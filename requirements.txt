@@ -1,0 +1,19 @@
+# Meteor-NC: Quantum-Resistant Cryptosystem
+# Requirements for CPU and GPU implementations
+
+# Core dependencies (CPU version)
+numpy>=1.24.0
+scipy>=1.10.0
+
+# GPU acceleration (optional, for meteor_nc_gpu.py and meteor_nc_gpu2.py)
+# Install based on your CUDA version:
+# CUDA 11.x: pip install cupy-cuda11x
+# CUDA 12.x: pip install cupy-cuda12x
+# cupy-cuda12x>=12.0.0
+
+# Visualization (optional, for validation tools)
+matplotlib>=3.7.0
+
+# Development dependencies (optional)
+pytest>=7.3.0
+jupyter>=1.0.0
