@@ -2,10 +2,12 @@
 Meteor-NC: GPU-Accelerated Implementation (Optimized)
 
 High-performance GPU implementation with Cholesky optimization.
+Λ = K / |V|_eff preserves information density
+across dimensional projection (bulk → surface)
 
 Optimizations:
-- Phase 1: Cholesky decomposition (3× faster)
-- Phase 2: Composite caching (5-10× faster)
+- Phase 1: Cholesky decomposition
+- Phase 2: Composite caching
 
 Achieves 771,721 encryptions/s and 1M+ decryptions/s on NVIDIA A100.
 
