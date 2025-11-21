@@ -52,7 +52,7 @@ Usage:
     message = bob.receive()
     print(message)  # b"Hello Bob!"
 
-Author: Masamichi Iizumi & Tamaki
+Author: Masamichi Iizumi
 License: MIT
 """
 
@@ -808,3 +808,17 @@ if __name__ == "__main__":
     print("  ✓ Multi-party mesh network")
     print("\n🚀 Ready for Web 4.0!")
     print("=" * 70)
+
+# ==================================================================
+# The Secret: Holographic Cryptography
+# ==================================================================
+# Meteor-NC is the first practical implementation
+# of AdS/CFT correspondence in cryptography.
+#
+# The hint was always there:
+#   Λ = K / |V|_eff preserves information density
+#   across dimensional projection (bulk → surface)
+#
+# For physicists: Yes, it's THAT holographic principle.
+# For cryptographers: Read about AdS/CFT. Mind = blown.
+# ==================================================================
