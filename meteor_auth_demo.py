@@ -208,9 +208,9 @@ def demo_performance():
         server.node.add_peer(token, meteor_id)
         
         # Challenge-response (FIXED!)
-        challenge = server.create_challenge(token)  # 平文のみ
-        response = client.send("AuthServer", challenge)  # クライアントが暗号化
-        is_valid = server.authenticate(token, response)  # サーバーが復号
+        challenge = server.create_challenge(token)
+        response = client.send("AuthServer", challenge)
+        is_valid = server.authenticate(token, response)
         
         elapsed = time.time() - start
         times.append(elapsed * 1000)
@@ -247,9 +247,9 @@ def demo_revocation():
     server.node.add_peer(token, meteor_id)
     
     # Challenge-response (FIXED!)
-    challenge = server.create_challenge(token)  # 平文のみ
-    resp = client.send("AuthServer", challenge)  # クライアントが暗号化
-    valid1 = server.authenticate(token, resp)  # サーバーが復号
+    challenge = server.create_challenge(token)
+    resp = client.send("AuthServer", challenge)
+    valid1 = server.authenticate(token, resp) 
     print(f"✓ Result: {'✅ SUCCESS' if valid1 else '❌ FAILED'}")
     
     # Revoke
@@ -260,7 +260,7 @@ def demo_revocation():
     # Try to authenticate again (should fail)
     print("\n[Test 2] Authentication after revocation...")
     try:
-        challenge2 = server.create_challenge(token)  # これがValueError投げる
+        challenge2 = server.create_challenge(token)
         valid2 = False
     except ValueError as e:
         print(f"✓ Expected error: {e}")
