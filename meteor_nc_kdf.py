@@ -33,7 +33,7 @@ Usage:
     ciphertexts = crypto2.encrypt_batch(messages)
     plaintexts = crypto2.decrypt_batch(ciphertexts)
 
-Author: Masamichi Iizumi & Tamaki
+Author: Masamichi Iizumi
 License: MIT
 """
 
