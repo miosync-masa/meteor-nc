@@ -13,8 +13,9 @@ import hashlib
 import uuid
 import platform
 import secrets
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 from meteor_nc_kdf import MeteorNC_KDF
+from meteor_protocol import MeteorNode
 
 
 class MeteorAuth:
@@ -26,6 +27,7 @@ class MeteorAuth:
     - Passwordless authentication
     - Quantum-resistant
     - Zero server trust
+    - Full P2P integration
     
     Usage:
         # Client
@@ -123,44 +125,59 @@ class MeteorAuth:
         
         return device_bound
     
-    def login(self, user_seed: bytes) -> MeteorNC_KDF:
+    def login(self, user_seed: bytes, node_name: Optional[str] = None) -> MeteorNode:
         """
-        Login (Key expansion)
+        Login (Key expansion + P2P node creation)
         
         Args:
             user_seed: 32-byte user seed
+            node_name: Optional node name (default: "Client")
         
         Returns:
-            MeteorNC_KDF session (ready for encryption)
+            MeteorNode with device-bound keys
         """
         # Device-bound seed
         auth_seed = self.create_device_bound_seed(user_seed)
         
-        # Key expansion
-        crypto = MeteorNC_KDF(
+        # Create Meteor node with device-bound keys
+        node = MeteorNode(node_name or "Client")
+        
+        # Expand keys with device-bound seed
+        node.crypto = MeteorNC_KDF(
             n=self.n,
             m=self.m,
             seed=auth_seed
         )
-        crypto.expand_keys()
+        node.crypto.expand_keys()
         
-        return crypto
+        # Set Meteor ID
+        node.meteor_id = self.get_meteor_id(user_seed)
+        
+        return node
     
     def get_meteor_id(self, user_seed: bytes) -> bytes:
         """
         Get Meteor ID (public identifier)
+        
+        This is the user's public identity in the Meteor network.
+        It's derived from device-bound seed, so it's unique per device.
         
         Args:
             user_seed: 32-byte user seed
         
         Returns:
             32-byte Meteor ID
+        
+        Note:
+            - Same user_seed on different devices = different IDs
+            - This enables device-bound authentication
+            - Safe to share publicly (like username)
         """
-        # Device-bound seedから生成
+        # Generate device-bound seed
         device_seed = self.create_device_bound_seed(user_seed)
         
-        # Meteor IDはdevice_seedのハッシュ
-        # （セッション作成不要で高速）
+        # Derive Meteor ID (public identifier)
+        # Using domain separation: "METEOR_ID_v1"
         meteor_id = hashlib.sha256(b"METEOR_ID_v1" + device_seed).digest()
         
         return meteor_id
@@ -198,6 +215,8 @@ class MeteorAuthServer:
     - Zero password storage
     - Zero personal info storage
     - Only stores 32-byte Meteor IDs
+    - Full P2P integration
+    - Challenge-response authentication
     
     Usage:
         server = MeteorAuthServer()
@@ -206,15 +225,19 @@ class MeteorAuthServer:
         token = server.register(meteor_id)
         
         # Authentication
-        is_valid = server.authenticate(encrypted_challenge)
+        is_valid = server.authenticate(token, encrypted_response)
     """
     
-    def __init__(self):
-        """Initialize server"""
-        from meteor_protocol import MeteorNode
+    def __init__(self, node_name: str = "AuthServer"):
+        """
+        Initialize server
         
-        self.node = MeteorNode("AuthServer")
-        self.users = {}  # token -> meteor_id
+        Args:
+            node_name: Server node name
+        """
+        self.node = MeteorNode(node_name)
+        self.users: Dict[str, dict] = {}  # token -> user_info
+        self.challenges: Dict[str, bytes] = {}  # token -> current_challenge
     
     def register(self, meteor_id: bytes, metadata: dict = None) -> str:
         """
@@ -227,44 +250,25 @@ class MeteorAuthServer:
         Returns:
             User token (hex)
         """
-        # Generate token
+        import time
+        
+        # Generate unique token
         token = hashlib.sha256(meteor_id + secrets.token_bytes(16)).hexdigest()
         
-        # Store (only ID!)
+        # Store user info (ID only, no password!)
         self.users[token] = {
             'meteor_id': meteor_id,
             'metadata': metadata or {},
-            'registered_at': __import__('time').time()
+            'registered_at': time.time()
         }
         
-        # Add as peer
+        # Add as peer in P2P network
         self.node.add_peer(token, meteor_id)
         
+        print(f"[{self.node.name}] Registered user: {token[:32]}...")
+        print(f"  Meteor ID: {meteor_id.hex()[:32]}...")
+        
         return token
-    
-    def authenticate(self, token: str, encrypted_challenge: bytes) -> bool:
-        """
-        Authenticate user
-        
-        Args:
-            token: User token
-            encrypted_challenge: Encrypted challenge response
-        
-        Returns:
-            True if valid, False otherwise
-        """
-        if token not in self.users:
-            return False
-        
-        try:
-            # Try to decrypt
-            plaintext = self.node.receive(encrypted_challenge)
-            
-            # If decryption succeeds, authentication succeeds
-            return True
-            
-        except Exception:
-            return False
     
     def create_challenge(self, token: str) -> Tuple[bytes, bytes]:
         """
@@ -276,16 +280,96 @@ class MeteorAuthServer:
         Returns:
             (challenge, encrypted_challenge)
         """
+        if token not in self.users:
+            raise ValueError(f"Unknown token: {token}")
+        
+        # Generate random challenge
         challenge = secrets.token_bytes(32)
         
-        # Encrypt challenge (server sends to client)
+        # Store for verification
+        self.challenges[token] = challenge
+        
+        # Encrypt challenge using P2P
         encrypted = self.node.send(token, challenge)
         
         return challenge, encrypted
     
+    def authenticate(self, token: str, encrypted_response: bytes) -> bool:
+        """
+        Authenticate user via challenge-response
+        
+        Args:
+            token: User token
+            encrypted_response: Client's encrypted response
+        
+        Returns:
+            True if valid, False otherwise
+        """
+        if token not in self.users:
+            print(f"[Auth Failed] Unknown token")
+            return False
+        
+        if token not in self.challenges:
+            print(f"[Auth Failed] No challenge for token")
+            return False
+        
+        try:
+            # Decrypt response using P2P
+            decrypted = self.node.receive(encrypted_response)
+            
+            # Verify it matches the challenge
+            expected = self.challenges[token]
+            
+            if decrypted == expected:
+                print(f"[Auth Success] Token {token[:16]}...")
+                # Clean up challenge
+                del self.challenges[token]
+                return True
+            else:
+                print(f"[Auth Failed] Challenge mismatch")
+                return False
+                
+        except Exception as e:
+            print(f"[Auth Failed] {e}")
+            return False
+    
     def get_user_info(self, token: str) -> Optional[dict]:
-        """Get user metadata"""
+        """
+        Get user metadata
+        
+        Args:
+            token: User token
+        
+        Returns:
+            User info dict or None
+        """
         return self.users.get(token)
+    
+    def revoke(self, token: str) -> bool:
+        """
+        Revoke user token
+        
+        Args:
+            token: User token
+        
+        Returns:
+            True if revoked
+        """
+        if token in self.users:
+            # Remove from users
+            del self.users[token]
+            
+            # Remove peer
+            self.node.remove_peer(token)
+            
+            # Remove any pending challenges
+            if token in self.challenges:
+                del self.challenges[token]
+            
+            print(f"[Revoked] Token {token[:16]}...")
+            return True
+        
+        return False
 
 
 # ==================================================================
@@ -300,6 +384,11 @@ class MeteorAuthServer:
 #
 # Zero trust: Server never stores passwords or personal info
 # Zero passwords: QR code + device = authentication
+#
+# Full P2P integration enables:
+# - Serverless authentication meshes
+# - Decentralized identity verification
+# - Web 4.0 authentication primitives
 #
 # Welcome to Web 4.0. 🌌
 # ==================================================================
