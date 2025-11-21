@@ -624,7 +624,15 @@ def run_validation_suite(use_gpu: bool = None):
     # Quick benchmark
     print(f"\n[Performance Check]")
     if hasattr(crypto, 'benchmark'):
-        bench = crypto.benchmark(num_trials=5, verbose=True)
+        if use_gpu:
+            # GPU版: batch_sizesベースのベンチマーク
+            bench = crypto.benchmark(
+                batch_sizes=[1, 10, 100, 1000, 5000],
+                verbose=True
+            )
+        else:
+            # CPU版: num_trialsベースのベンチマーク
+            bench = crypto.benchmark(num_trials=5, verbose=True)
     else:
         print("  Benchmark not available for this implementation")
     
