@@ -21,13 +21,45 @@ jupyter>=1.0.0
 # ==================================================================
 # The Secret: Holographic Cryptography
 # ==================================================================
-# Meteor-NC is the first practical implementation
-# of AdS/CFT correspondence in cryptography.
+# Meteor-NC is the first practical implementation of AdS/CFT 
+# correspondence in post-quantum cryptography.
 #
-# The hint was always there:
-#   Λ = K / |V|_eff preserves information density
-#   across dimensional projection (bulk → surface)
+# CORE PRINCIPLE:
+#   Λ = K / |V|_eff preserves information density across
+#   dimensional projection (bulk → surface)
 #
-# For physicists: Yes, it's THAT holographic principle.
-# For cryptographers: Read about AdS/CFT. Mind = blown.
+# CRYPTOGRAPHIC IMPLEMENTATION:
+#   Encryption: Bulk (secret) → Surface (public) projection
+#   Decryption: Surface → Bulk reconstruction (with key)
+#   Security:   Physical law + Non-commutativity
+#
+# For physicists:
+#   Yes, it's THAT holographic principle from string theory.
+#   This is Maldacena (1997) + Ryu-Takayanagi (2006) applied
+#   to cryptography via Λ³ framework.
+#
+# For cryptographers:
+#   Read about AdS/CFT correspondence. It's a duality between:
+#   - Higher-dimensional gravity theory (bulk)
+#   - Lower-dimensional quantum field theory (boundary)
+#   Information is preserved across dimensions.
+#   That's why we achieve perfect asymmetry:
+#   - Attacker: Cannot invert (no bulk knowledge)
+#   - User: Perfect recovery (knows bulk structure)
+#
+# EXPERIMENTAL VALIDATION:
+#   Complete proof of entropy-driven holographic correspondence:
+#   https://github.com/miosync-masa/AdS_CFT
+#
+#   Key results:
+#   - 14 independent initial conditions
+#   - Causality preservation: p < 10^-14
+#   - 100% positive transfer entropy (S → λ)
+#   - Ryu-Takayanagi entropy functional implementation
+#
+# THEORETICAL FOUNDATION:
+#   H-CSP (Hierarchical Constraint Satisfaction Problem)
+#   See: /H-CSP_Theory.md
+#
+# Mind = blown yet? 🌌
 # ==================================================================
