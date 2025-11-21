@@ -253,6 +253,23 @@ class MeteorNode:
             self._peer_crypto_cache[meteor_id] = peer_crypto
         
         return self._peer_crypto_cache[meteor_id]
+
+    def remove_peer(self, peer_name: str) -> bool:
+        """
+        Remove peer from network
+        
+        Args:
+            peer_name: Peer identifier
+        
+        Returns:
+            True if removed, False if not found
+        """
+        if peer_name in self.peers:
+            del self.peers[peer_name]
+            print(f"[{self.name}] Removed peer: {peer_name}")
+            return True
+        
+        return False
     
     def send(self, peer_name: str, plaintext: bytes) -> MeteorMessage:
         """
