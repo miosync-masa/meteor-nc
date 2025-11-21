@@ -270,15 +270,15 @@ class MeteorAuthServer:
         
         return token
     
-    def create_challenge(self, token: str) -> Tuple[bytes, bytes]:
+    def create_challenge(self, token: str) -> bytes:
         """
-        Create authentication challenge
+        Create authentication challenge (plaintext)
         
         Args:
             token: User token
         
         Returns:
-            (challenge, encrypted_challenge)
+            challenge (plaintext, 32 bytes)
         """
         if token not in self.users:
             raise ValueError(f"Unknown token: {token}")
@@ -289,18 +289,23 @@ class MeteorAuthServer:
         # Store for verification
         self.challenges[token] = challenge
         
-        # Encrypt challenge using P2P
-        encrypted = self.node.send(token, challenge)
+        print(f"[{self.node.name}] Challenge created: {challenge.hex()[:32]}...")
         
-        return challenge, encrypted
+        # Return plaintext (client will encrypt)
+        return challenge
     
     def authenticate(self, token: str, encrypted_response: bytes) -> bool:
         """
         Authenticate user via challenge-response
         
+        Flow:
+        1. Server creates challenge (plaintext)
+        2. Client encrypts challenge with their key
+        3. Server decrypts with peer key and verifies
+        
         Args:
             token: User token
-            encrypted_response: Client's encrypted response
+            encrypted_response: Client's encrypted challenge
         
         Returns:
             True if valid, False otherwise
@@ -315,22 +320,25 @@ class MeteorAuthServer:
         
         try:
             # Decrypt response using P2P
+            # (Client encrypted with their key, server has peer key)
             decrypted = self.node.receive(encrypted_response)
             
             # Verify it matches the challenge
             expected = self.challenges[token]
             
             if decrypted == expected:
-                print(f"[Auth Success] Token {token[:16]}...")
+                print(f"[{self.node.name}] ✅ Authentication SUCCESS for {token[:16]}...")
                 # Clean up challenge
                 del self.challenges[token]
                 return True
             else:
                 print(f"[Auth Failed] Challenge mismatch")
+                print(f"  Expected: {expected.hex()[:32]}...")
+                print(f"  Got: {decrypted.hex()[:32]}...")
                 return False
                 
         except Exception as e:
-            print(f"[Auth Failed] {e}")
+            print(f"[Auth Failed] Decryption error: {e}")
             return False
     
     def get_user_info(self, token: str) -> Optional[dict]:
