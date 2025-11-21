@@ -156,8 +156,14 @@ class MeteorAuth:
         Returns:
             32-byte Meteor ID
         """
-        session = self.login(user_seed)
-        return session.get_meteor_id()
+        # Device-bound seedから生成
+        device_seed = self.create_device_bound_seed(user_seed)
+        
+        # Meteor IDはdevice_seedのハッシュ
+        # （セッション作成不要で高速）
+        meteor_id = hashlib.sha256(b"METEOR_ID_v1" + device_seed).digest()
+        
+        return meteor_id
     
     def export_qr_data(self, user_seed: bytes) -> str:
         """
