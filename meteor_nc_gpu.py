@@ -58,11 +58,11 @@ class MeteorNC_GPU:
     """
     
     def __init__(self,
-                 n: int = 256,
-                 m: int = 10,
-                 noise_std: float = 1e-10,
-                 rank_reduction: float = 0.3,
-                 device_id: int = 0):
+             n: int = 256,
+             m: int = 10,
+             noise_std: float = 1e-10,
+             rank_reduction: float = 0.3,
+             device_id: int = 0):
         """Initialize GPU-accelerated Meteor-NC"""
         
         if not GPU_AVAILABLE:
@@ -81,6 +81,11 @@ class MeteorNC_GPU:
         self.S_gpu = None
         self.S_inv_gpu = None
         self.public_keys_gpu = []
+        
+        # ✨ ADD THESE THREE LINES ✨
+        self.private_P_gpu = []  # For Λ-IPP verification
+        self.private_D_gpu = []  # Optional (not used in verify yet)
+        self.private_R_gpu = []  # For Λ-RRP verification
         
         # Performance tracking
         self.keygen_time = None
@@ -109,6 +114,11 @@ class MeteorNC_GPU:
         # Generate layers on GPU
         self.public_keys_gpu = []
         
+        # ✨ CLEAR PRIVATE KEYS ✨
+        self.private_P_gpu = []
+        self.private_D_gpu = []
+        self.private_R_gpu = []
+        
         for i in range(self.m):
             # Projection (rank deficient)
             P = self._generate_projection()
@@ -122,6 +132,11 @@ class MeteorNC_GPU:
             # Noise
             E = cp.random.normal(0, self.noise_std, (self.n, self.n), 
                                 dtype=cp.float64)
+            
+            # ✨ SAVE PRIVATE KEYS ✨
+            self.private_P_gpu.append(P)  # For Λ-IPP
+            self.private_D_gpu.append(D)  # Optional
+            self.private_R_gpu.append(R)  # For Λ-RRP
             
             # Public key: S(P+D)S^-1 + R + E
             public_key = self.S_gpu @ (P + D) @ self.S_inv_gpu + R + E
@@ -441,6 +456,12 @@ class MeteorNC_GPU:
         self.public_keys_gpu = []
         self.S_gpu = None
         self.S_inv_gpu = None
+        
+        # ✨ CLEAR PRIVATE KEYS ✨
+        self.private_P_gpu = []
+        self.private_D_gpu = []
+        self.private_R_gpu = []
+        
         cp.get_default_memory_pool().free_all_blocks()
     
     # =========================================================================
