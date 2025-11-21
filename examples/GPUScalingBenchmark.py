@@ -16,11 +16,6 @@ print("="*70)
 print("\n[*] Installing dependencies...")
 !pip install cupy-cuda12x -q
 
-# Clone repository
-print("\n[*] Cloning Meteor-NC repository...")
-!git clone https://github.com/miosync-masa/meteor-nc.git
-%cd meteor-nc
-
 print("\n✅ Setup complete!")
 
 # Cell 2: Quick Test (n=256 baseline)
@@ -79,46 +74,46 @@ def benchmark_n_value(n, batch_size=1000):
     print(f"\n{'='*70}")
     print(f"Testing n={n} (Security: {n}-bit)")
     print(f"{'='*70}")
-    
+
     # Adjust m
     m = max(8, n // 32 + 2)
-    
+
     # Create instance
     crypto = MeteorNC_GPU(n=n, m=m)
-    
+
     # Key generation
     print(f"[*] Generating keys...")
     keygen_time = crypto.key_gen(verbose=False)
     print(f"    Key generation: {keygen_time:.3f}s")
-    
+
     # Prepare data
     messages = np.random.randn(batch_size, n)
-    
+
     # Warmup
     print(f"[*] Warming up...")
     for _ in range(3):
         _ = crypto.encrypt_batch(messages[:min(100, batch_size)])
         _ = crypto.decrypt_batch(crypto.encrypt_batch(messages[:min(100, batch_size)]))
-    
+
     # Benchmark encryption
     print(f"[*] Benchmarking encryption...")
     start = time.time()
     ciphertexts = crypto.encrypt_batch(messages)
     enc_time = time.time() - start
     enc_throughput = batch_size / enc_time
-    
+
     # Benchmark decryption (optimized)
     print(f"[*] Benchmarking decryption...")
     recovered, dec_time = crypto.decrypt_batch(ciphertexts)
     dec_throughput = batch_size / dec_time
-    
+
     # Error
     error = np.linalg.norm(messages - recovered) / np.linalg.norm(messages)
-    
+
     # Security (quick check)
     print(f"[*] Verifying security...")
     security = crypto.verify_security(verbose=False)
-    
+
     # Results
     result = {
         'n': n,
@@ -132,17 +127,19 @@ def benchmark_n_value(n, batch_size=1000):
         'cp_norm': security['cp_commutator_norm'],
         'secure': security['secure']
     }
-    
+
     # Print summary
     print(f"\n[Summary]")
     print(f"  Encryption:  {enc_time*1000:>7.2f}ms → {enc_throughput:>10,.0f} msg/s")
     print(f"  Decryption:  {dec_time*1000:>7.2f}ms → {dec_throughput:>10,.0f} msg/s")
     print(f"  Error:       {error:.2e}")
-    print(f"  Security:    Λ-CP={security['cp_commutator_norm']:.1f} {'✅' if security['secure'] else '❌'}")
-    
+    print(f"  Security:    Λ-CP={security['cp_commutator_norm']:.1f} "
+      f"(threshold: {security.get('cp_threshold', 8.0):.1f}) "
+      f"{'✅' if security['secure'] else '❌'}")
+
     # Cleanup
     crypto.cleanup()
-    
+
     return result
 
 # Run benchmarks
@@ -166,14 +163,17 @@ df = pd.DataFrame(results)
 
 # Display table
 print(f"\n{'n':<8} {'m':<6} {'KeyGen (s)':<12} {'Enc (ms)':<10} {'Dec (ms)':<10} "
-      f"{'Dec Throughput':<16} {'Λ-CP':<8} {'Secure':<8}")
-print("-"*70)
+      f"{'Dec Throughput':<16} {'Λ-CP':<12} {'Threshold':<10} {'Secure':<8}")
+print("-"*80)
 
 for _, row in df.iterrows():
+    threshold = 8.0 * np.sqrt(row['n'] / 256.0)
+    
     print(f"{row['n']:<8} {row['m']:<6} {row['keygen_time']:>10.2f}  "
           f"{row['enc_time_ms']:>8.2f}  {row['dec_time_ms']:>8.2f}  "
           f"{row['dec_throughput']:>14,.0f}  "
-          f"{row['cp_norm']:>6.1f}  {'✅' if row['secure'] else '❌'}")
+          f"{row['cp_norm']:>10.1f}  {threshold:>8.1f}  "
+          f"{'✅' if row['secure'] else '❌'}")
 
 # Efficiency analysis
 print("\n" + "="*70)
@@ -188,7 +188,7 @@ for r in results:
     theoretical = (r['n'] / baseline['n']) ** 3
     actual = r['dec_time_ms'] / baseline['dec_time_ms']
     efficiency = theoretical / actual
-    
+
     print(f"{r['n']:<8} {theoretical:>13.1f}×  {actual:>13.1f}×  {efficiency:>13.1%}")
 
 # Speedup visualization
@@ -256,7 +256,7 @@ ax.set_yscale('log')
 
 # 4. Security vs Performance
 ax = axes[1, 1]
-scatter = ax.scatter(df['dec_throughput'] / 1000, df['cp_norm'], 
+scatter = ax.scatter(df['dec_throughput'] / 1000, df['cp_norm'],
                      s=df['n']/2, alpha=0.6, c=df['n'], cmap='viridis')
 ax.set_xlabel('Decryption Throughput (K msg/s)', fontsize=12)
 ax.set_ylabel('Non-commutativity (Λ-CP)', fontsize=12)
