@@ -495,16 +495,18 @@ class MeteorNC_GPU:
         results['rrp_snr'] = float(np.mean(snr_values))
         results['rrp_r_norm'] = float(np.mean(r_norms))
         
-        # NEW: Security criterion based on absolute scale, not SNR
-        # R should be small perturbation: ||R||_F < 0.1 * ||D||_F
-        # Typical: 0.01 < ||R||_F < 10.0
-        results['rrp_secure'] = 0.01 < results['rrp_r_norm'] < 10.0
+        # dimension-scaled bounds
+        rrp_lower = 0.01
+        rrp_upper = 10.0 * np.sqrt(self.n / 256.0)
+        results['rrp_lower'] = rrp_lower
+        results['rrp_upper'] = rrp_upper
+        results['rrp_secure'] = rrp_lower < results['rrp_r_norm'] < rrp_upper
         
         if verbose:
             print(f"\n[Λ-RRP (Rotation Recovery Problem)]")
             print(f"  R Frobenius norm: {results['rrp_r_norm']:.4f}")
             print(f"  Signal-to-Noise Ratio: {results['rrp_snr']:.2e}")
-            print(f"  Valid range: [0.01, 10.0] (absolute scale)")
+            print(f"  Valid range: [{rrp_lower:.2f}, {rrp_upper:.2f}] (dimension-scaled)")
             print(f"  Status: {'✅ SECURE' if results['rrp_secure'] else '⚠️ WEAK'}")
             print(f"  Note: SNR is informational; security from S-conjugacy (Λ-CP)")
         
