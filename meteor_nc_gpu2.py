@@ -747,6 +747,8 @@ def create_meteor_gpu(security_level: int = 256, device_id: int = 0) -> MeteorNC
         512: {'n': 512, 'm': 12},
         1024: {'n': 1024, 'm': 12},
         2048: {'n': 2048, 'm': 14},
+        4096: {'n': 4096, 'm': 16},
+        8192: {'n': 8192, 'm': 18},
     }
 
     if security_level not in security_configs:
