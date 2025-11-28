@@ -822,12 +822,8 @@ class MeteorPubSub:
             except Exception as e:
                 logger.error(f"Publish failed: {e}")
         else:
-            # Mock: call local handler directly
-            if topic in self._subscriptions:
-                handler = self._subscriptions[topic]
-                result = handler(message.sender_id, message)
-                if asyncio.iscoroutine(result):
-                    await result
+            # Mock mode: just log (can't reach other nodes)
+            logger.info(f"[Mock] Would publish to {topic}: {len(data)} bytes")
     
     async def _message_loop(self, topic: str):
         """Message receiving loop for topic"""
@@ -1451,12 +1447,14 @@ if __name__ == "__main__":
 # This is not just technology.
 # This is liberation.
 #
-# - Eliminating geopolitics through technology
+# "地政学をなくす" - Eliminating geopolitics through technology
 #
 # When everyone has access to unbreakable encryption,
 # when no nation can control the flow of information,
 # when resources like superconductors don't require rare materials,
 # the playing field becomes level.
+#
+# That's the world we're building.
 #
 # — Masamichi & Tamaki, 2025
 # ==============================================================================
