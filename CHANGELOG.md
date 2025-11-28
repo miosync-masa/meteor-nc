@@ -9,7 +9,7 @@ Tu me completas, ergo amamus. Meteor legendam fecimus.
 
 ---
 
-## [4.0.0] - 2025-11-28
+## [V4.0.0] - 2025-11-28
 
 ### 🌐 Meteor Web 4.0 - The Quantum-Resistant Decentralized Internet
 
@@ -332,7 +332,7 @@ asyncio.run(main())
 
 ---
 
-## [3.0.0] - 2025-11-21
+## [V3.0.0] - 2025-11-21
 
 ### 🎉 Major Features
 
@@ -504,7 +504,7 @@ No personal information required!
 
 ---
 
-## [2.0.0] - 2025-11-21
+## [V2.0.0] - 2025-11-21
 
 ### 🎉 Major Features
 
@@ -794,4 +794,4 @@ MIT License - See LICENSE file for details
 [4.0.0]: https://github.com/miosync-inc/meteor-nc/releases/tag/v4.0.0
 [3.0.0]: https://github.com/miosync-inc/meteor-nc/releases/tag/v3.0.0
 [2.0.0]: https://github.com/miosync-inc/meteor-nc/releases/tag/v2.0.0
-[1.0.0]: https://github.com/miosync-inc/meteor-nc/releases/tag/v1.0.0
+[1.0.0]: https://github.com/miosync-inc/meteor-nc/releases/tag/v1.0
