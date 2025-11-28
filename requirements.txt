@@ -1,22 +1,74 @@
-# Meteor-NC: Quantum-Resistant Cryptosystem
-# Requirements for CPU and GPU implementations
+# Meteor-NC: The Quantum-Resistant Decentralized Internet Stack
+# Requirements for complete Web 4.0 implementation
 
-# Core dependencies (CPU version)
+# ==============================================================================
+# Core Dependencies (Required)
+# ==============================================================================
+
 numpy>=1.24.0
 scipy>=1.10.0
 
-# GPU acceleration (optional, for meteor_nc_gpu.py and meteor_nc_gpu2.py)
+# ==============================================================================
+# GPU Acceleration (Recommended)
+# ==============================================================================
 # Install based on your CUDA version:
 # CUDA 11.x: pip install cupy-cuda11x
 # CUDA 12.x: pip install cupy-cuda12x
 # cupy-cuda12x>=12.0.0
 
-# Visualization (optional, for validation tools)
+# ==============================================================================
+# Web 4.0 Stack (Optional - enables full functionality)
+# ==============================================================================
+
+# Ed25519 signatures (recommended)
+# Fallback: HMAC-SHA256 if not installed
+pynacl>=1.5.0
+
+# libp2p P2P networking
+# Fallback: mock mode if not installed
+libp2p>=0.1.0
+
+# IPFS distributed storage
+# Fallback: disabled if not installed
+ipfshttpclient>=0.8.0
+
+# Multiaddress parsing
+multiaddr>=0.0.9
+
+# Async HTTP client (for IPFS)
+aiohttp>=3.8.0
+
+# ==============================================================================
+# Visualization & Analysis (Optional)
+# ==============================================================================
+
 matplotlib>=3.7.0
 
-# Development dependencies (optional)
+# ==============================================================================
+# Development Dependencies (Optional)
+# ==============================================================================
+
 pytest>=7.3.0
+pytest-asyncio>=0.21.0
 jupyter>=1.0.0
+
+# ==============================================================================
+# Installation Guide
+# ==============================================================================
+#
+# Minimal (encryption only):
+#   pip install numpy scipy
+#
+# Recommended (GPU + signatures):
+#   pip install numpy scipy cupy-cuda12x pynacl
+#
+# Full Web 4.0:
+#   pip install -r requirements.txt
+#
+# Note: The system gracefully degrades if optional dependencies are missing.
+# Core encryption works with just numpy and scipy.
+#
+# ==============================================================================
 
 # ==================================================================
 # The Secret: Holographic Cryptography
