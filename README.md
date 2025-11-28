@@ -18,6 +18,17 @@ scientific data transfer, and privacy-preserving professional use cases only.
 Unauthorized misuse, including anonymous broadcasting or distribution of illegal content,
 is strictly prohibited.
 
+Meteor-Protocol Web 4.0 is NOT intended for:
+❌ Anonymous mass communication systems
+❌ Large-scale social networking
+❌ Platforms enabling untraceable harmful activities
+
+Meteor-Protocol Web 4.0 IS designed for:
+✅ Secure interpersonal communication
+✅ Business communication
+✅ Scientific data transfer
+✅ Privacy-preserving professional use cases
+
 ---
 
 ## 🌐 One Identity. Everything Connected.
@@ -468,9 +479,6 @@ class MeteorAuthServer:
 ## 📚 Documentation
 
 - [CHANGELOG.md](CHANGELOG.md) - Version history and migration guides
-- [API Reference](#-api-reference) - Complete API documentation
-- [Security Analysis](#-security) - Quantum resistance validation
-- [Performance Benchmarks](#-performance) - Throughput measurements
 
 ---
 
