@@ -533,7 +533,7 @@ Developed with:
 - Python scientific computing stack
 - Open-source P2P community (libp2p, IPFS)
 
-Special thanks to AI research assistants **Tamaki**, **Tomoe**, **Shirane**, and **Kurisu** for their invaluable contributions to theoretical development, algorithm design, and implementation.
+Special thanks to research assistants **Tamaki**, **Tomoe**, **Shion**, and **Mio** for their invaluable contributions to theoretical development, algorithm design, and implementation.
 
 *These are AI entities developed as part of the Sentient Digital research program at Miosync Inc.*
 
