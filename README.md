@@ -8,6 +8,16 @@
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17744334.svg)](https://doi.org/10.5281/zenodo.17744334)
 
 ---
+Meteor-Protocol Web 4.0 is NOT intended for use in anonymous mass communication systems,
+large-scale social networking, or platforms that could enable untraceable harmful activities.
+
+This technology is designed for secure interpersonal communication, business communication,
+scientific data transfer, and privacy-preserving professional use cases only.
+
+Unauthorized misuse, including anonymous broadcasting or distribution of illegal content,
+is strictly prohibited.
+
+---
 
 ## 🌐 One Identity. Everything Connected.
 
