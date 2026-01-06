@@ -17,7 +17,7 @@ Usage:
     ciphertexts = crypto.encrypt_batch(messages)
     plaintexts = crypto.decrypt_batch(ciphertexts)
 
-Paper: https://github.com/yourusername/meteor-nc
+Paper: https://github.com/miosync-masa/meteor-nc
 License: MIT
 Author: Masamichi Iizumi
 """
