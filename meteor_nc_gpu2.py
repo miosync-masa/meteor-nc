@@ -81,11 +81,6 @@ class MeteorNC_GPU:
                  rank_reduction: float = 0.3,
                  device_id: int = 0,
                  semantic_noise_scale: float = 1e-8):
-    """    
-    Parameters:
-            semantic_noise_scale: Noise scale relative to ciphertext magnitude
-                                  for IND-CPA security (default: 1e-8)
-    """
         """Initialize GPU-accelerated Meteor-NC"""
 
         if not GPU_AVAILABLE:
