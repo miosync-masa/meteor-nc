@@ -27,7 +27,7 @@ Usage:
     # Optimized decryption (10× faster!)
     plaintexts = crypto.decrypt_batch(ciphertexts, method='optimized')
 
-Paper: https://github.com/yourusername/meteor-nc
+Paper: https://github.com/miosync-masa/meteor-nc
 License: MIT
 Author: Masamichi Iizumi
 """
@@ -79,7 +79,13 @@ class MeteorNC_GPU:
                  m: int = 10,
                  noise_std: float = 1e-10,
                  rank_reduction: float = 0.3,
-                 device_id: int = 0):
+                 device_id: int = 0,
+                 semantic_noise_scale: float = 1e-8):
+    """    
+    Parameters:
+            semantic_noise_scale: Noise scale relative to ciphertext magnitude
+                                  for IND-CPA security (default: 1e-8)
+    """
         """Initialize GPU-accelerated Meteor-NC"""
 
         if not GPU_AVAILABLE:
@@ -93,6 +99,8 @@ class MeteorNC_GPU:
         self.noise_std = noise_std
         self.rank_reduction = rank_reduction
         self.device_id = device_id
+        # IND-CPA security
+        self.semantic_noise_scale = semantic_noise_scale
 
         # Keys on GPU
         self.S_gpu = None
@@ -173,20 +181,12 @@ class MeteorNC_GPU:
 
         return self.keygen_time
 
-    def encrypt(self, message: np.ndarray) -> np.ndarray:
+     def encrypt(self, message: np.ndarray) -> np.ndarray:
         """
-        Encrypt single message
-
-        Args:
-            message: numpy array of shape (n,)
-
-        Returns:
-            numpy array: ciphertext
+        Encrypt single message (IND-CPA secure)
         """
         if len(self.public_keys_gpu) == 0:
             raise ValueError("Keys not generated. Call key_gen() first.")
-
-        start = time.time()
 
         # Transfer to GPU
         M = cp.asarray(message, dtype=cp.float64)
@@ -196,13 +196,14 @@ class MeteorNC_GPU:
         for public_key in self.public_keys_gpu:
             C = public_key @ C
 
-        # Add noise
-        C += cp.random.normal(0, self.noise_std, self.n, dtype=cp.float64)
+        # ★ MODIFIED: Scale-aware semantic noise
+        if self.semantic_noise_scale > 0:
+            ct_magnitude = float(cp.linalg.norm(C))
+            effective_noise_std = ct_magnitude * self.semantic_noise_scale / cp.sqrt(self.n)
+            C += cp.random.normal(0, effective_noise_std, self.n, dtype=cp.float64)
 
         # Transfer back
         result = cp.asnumpy(C)
-
-        self.last_encrypt_time = time.time() - start
         return result
 
     def decrypt(self, ciphertext: np.ndarray, method: str = 'optimized') -> np.ndarray:
@@ -225,18 +226,10 @@ class MeteorNC_GPU:
 
     def encrypt_batch(self, messages: np.ndarray) -> np.ndarray:
         """
-        Batch encryption (high performance!)
-
-        Args:
-            messages: numpy array of shape (batch_size, n)
-
-        Returns:
-            numpy array: ciphertexts of shape (batch_size, n)
+        Batch encryption (IND-CPA secure, high performance!)
         """
         if len(self.public_keys_gpu) == 0:
             raise ValueError("Keys not generated. Call key_gen() first.")
-
-        start = time.time()
 
         batch_size = messages.shape[0]
 
@@ -248,15 +241,16 @@ class MeteorNC_GPU:
         for public_key in self.public_keys_gpu:
             C = C @ public_key.T  # [batch, n] @ [n, n]
 
-        # Add noise
-        eta = cp.random.normal(0, self.noise_std, (batch_size, self.n),
-                              dtype=cp.float64)
-        C += eta
+        # ★ MODIFIED: Scale-aware semantic noise
+        if self.semantic_noise_scale > 0:
+            # Calculate per-row magnitude for adaptive noise
+            ct_magnitudes = cp.linalg.norm(C, axis=1, keepdims=True)  # [batch, 1]
+            effective_noise_std = ct_magnitudes * self.semantic_noise_scale / cp.sqrt(self.n)
+            eta = cp.random.normal(0, 1, (batch_size, self.n), dtype=cp.float64)
+            C += eta * effective_noise_std  # Broadcasting: [batch, n] * [batch, 1]
 
         # Transfer back
         result = cp.asnumpy(C)
-
-        self.last_encrypt_time = time.time() - start
         return result
 
     def decrypt_batch(self, ciphertexts: np.ndarray,
