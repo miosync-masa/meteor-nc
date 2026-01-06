@@ -176,7 +176,7 @@ class MeteorNC_GPU:
 
         return self.keygen_time
 
-     def encrypt(self, message: np.ndarray) -> np.ndarray:
+    def encrypt(self, message: np.ndarray) -> np.ndarray:
         """
         Encrypt single message (IND-CPA secure)
         """
