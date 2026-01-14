@@ -38,6 +38,7 @@ import numpy as np
 import time
 from typing import Optional, Tuple, Dict
 import hashlib
+import hmac
 
 try:
     import cupy as cp
@@ -47,6 +48,114 @@ except ImportError:
 
 from scipy.stats import ortho_group, special_ortho_group
 from .core import MeteorNC
+
+
+# =============================================================================
+# HKDF: RFC 5869 Compliant Implementation
+# =============================================================================
+
+class HKDF:
+    """
+    HKDF (HMAC-based Extract-and-Expand Key Derivation Function).
+    
+    RFC 5869 compliant implementation using SHA-256.
+    
+    Reference:
+        https://tools.ietf.org/html/rfc5869
+    
+    This is used for:
+        - Deterministic key expansion from master seed
+        - Domain separation for different key components
+        - Authentication system integration (MeteorAuth)
+    
+    Example:
+        >>> hkdf = HKDF(salt=b"MeteorNC-v1")
+        >>> prk = hkdf.extract(input_key_material)
+        >>> okm = hkdf.expand(prk, info=b"orthogonal", length=32)
+    """
+    
+    HASH_LEN = 32  # SHA-256 output length
+    
+    def __init__(self, salt: Optional[bytes] = None, hash_func=hashlib.sha256):
+        """
+        Initialize HKDF.
+        
+        Args:
+            salt: Optional salt (if None, uses zero-filled bytes)
+            hash_func: Hash function (default: SHA-256)
+        """
+        self.hash_func = hash_func
+        self.salt = salt if salt is not None else b'\x00' * self.HASH_LEN
+    
+    def extract(self, ikm: bytes) -> bytes:
+        """
+        HKDF-Extract: Extract pseudorandom key from input key material.
+        
+        PRK = HMAC-Hash(salt, IKM)
+        
+        Args:
+            ikm: Input key material
+            
+        Returns:
+            Pseudorandom key (PRK), 32 bytes
+        """
+        return hmac.new(self.salt, ikm, self.hash_func).digest()
+    
+    def expand(self, prk: bytes, info: bytes = b"", length: int = 32) -> bytes:
+        """
+        HKDF-Expand: Expand PRK to desired length.
+        
+        T(0) = empty string
+        T(i) = HMAC-Hash(PRK, T(i-1) || info || i)
+        OKM = T(1) || T(2) || ... (first L bytes)
+        
+        Args:
+            prk: Pseudorandom key from extract()
+            info: Context/application-specific info
+            length: Desired output length in bytes
+            
+        Returns:
+            Output key material (OKM)
+        """
+        if length > 255 * self.HASH_LEN:
+            raise ValueError(f"Cannot expand to more than {255 * self.HASH_LEN} bytes")
+        
+        # Number of blocks needed
+        n_blocks = (length + self.HASH_LEN - 1) // self.HASH_LEN
+        
+        okm = b""
+        t_prev = b""
+        
+        for i in range(1, n_blocks + 1):
+            # T(i) = HMAC-Hash(PRK, T(i-1) || info || i)
+            t_prev = hmac.new(
+                prk,
+                t_prev + info + bytes([i]),
+                self.hash_func
+            ).digest()
+            okm += t_prev
+        
+        return okm[:length]
+    
+    def derive(self, ikm: bytes, info: bytes = b"", length: int = 32) -> bytes:
+        """
+        One-shot derive: Extract + Expand.
+        
+        Args:
+            ikm: Input key material
+            info: Context info
+            length: Output length
+            
+        Returns:
+            Derived key material
+        """
+        prk = self.extract(ikm)
+        return self.expand(prk, info, length)
+
+
+# =============================================================================
+# MeteorKDF Class
+# =============================================================================
 
 
 class MeteorKDF(MeteorNC):
@@ -103,6 +212,10 @@ class MeteorKDF(MeteorNC):
         else:
             self.master_seed = seed
         
+        # HKDF instance (RFC 5869)
+        self._hkdf = HKDF(salt=b"MeteorNC-KDF-v1")
+        self._prk = None  # Pseudorandom key (computed on first use)
+        
         # Track if keys are expanded
         self.keys_expanded = False
         self.expansion_time = None
@@ -116,24 +229,53 @@ class MeteorKDF(MeteorNC):
         """
         return np.random.bytes(32)
     
+    def _get_prk(self) -> bytes:
+        """
+        Get or compute pseudorandom key from master seed.
+        
+        Uses HKDF-Extract (RFC 5869 Section 2.2).
+        
+        Returns:
+            32-byte PRK
+        """
+        if self._prk is None:
+            self._prk = self._hkdf.extract(self.master_seed)
+        return self._prk
+    
+    def _derive_bytes(self, info: str, length: int = 32) -> bytes:
+        """
+        Derive key material using HKDF-Expand (RFC 5869).
+        
+        This is used for:
+            - Key component generation
+            - Authentication system integration
+            - Domain-separated key derivation
+        
+        Args:
+            info: Context/purpose string (e.g., "orthogonal", "P_0")
+            length: Output length in bytes
+            
+        Returns:
+            Derived key material
+        """
+        prk = self._get_prk()
+        return self._hkdf.expand(prk, info.encode('utf-8'), length)
+    
     def _derive_subseed(self, purpose: str) -> int:
         """
-        Derive subseed for specific purpose using HKDF-like construction.
+        Derive integer subseed for NumPy/CuPy random generators.
+        
+        Uses HKDF (RFC 5869) for cryptographic key derivation.
         
         Args:
             purpose: Purpose string (e.g., "S", "P_0", "D_1", "R_2")
             
         Returns:
-            Derived seed as integer
+            Derived seed as integer (for np.random.seed)
         """
-        # HKDF-like: HMAC(master_seed, purpose)
-        h = hashlib.sha256()
-        h.update(self.master_seed)
-        h.update(purpose.encode('utf-8'))
-        
-        # Convert to integer seed
-        seed_bytes = h.digest()
-        seed_int = int.from_bytes(seed_bytes[:4], byteorder='big')
+        # Use HKDF to derive 4 bytes
+        seed_bytes = self._derive_bytes(purpose, length=4)
+        seed_int = int.from_bytes(seed_bytes, byteorder='big')
         
         return seed_int
     
