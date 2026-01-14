@@ -30,7 +30,7 @@ def demo_basic_flow():
     
     # Step 1: Client generates seed
     print("\n[Client] Generating user seed...")
-    auth = MeteorAuth(security_level=256, gpu=False)
+    auth = MeteorAuth(security_level=256, gpu=True)
     user_seed = auth.generate_seed()
     
     print(f"✓ User seed: {user_seed.hex()[:32]}...")
@@ -44,7 +44,7 @@ def demo_basic_flow():
     
     # Step 3: Server registration
     print("\n[Server] Registering user...")
-    server = MeteorAuthServer(gpu=False)
+    server = MeteorAuthServer(gpu=True)
     token = server.register(
         meteor_id,
         metadata={'username': 'alice', 'email': 'alice@example.com'}
@@ -100,7 +100,7 @@ def demo_device_binding():
     print("Meteor-Auth Demo: Device Binding")
     print("=" * 70)
     
-    auth = MeteorAuth(security_level=256, gpu=False)
+    auth = MeteorAuth(security_level=256, gpu=True)
     
     # Generate seed
     user_seed = auth.generate_seed()
@@ -145,7 +145,7 @@ def demo_qr_flow():
     print("Meteor-Auth Demo: QR Code Flow")
     print("=" * 70)
     
-    auth = MeteorAuth(security_level=256, gpu=False)
+    auth = MeteorAuth(security_level=256, gpu=True)
     
     # Generate and export
     print("\n[Client] Generate seed...")
@@ -183,7 +183,7 @@ def demo_recovery_codes():
     
     from meteor_nc.auth import generate_recovery_codes
     
-    auth = MeteorAuth(security_level=256, gpu=False)
+    auth = MeteorAuth(security_level=256, gpu=True)
     user_seed = auth.generate_seed()
     
     print("\n[Client] Generating recovery codes...")
@@ -210,7 +210,7 @@ def demo_performance():
     
     import time
     
-    auth = MeteorAuth(security_level=256, gpu=False)
+    auth = MeteorAuth(security_level=256, gpu=True)
     user_seed = auth.generate_seed()
     
     # Login timing
@@ -229,7 +229,7 @@ def demo_performance():
     
     # Full authentication flow timing
     print("\n[Benchmark] Full auth flow (P2P)...")
-    server = MeteorAuthServer(gpu=False)
+    server = MeteorAuthServer(gpu=True)
     meteor_id = auth.get_meteor_id(user_seed)
     token = server.register(meteor_id)
     
@@ -266,8 +266,8 @@ def demo_revocation():
     print("Meteor-Auth Demo: Token Revocation")
     print("=" * 70)
     
-    auth = MeteorAuth(security_level=256, gpu=False)
-    server = MeteorAuthServer(gpu=False)
+    auth = MeteorAuth(security_level=256, gpu=True)
+    server = MeteorAuthServer(gpu=True)
     
     # Register user
     print("\n[Setup] Registering user...")
