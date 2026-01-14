@@ -104,6 +104,7 @@ from .protocols import (
     # Advanced testing
     MeteorNetwork,
     LatencySimulator,
+    LatencyProfile, 
     SessionManager,
     
     # Web 4.0
@@ -159,6 +160,7 @@ __all__ = [
     # Protocols - Advanced
     'MeteorNetwork',
     'LatencySimulator',
+    'LatencyProfile', 
     'SessionManager',
     
     # Protocols - Web 4.0
