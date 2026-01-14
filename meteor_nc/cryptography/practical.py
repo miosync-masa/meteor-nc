@@ -248,13 +248,14 @@ class MeteorPractical:
         
         return {
             'ciphertext': chunk.ciphertext,
+            'tag': chunk.tag,  # ← これ追加！
             'seq': chunk.header.seq,
             'stream_id': chunk.header.stream_id,
             'original_len': len(data),
             'checksum': checksum,
             'encrypt_time': encrypt_time,
         }
-    
+        
     def _decrypt_bytes_internal(self, encrypted: Dict) -> bytes:
         """Internal decryption using StreamDEM."""
         start = time.time()
@@ -272,11 +273,10 @@ class MeteorPractical:
         chunk = EncryptedChunk(
             header=header,
             ciphertext=encrypted['ciphertext'],
-            tag=encrypted.get('tag', b''),  # Tag handled internally
+            tag=encrypted['tag'],  # ← これ修正！
         )
         
         # Decrypt
-        # Note: StreamDEM stores tag with ciphertext, need to handle
         data = self._stream.decrypt_chunk(chunk)
         
         decrypt_time = time.time() - start
@@ -387,6 +387,7 @@ class MeteorPractical:
         """
         return json.dumps({
             'ciphertext_b64': base64.b64encode(encrypted['ciphertext']).decode('ascii'),
+            'tag_b64': base64.b64encode(encrypted['tag']).decode('ascii'),  # ← 追加
             'stream_id_b64': base64.b64encode(encrypted['stream_id']).decode('ascii'),
             'seq': encrypted['seq'],
             'original_len': encrypted['original_len'],
@@ -410,6 +411,7 @@ class MeteorPractical:
         
         return {
             'ciphertext': base64.b64decode(data['ciphertext_b64']),
+            'tag': base64.b64decode(data['tag_b64']),  # ← 追加
             'stream_id': base64.b64decode(data['stream_id_b64']),
             'seq': data['seq'],
             'original_len': data['original_len'],
