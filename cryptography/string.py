@@ -494,7 +494,9 @@ class MeteorPractical(MeteorKDF):
 
 def create_practical_meteor(security_level: int = 256,
                             device_id: int = 0,
-                            seed: Optional[bytes] = None) -> MeteorPractical:
+                            seed: Optional[bytes] = None,
+                            apn_enabled: bool = True,
+                            apn_dynamic: bool = True) -> MeteorPractical:
     """
     Factory function for MeteorPractical.
     
@@ -504,6 +506,8 @@ def create_practical_meteor(security_level: int = 256,
         security_level: Security level (128, 256, 512, 1024, 2048)
         device_id: GPU device ID
         seed: Optional seed for key restoration
+        apn_enabled: Enable Adaptive Precision Noise
+        apn_dynamic: Use dynamic κ estimation (PowerIteration)
         
     Returns:
         Configured MeteorPractical instance
@@ -522,7 +526,14 @@ def create_practical_meteor(security_level: int = 256,
     n = security_level
     m = compute_layer_count(n)
     
-    return MeteorPractical(n=n, m=m, seed=seed, device_id=device_id)
+    return MeteorPractical(
+        n=n, 
+        m=m, 
+        seed=seed, 
+        device_id=device_id,
+        apn_enabled=apn_enabled,
+        apn_dynamic=apn_dynamic
+    )
 
 
 # =========================================================================
