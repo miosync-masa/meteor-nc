@@ -200,13 +200,14 @@ def demo_quick_functions():
     original = "Quick encryption test! 🚀"
     print(f"  Original: {original}")
     
-    # Quick encrypt (creates new keys each time)
-    encrypted_json = quick_encrypt_string(original)
+    # Quick encrypt returns (json_str, seed) tuple
+    encrypted_json, seed = quick_encrypt_string(original)
     print(f"  Encrypted (JSON): {encrypted_json[:50]}...")
+    print(f"  Seed: {seed.hex()[:32]}...")
     
-    # Quick decrypt
+    # Quick decrypt needs both json and seed
     print("\n[*] Using quick_decrypt_string...")
-    decrypted = quick_decrypt_string(encrypted_json)
+    decrypted = quick_decrypt_string(encrypted_json, seed)
     print(f"  Decrypted: {decrypted}")
     
     match = original == decrypted
