@@ -150,8 +150,8 @@ class BatchLWEKEM:
         E2 = cbd_i32(seeds_e2, MSG_BITS, self.eta)   # (MSG_BITS, batch) int32
         
         # 4. Encode message: M_bits * delta
-        M_bits_np = np.unpackbits(M_np, axis=1).astype(np.uint32)  # (batch, 256)
-        M_encoded = cp.asarray(M_bits_np, dtype=cp.uint32) * np.uint32(self.delta)
+        from .kernels.batch_kernels import unpack_to_encoded
+        M_encoded = unpack_to_encoded(M_gpu, self.delta) 
         
         # 5. U = A.T @ R + E1 (mod 2^32) via custom kernel
         U = matmul_AT_R(self.A, R, E1)  # (n, batch) uint32
@@ -217,9 +217,8 @@ class BatchLWEKEM:
         M_bits = ((V_signed > threshold) | (V_signed < -threshold)).astype(cp.uint8)
         
         # 5. Pack bits to bytes (CPU side)
-        M_bits_np = cp.asnumpy(M_bits).astype(np.uint8)
-        M_recovered_np = np.packbits(M_bits_np, axis=1)  # (batch, 32)
-        M_recovered = cp.asarray(M_recovered_np)
+        from .kernels.batch_kernels import pack_bits_gpu
+        M_recovered = pack_bits_gpu(M_bits) 
         
         # 6. Re-derive FO seeds
         seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_recovered, self.pk_hash)
