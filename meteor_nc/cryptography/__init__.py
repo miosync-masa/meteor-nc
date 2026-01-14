@@ -33,6 +33,13 @@ try:
 except ImportError:
     STREAM_AVAILABLE = False
 
+# Practical encryption
+try:
+    from .practical import MeteorPractical, create_meteor, quick_encrypt, quick_decrypt
+    PRACTICAL_AVAILABLE = True
+except ImportError:
+    PRACTICAL_AVAILABLE = False
+
 __all__ = [
     # Core
     "HKDF",
@@ -45,6 +52,11 @@ __all__ = [
     "StreamDEM",
     "EncryptedChunk",
     "StreamHeader",
+    # Practical
+    "MeteorPractical",
+    "create_meteor",
+    "quick_encrypt",
+    "quick_decrypt",
     # Constants
     "Q_DEFAULT",
     "MSG_BYTES",
@@ -55,4 +67,5 @@ __all__ = [
     "CRYPTO_AVAILABLE",
     "BATCH_AVAILABLE",
     "STREAM_AVAILABLE",
+    "PRACTICAL_AVAILABLE",
 ]
