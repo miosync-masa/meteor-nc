@@ -486,21 +486,19 @@ def create_kdf_meteor(security_level: int = 256,
         >>> crypto2 = create_kdf_meteor(256, seed=seed)
         >>> crypto2.expand_keys()
     """
-    security_configs = {
-        128: {'n': 128, 'm': 8},
-        256: {'n': 256, 'm': 10},
-        512: {'n': 512, 'm': 12},
-        1024: {'n': 1024, 'm': 12},
-        2048: {'n': 2048, 'm': 14},
-    }
+    from .core import compute_layer_count
     
-    if security_level not in security_configs:
-        raise ValueError(f"Security level must be one of {list(security_configs.keys())}")
+    valid_levels = [128, 256, 512, 1024, 2048]
     
-    config = security_configs[security_level]
+    if security_level not in valid_levels:
+        raise ValueError(f"Security level must be one of {valid_levels}")
+    
+    n = security_level
+    m = compute_layer_count(n)
+    
     return MeteorKDF(
-        n=config['n'],
-        m=config['m'],
+        n=n,
+        m=m,
         seed=seed,
         device_id=device_id
     )
