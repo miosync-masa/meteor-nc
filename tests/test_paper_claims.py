@@ -40,6 +40,8 @@ def create_crypto(n: int, m: int = None):
     """Create crypto instance (GPU required)."""
     if not USE_GPU:
         raise RuntimeError("GPU required for paper claims verification")
+    if m is None:
+        m = max(8, n // 32 + 2)  # Paper formula: m = max(8, ⌊n/32⌋ + 2)
     crypto = MeteorKDF(n=n, m=m)
     return crypto
 
