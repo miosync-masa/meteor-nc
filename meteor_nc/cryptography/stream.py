@@ -19,8 +19,13 @@ from .common import GPU_AVAILABLE, _sha256
 
 if GPU_AVAILABLE:
     import cupy as cp
-    from .kernels.chacha_poly_kernel import GPUChaCha20Poly1305
-
+    try:
+        from .kernels.chacha_poly_kernel import GPUChaCha20Poly1305
+        STREAM_GPU_AVAILABLE = True
+    except ImportError:
+        STREAM_GPU_AVAILABLE = False
+else:
+    STREAM_GPU_AVAILABLE = False
 
 @dataclass
 class StreamHeader:
