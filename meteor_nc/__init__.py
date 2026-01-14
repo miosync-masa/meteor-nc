@@ -1,6 +1,11 @@
 # meteor_nc/__init__.py
 """
 Meteor-NC: Post-Quantum Hybrid Cryptosystem
+
+WEB4.0 Protocol Ready!
+- Post-Quantum Key Encapsulation (LWE-KEM)
+- High-Speed Streaming Encryption (XChaCha20-Poly1305)
+- P2P Communication Protocol
 """
 
 __version__ = "2.0.0"
@@ -22,25 +27,85 @@ from .cryptography.core import (
     SymmetricMixer,
 )
 
-# Batch (GPU required) - optional import
+# Batch KEM (GPU required)
 try:
     from .cryptography.batch import BatchLWEKEM
     BATCH_AVAILABLE = True
 except ImportError:
     BATCH_AVAILABLE = False
 
+# Stream DEM (XChaCha20-Poly1305)
+try:
+    from .cryptography.stream import StreamDEM, EncryptedChunk, StreamHeader
+    STREAM_AVAILABLE = True
+except ImportError:
+    STREAM_AVAILABLE = False
+
+# Practical API (String/File encryption)
+try:
+    from .cryptography.practical import (
+        MeteorPractical,
+        create_meteor,
+        quick_encrypt,
+        quick_decrypt,
+    )
+    PRACTICAL_AVAILABLE = True
+except ImportError:
+    PRACTICAL_AVAILABLE = False
+
+# Protocol Layer (P2P Communication)
+try:
+    from .protocols.meteor_protocol import (
+        MeteorNode,
+        MeteorPeer,
+        MeteorMessage,
+        MeteorProtocol,
+    )
+    PROTOCOL_AVAILABLE = True
+except ImportError:
+    PROTOCOL_AVAILABLE = False
+
 __all__ = [
+    # Version
+    "__version__",
+    
+    # Core Cryptography
     "HKDF",
     "LWEKEM",
     "HybridKEM",
     "SymmetricMixer",
+    
+    # Batch KEM
     "BatchLWEKEM",
+    
+    # Stream DEM
+    "StreamDEM",
+    "EncryptedChunk",
+    "StreamHeader",
+    
+    # Practical API
+    "MeteorPractical",
+    "create_meteor",
+    "quick_encrypt",
+    "quick_decrypt",
+    
+    # Protocol
+    "MeteorNode",
+    "MeteorPeer",
+    "MeteorMessage",
+    "MeteorProtocol",
+    
+    # Constants
     "Q_DEFAULT",
     "MSG_BYTES",
     "MSG_BITS",
     "SECURITY_PARAMS",
+    
+    # Availability Flags
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
     "BATCH_AVAILABLE",
-    "__version__",
+    "STREAM_AVAILABLE",
+    "PRACTICAL_AVAILABLE",
+    "PROTOCOL_AVAILABLE",
 ]
