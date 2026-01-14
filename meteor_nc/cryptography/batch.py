@@ -38,8 +38,9 @@ from .kernels.batch_kernels import (
     bdot_R,
     b_from_As,
     sdot_U,
+    unpack_to_encoded,
+    pack_bits_gpu,
 )
-
 
 # =============================================================================
 # Constants
@@ -150,7 +151,6 @@ class BatchLWEKEM:
         E2 = cbd_i32(seeds_e2, MSG_BITS, self.eta)   # (MSG_BITS, batch) int32
         
         # 4. Encode message: M_bits * delta
-        from .kernels.batch_kernels import unpack_to_encoded
         M_encoded = unpack_to_encoded(M_gpu, self.delta) 
         
         # 5. U = A.T @ R + E1 (mod 2^32) via custom kernel
@@ -217,7 +217,6 @@ class BatchLWEKEM:
         M_bits = ((V_signed > threshold) | (V_signed < -threshold)).astype(cp.uint8)
         
         # 5. Pack bits to bytes (CPU side)
-        from .kernels.batch_kernels import pack_bits_gpu
         M_recovered = pack_bits_gpu(M_bits) 
         
         # 6. Re-derive FO seeds
