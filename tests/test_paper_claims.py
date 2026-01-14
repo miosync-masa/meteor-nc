@@ -46,6 +46,24 @@ def create_crypto(n: int, m: int = None):
     return crypto
 
 
+def safe_encrypt(crypto, message: np.ndarray) -> np.ndarray:
+    """Encrypt and handle batch dimension."""
+    ct = crypto.encrypt(message)
+    # Handle batch dimension if present (1, n, n) -> (n, n)
+    if hasattr(ct, 'ndim') and ct.ndim == 3:
+        ct = ct[0]
+    return ct
+
+
+def safe_decrypt(crypto, ciphertext: np.ndarray) -> np.ndarray:
+    """Decrypt and handle batch dimension."""
+    result = crypto.decrypt(ciphertext)
+    # Handle batch dimension if present
+    if hasattr(result, 'ndim') and result.ndim == 3:
+        result = result[0]
+    return result
+
+
 class PaperClaimsVerification:
     """Verify claims from TCHES paper Section 6."""
     
@@ -99,8 +117,8 @@ class PaperClaimsVerification:
             
             for msg in messages:
                 # Encrypt and decrypt
-                ciphertext = crypto.encrypt(msg.astype(np.float64))
-                decrypted = crypto.decrypt(ciphertext)
+                ciphertext = safe_encrypt(crypto, msg.astype(np.float64))
+                decrypted = safe_decrypt(crypto, ciphertext)
                 
                 # Calculate error
                 error = np.max(np.abs(decrypted - msg))
@@ -169,7 +187,7 @@ class PaperClaimsVerification:
         # Generate test messages
         messages = [np.random.randint(0, 256, size=(self.n, self.n)).astype(np.float64) 
                    for _ in range(num_iterations)]
-        ciphertexts = [crypto.encrypt(msg) for msg in messages]
+        ciphertexts = [safe_encrypt(crypto, msg) for msg in messages]
         
         # Method 1: Standard decryption (uses cached internally, but measure total)
         # We'll compare first decrypt (cold) vs subsequent (warm/cached)
@@ -182,17 +200,17 @@ class PaperClaimsVerification:
         crypto.expand_keys()
         
         # Time first decryption (includes Cholesky computation)
-        ciphertext = crypto.encrypt(messages[0])
+        ciphertext = safe_encrypt(crypto, messages[0])
         
         start = time.time()
-        _ = crypto.decrypt(ciphertext)
+        _ = safe_decrypt(crypto, ciphertext)
         cold_time = time.time() - start
         
         # Time subsequent decryptions (cached Cholesky)
         warm_times = []
         for ct in ciphertexts[1:50]:  # 50 iterations
             start = time.time()
-            _ = crypto.decrypt(ct)
+            _ = safe_decrypt(crypto, ct)
             warm_times.append(time.time() - start)
         
         avg_warm_time = np.mean(warm_times)
@@ -247,7 +265,7 @@ class PaperClaimsVerification:
         # Encrypt same message multiple times
         ciphertexts = []
         for i in range(num_encryptions):
-            ct = crypto.encrypt(message.copy())
+            ct = safe_encrypt(crypto, message.copy())
             ciphertexts.append(ct.flatten())
         
         # Check uniqueness
@@ -271,7 +289,7 @@ class PaperClaimsVerification:
         decryption_errors = []
         for ct_flat in ciphertexts[:10]:
             ct = ct_flat.reshape(self.n, self.n)
-            decrypted = crypto.decrypt(ct)
+            decrypted = safe_decrypt(crypto, ct)
             error = np.max(np.abs(decrypted - message))
             decryption_errors.append(error)
         
@@ -347,8 +365,8 @@ class PaperClaimsVerification:
         
         for name, message in test_cases.items():
             try:
-                ciphertext = crypto.encrypt(message)
-                decrypted = crypto.decrypt(ciphertext)
+                ciphertext = safe_encrypt(crypto, message)
+                decrypted = safe_decrypt(crypto, ciphertext)
                 error = np.max(np.abs(decrypted - message))
                 
                 # For scaled inputs, use relative error
@@ -439,8 +457,8 @@ class PaperClaimsVerification:
         errors = []
         
         for cycle in range(num_cycles):
-            ciphertext = crypto.encrypt(message)
-            decrypted = crypto.decrypt(ciphertext)
+            ciphertext = safe_encrypt(crypto, message)
+            decrypted = safe_decrypt(crypto, ciphertext)
             error = np.max(np.abs(decrypted - message))
             errors.append(error)
             
@@ -508,7 +526,7 @@ class PaperClaimsVerification:
         ciphertexts = []
         for _ in range(num_samples):
             msg = np.random.randint(0, 256, size=(self.n, self.n)).astype(np.float64)
-            ct = crypto.encrypt(msg)
+            ct = safe_encrypt(crypto, msg)
             ciphertexts.append(ct.flatten())
         
         ct_array = np.array(ciphertexts)  # shape: (num_samples, n*n)
