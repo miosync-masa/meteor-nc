@@ -201,10 +201,37 @@ class MeteorKDF(MeteorNC):
                  noise_std: float = 1e-10,
                  rank_reduction: float = 0.3,
                  device_id: int = 0,
-                 seed: Optional[bytes] = None):
-        """Initialize KDF-based Meteor-NC."""
+                 seed: Optional[bytes] = None,
+                 apn_enabled: bool = True,
+                 apn_dynamic: bool = True,
+                 apn_iterations: int = 20,
+                 apn_safety_factor: float = 10000.0):
+        """
+        Initialize KDF-based Meteor-NC.
         
-        super().__init__(n, m, noise_std, rank_reduction, device_id)
+        Args:
+            n: Matrix dimension (security level)
+            m: Number of projection layers
+            noise_std: Base noise standard deviation
+            rank_reduction: Projection rank deficit ratio
+            device_id: GPU device ID
+            seed: Master seed (32 bytes, auto-generated if None)
+            apn_enabled: Enable Adaptive Precision Noise
+            apn_dynamic: Use dynamic κ estimation (PowerIteration)
+            apn_iterations: Iterations for condition number estimation
+            apn_safety_factor: Static APN safety factor κ (fallback)
+        """
+        super().__init__(
+            n=n, 
+            m=m, 
+            noise_std=noise_std, 
+            rank_reduction=rank_reduction, 
+            device_id=device_id,
+            apn_enabled=apn_enabled,
+            apn_dynamic=apn_dynamic,
+            apn_iterations=apn_iterations,
+            apn_safety_factor=apn_safety_factor
+        )
         
         # Master seed (32 bytes)
         if seed is None:
@@ -606,7 +633,9 @@ class MeteorKDF(MeteorNC):
 
 def create_kdf_meteor(security_level: int = 256,
                      device_id: int = 0,
-                     seed: Optional[bytes] = None) -> MeteorKDF:
+                     seed: Optional[bytes] = None,
+                     apn_enabled: bool = True,
+                     apn_dynamic: bool = True) -> MeteorKDF:
     """
     Create KDF-based Meteor-NC with predefined security level.
     
@@ -614,6 +643,8 @@ def create_kdf_meteor(security_level: int = 256,
         security_level: 128, 256, 512, 1024, or 2048 bits
         device_id: GPU device ID
         seed: Optional 32-byte seed
+        apn_enabled: Enable Adaptive Precision Noise
+        apn_dynamic: Use dynamic κ estimation (PowerIteration)
         
     Returns:
         MeteorKDF instance
@@ -642,7 +673,9 @@ def create_kdf_meteor(security_level: int = 256,
         n=n,
         m=m,
         seed=seed,
-        device_id=device_id
+        device_id=device_id,
+        apn_enabled=apn_enabled,
+        apn_dynamic=apn_dynamic
     )
 
 
