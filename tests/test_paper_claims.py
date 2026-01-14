@@ -112,12 +112,12 @@ class PaperClaimsVerification:
         start_time = time.time()
         
         for batch_idx in range(num_batches):
-            # Generate random messages
-            messages = np.random.randint(0, 256, size=(batch_size, self.n, self.n))
+            # Generate random messages as (n,) vectors
+            messages = np.random.randint(0, 256, size=(batch_size, self.n)).astype(np.float64)
             
             for msg in messages:
-                # Encrypt and decrypt
-                ciphertext = safe_encrypt(crypto, msg.astype(np.float64))
+                # Encrypt and decrypt (n,) vector
+                ciphertext = safe_encrypt(crypto, msg)
                 decrypted = safe_decrypt(crypto, ciphertext)
                 
                 # Calculate error
@@ -184,8 +184,8 @@ class PaperClaimsVerification:
         crypto.key_gen()
         crypto.expand_keys()
         
-        # Generate test messages
-        messages = [np.random.randint(0, 256, size=(self.n, self.n)).astype(np.float64) 
+        # Generate test messages as (n,) vectors
+        messages = [np.random.randint(0, 256, size=(self.n,)).astype(np.float64) 
                    for _ in range(num_iterations)]
         ciphertexts = [safe_encrypt(crypto, msg) for msg in messages]
         
@@ -259,8 +259,8 @@ class PaperClaimsVerification:
         if USE_GPU:
             crypto.expand_keys()
         
-        # Fixed message
-        message = np.ones((self.n, self.n), dtype=np.float64) * 42
+        # Fixed message as (n,) vector
+        message = np.ones((self.n,), dtype=np.float64) * 42
         
         # Encrypt same message multiple times
         ciphertexts = []
@@ -288,8 +288,8 @@ class PaperClaimsVerification:
         # Verify decryption still works
         decryption_errors = []
         for ct_flat in ciphertexts[:10]:
-            ct = ct_flat.reshape(self.n, self.n)
-            decrypted = safe_decrypt(crypto, ct)
+            # ct is already (n,), no reshape needed
+            decrypted = safe_decrypt(crypto, ct_flat)
             error = np.max(np.abs(decrypted - message))
             decryption_errors.append(error)
         
@@ -348,16 +348,15 @@ class PaperClaimsVerification:
             crypto.expand_keys()
         
         test_cases = {
-            'zero_vector': np.zeros((self.n, self.n)),
-            'unit_vector': np.ones((self.n, self.n)),
-            'scaled_1e10': np.ones((self.n, self.n)) * 1e10,
-            'scaled_1e-10': np.ones((self.n, self.n)) * 1e-10,
-            'alternating': np.array([[(-1)**(i+j) for j in range(self.n)] 
-                                     for i in range(self.n)], dtype=np.float64),
-            'sparse_1pct': self._create_sparse_matrix(self.n, 0.01),
-            'single_impulse': self._create_impulse_matrix(self.n),
-            'random_int': np.random.randint(0, 256, size=(self.n, self.n)).astype(np.float64),
-            'random_gaussian': np.random.randn(self.n, self.n) * 100,
+            'zero_vector': np.zeros((self.n,)),
+            'unit_vector': np.ones((self.n,)),
+            'scaled_1e10': np.ones((self.n,)) * 1e10,
+            'scaled_1e-10': np.ones((self.n,)) * 1e-10,
+            'alternating': np.array([(-1)**i for i in range(self.n)], dtype=np.float64),
+            'sparse_1pct': self._create_sparse_vector(self.n, 0.01),
+            'single_impulse': self._create_impulse_vector(self.n),
+            'random_int': np.random.randint(0, 256, size=(self.n,)).astype(np.float64),
+            'random_gaussian': np.random.randn(self.n) * 100,
         }
         
         results_detail = {}
@@ -408,21 +407,20 @@ class PaperClaimsVerification:
         self.results['numerical_stability'] = result
         return result
     
-    def _create_sparse_matrix(self, n: int, density: float) -> np.ndarray:
-        """Create sparse matrix with given density."""
-        matrix = np.zeros((n, n))
-        num_nonzero = int(n * n * density)
-        indices = np.random.choice(n * n, num_nonzero, replace=False)
+    def _create_sparse_vector(self, n: int, density: float) -> np.ndarray:
+        """Create sparse vector with given density."""
+        vector = np.zeros(n)
+        num_nonzero = int(n * density)
+        indices = np.random.choice(n, num_nonzero, replace=False)
         for idx in indices:
-            i, j = idx // n, idx % n
-            matrix[i, j] = np.random.randint(1, 256)
-        return matrix
+            vector[idx] = np.random.randint(1, 256)
+        return vector
     
-    def _create_impulse_matrix(self, n: int) -> np.ndarray:
+    def _create_impulse_vector(self, n: int) -> np.ndarray:
         """Create single impulse (one nonzero element)."""
-        matrix = np.zeros((n, n))
-        matrix[n//2, n//2] = 255.0
-        return matrix
+        vector = np.zeros(n)
+        vector[n//2] = 255.0
+        return vector
     
     # =========================================================================
     # Section 6.5.3: Long-Term Stability
@@ -451,8 +449,8 @@ class PaperClaimsVerification:
         if USE_GPU:
             crypto.expand_keys()
         
-        # Fixed message for consistency
-        message = np.random.randint(0, 256, size=(self.n, self.n)).astype(np.float64)
+        # Fixed message as (n,) vector for consistency
+        message = np.random.randint(0, 256, size=(self.n,)).astype(np.float64)
         
         errors = []
         
@@ -522,18 +520,18 @@ class PaperClaimsVerification:
         if USE_GPU:
             crypto.expand_keys()
         
-        # Generate random messages and collect ciphertexts
+        # Generate random messages as (n,) vectors and collect ciphertexts
         ciphertexts = []
         for _ in range(num_samples):
-            msg = np.random.randint(0, 256, size=(self.n, self.n)).astype(np.float64)
+            msg = np.random.randint(0, 256, size=(self.n,)).astype(np.float64)
             ct = safe_encrypt(crypto, msg)
             ciphertexts.append(ct.flatten())
         
-        ct_array = np.array(ciphertexts)  # shape: (num_samples, n*n)
+        ct_array = np.array(ciphertexts)  # shape: (num_samples, n)
         
         # Test normality for each dimension (sample of dimensions)
-        num_dims_to_test = min(256, self.n * self.n)
-        dim_indices = np.random.choice(self.n * self.n, num_dims_to_test, replace=False)
+        num_dims_to_test = min(256, self.n)
+        dim_indices = np.random.choice(self.n, num_dims_to_test, replace=False)
         
         normality_passed = 0
         for dim_idx in dim_indices:
