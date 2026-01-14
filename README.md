@@ -176,27 +176,40 @@ meteor-nc/
 
 ## 🧪 Testing
 
+### Basic Tests
 ```bash
-# Run all tests (requires GPU)
 python tests/test_security_validation.py
 python tests/test_basic_protocol.py
 python tests/test_string_encryption.py
 python tests/test_integrated.py
-python tests/test_advanced_web4.py
-
-# GPU scaling benchmark
-python tests/test_gpu_scaling.py
 ```
 
-### Test Results
+### Paper Claims Verification
 
-| Test Suite | Tests | Status |
-|------------|-------|--------|
-| Security Validation | 10 | ✅ All Pass |
-| Basic Protocol | 8 | ✅ All Pass |
-| String Encryption | 8 | ✅ All Pass |
-| Integrated (E2E) | 6 | ✅ All Pass |
-| Advanced/Web4 | 5 | ✅ 4 Pass, 1 Skip |
+Verifies claims from the TCHES paper (Section 6).
+
+```bash
+# Quick test (~3 min)
+python tests/test_paper_claims.py
+
+# Full test - matches paper parameters (~40 min)
+python tests/test_paper_claims.py -f
+
+# Different security levels
+python tests/test_paper_claims.py -n 128
+python tests/test_paper_claims.py -n 512
+```
+
+### Verification Results (NVIDIA A100, n=256, Full Mode)
+
+| Test | Result | Paper Claim |
+|------|--------|-------------|
+| APN IND-CPA | 4950/4950 unique ✅ | 100% unique ciphertexts |
+| Numerical Stability | 9/9 passed ✅ | All extreme inputs |
+| Ciphertext Distribution | 89.5% normal ✅ | >80% normality |
+| Long-Term Stability | drift=0.05% ✅ | No drift (10K cycles) |
+| Million Messages | 0 failures ✅ | 0 failures / 10⁶ |
+| Max Decryption Error | 2.70×10⁻¹² ✅ | < 10⁻¹⁰ |
 
 ---
 
