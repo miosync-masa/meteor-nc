@@ -212,10 +212,8 @@ class BatchLWEKEM:
         V_dec = V_gpu - S_dot_U[:, None]  # auto wrap uint32
         
         # 4. Decode message bits
-        half_q = np.uint32(2**31)
-        V_centered = cp.where(V_dec > half_q, V_dec.astype(cp.int64) - 2**32, V_dec.astype(cp.int64))
-        threshold = 2**30  # q // 4
-        M_bits = (cp.abs(V_centered) > threshold).astype(cp.uint8)  # (batch, MSG_BITS)
+        V_signed = V_dec.view(cp.int32)  # uint32 → int32 再解釈（コピーなし）
+        M_bits = (cp.abs(V_signed) > (1 << 30)).astype(cp.uint8)
         
         # 5. Pack bits to bytes (CPU side)
         M_bits_np = cp.asnumpy(M_bits).astype(np.uint8)
