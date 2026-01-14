@@ -318,7 +318,7 @@ def demo_verify_device_binding():
     
     from meteor_nc.auth import verify_device_binding
     
-    auth = MeteorAuth(security_level=256, gpu=False)
+    auth = MeteorAuth(security_level=256, gpu=True)
     user_seed = auth.generate_seed()
     meteor_id = auth.get_meteor_id(user_seed)
     
