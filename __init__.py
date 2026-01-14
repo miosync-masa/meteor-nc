@@ -9,7 +9,7 @@ Modules:
     protocols: P2P communication (MeteorNode, Web4)
     auth: Device-bound authentication (MeteorAuth)
 
-Quick Start:
+Quick Start (GPU):
     >>> from meteor_nc import MeteorKDF
     >>>
     >>> # Create and generate keys
@@ -23,11 +23,19 @@ Quick Start:
     >>> ciphertext = crypto.encrypt(message)
     >>> plaintext = crypto.decrypt(ciphertext)
 
+Quick Start (CPU - no CuPy required):
+    >>> from meteor_nc import create_kdf_meteor
+    >>>
+    >>> # CPU mode with gpu=False
+    >>> crypto = create_kdf_meteor(256, gpu=False)
+    >>> crypto.key_gen()
+    >>> crypto.expand_keys()
+
 P2P Communication:
     >>> from meteor_nc import MeteorNode
     >>>
-    >>> alice = MeteorNode("Alice")
-    >>> bob = MeteorNode("Bob")
+    >>> alice = MeteorNode("Alice", gpu=False)
+    >>> bob = MeteorNode("Bob", gpu=False)
     >>>
     >>> # Exchange 32-byte IDs (no key exchange needed!)
     >>> alice.add_peer("Bob", bob.get_meteor_id())
@@ -40,7 +48,7 @@ P2P Communication:
 Authentication:
     >>> from meteor_nc import MeteorAuth
     >>>
-    >>> auth = MeteorAuth()
+    >>> auth = MeteorAuth(gpu=False)
     >>> seed = auth.generate_seed()  # Save as QR!
     >>> node = auth.login(seed)      # Device-bound login
 
@@ -48,7 +56,7 @@ Security:
     - IND-CPA secure via Adaptive Precision Noise (APN)
     - 32-byte key storage (99.9998% reduction)
     - Quantum-resistant (no known quantum attacks)
-    - GPU-accelerated (820K msg/s)
+    - GPU-accelerated (820K msg/s) or CPU fallback
 
 Author: Masamichi Iizumi
 License: MIT
@@ -59,16 +67,24 @@ __author__ = "Masamichi Iizumi"
 
 # Convenience imports from cryptography
 from .cryptography import (
-    # Core classes
+    # Core classes (GPU)
     MeteorNC,
     MeteorKDF,
     MeteorPractical,
     HKDF,
     
-    # Factory functions
+    # Core classes (CPU - no CuPy required)
+    MeteorNC_CPU,
+    MeteorKDF_CPU,
+    
+    # Factory functions (GPU)
     create_meteor,
     create_kdf_meteor,
     create_practical_meteor,
+    
+    # Factory functions (CPU)
+    create_meteor_cpu,
+    create_kdf_meteor_cpu,
     
     # Utilities
     check_gpu_available,
@@ -111,16 +127,24 @@ __all__ = [
     '__version__',
     '__author__',
     
-    # Cryptography - Core
+    # Cryptography - Core (GPU)
     'MeteorNC',
     'MeteorKDF',
     'MeteorPractical',
     'HKDF',
     
-    # Cryptography - Factory
+    # Cryptography - Core (CPU)
+    'MeteorNC_CPU',
+    'MeteorKDF_CPU',
+    
+    # Cryptography - Factory (GPU)
     'create_meteor',
     'create_kdf_meteor',
     'create_practical_meteor',
+    
+    # Cryptography - Factory (CPU)
+    'create_meteor_cpu',
+    'create_kdf_meteor_cpu',
     
     # Cryptography - Utilities
     'check_gpu_available',
