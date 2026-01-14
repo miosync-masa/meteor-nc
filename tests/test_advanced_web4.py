@@ -98,9 +98,9 @@ def demo_latency_simulator():
     # Add to simulator
     sim.add_node_pair(alice, bob)
     
-    # Simulate communication
+    # Simulate communication (max 252 bytes per message for n=256)
     print("\n[*] Simulating 100 messages...")
-    results = sim.simulate_communication(num_messages=100, message_size=1024)
+    results = sim.simulate_communication(num_messages=100, message_size=200)
     
     print(f"\n[Results]")
     print(f"  Messages sent: {results['messages_sent']}")
