@@ -125,14 +125,18 @@ class MeteorPractical:
         # Derive session key for StreamDEM
         self._session_key = _sha256(b"stream-session", self.master_seed)
         
-        # Initialize StreamDEM
+        # Derive deterministic stream_id from seed
+        stream_id = _sha256(b"stream-id", self.master_seed)[:16]
+        
+        # Initialize StreamDEM with deterministic stream_id
         self._stream = StreamDEM(
             session_key=self._session_key,
+            stream_id=stream_id,
             gpu=self.gpu,
             device_id=self.device_id,
-        )
-        
-        return time.time() - start
+    )
+    
+    return time.time() - start
     
     @property
     def keys_ready(self) -> bool:
