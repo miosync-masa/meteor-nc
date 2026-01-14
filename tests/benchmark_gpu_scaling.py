@@ -6,8 +6,7 @@ Tests performance across security levels (128, 256, 512, 1024).
 Validates three-fold security (LTDF/NCSP/Procrustes).
 
 Usage:
-    # In Google Colab with A100 GPU
-    !cd /content/meteor-nc && python tests/benchmark_gpu_scaling.py
+python tests/benchmark_gpu_scaling.py
 """
 
 # ============================================================================
