@@ -35,6 +35,8 @@ Example:
     >>> plaintexts = crypto.decrypt_batch(ciphertexts, method='optimized')
 """
 
+from __future__ import annotations
+
 import numpy as np
 import time
 from typing import Optional, Tuple
@@ -429,7 +431,7 @@ class MeteorNC:
 
         return result, elapsed
 
-    def _get_cached_decomposition(self) -> Tuple[cp.ndarray, cp.ndarray]:
+    def _get_cached_decomposition(self) -> Tuple:
         """Get or compute cached composite and Cholesky decomposition."""
         if self._composite_cache is None or self._cholesky_cache is None:
             composite = cp.eye(self.n, dtype=cp.float64)
@@ -870,6 +872,7 @@ class MeteorNC:
 def create_meteor(security_level: int = 256, 
                   device_id: int = 0,
                   apn_enabled: bool = True,
+                  apn_dynamic: bool = True,
                   apn_safety_factor: float = 10000.0) -> MeteorNC:
     """
     Create Meteor-NC instance with predefined security level.
@@ -878,7 +881,8 @@ def create_meteor(security_level: int = 256,
         security_level: 128, 256, 512, 1024, or 2048 bits
         device_id: GPU device ID
         apn_enabled: Enable Adaptive Precision Noise
-        apn_safety_factor: APN safety factor κ
+        apn_dynamic: Use dynamic κ estimation (PowerIteration)
+        apn_safety_factor: Static APN safety factor κ (fallback)
         
     Returns:
         Configured MeteorNC instance
@@ -901,6 +905,7 @@ def create_meteor(security_level: int = 256,
         m=m, 
         device_id=device_id,
         apn_enabled=apn_enabled,
+        apn_dynamic=apn_dynamic,
         apn_safety_factor=apn_safety_factor
     )
 
