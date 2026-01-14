@@ -274,8 +274,10 @@ class GPUChaCha20Poly1305:
         # HChaCha20
         subkey = self._hchacha20(self.key, nonce[:16])
         
-        # ChaCha20 block 0
-        chacha_nonce = b"\x00\x00\x00\x00" + nonce[16:]
+        # ChaCha20 nonce: cryptography expects 16 bytes (counter + nonce)
+        # Format: 4-byte counter (0) + 12-byte nonce
+        # nonce[16:24] is 8 bytes, so we need to pad
+        chacha_nonce = b"\x00\x00\x00\x00" + b"\x00\x00\x00\x00" + nonce[16:24]  # 16 bytes total
         
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
         cipher = Cipher(algorithms.ChaCha20(subkey, chacha_nonce), mode=None)
