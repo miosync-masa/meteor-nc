@@ -29,8 +29,6 @@ Example:
     >>> token = server.register(meteor_id)
     >>> is_valid = server.authenticate(token, response)
 
-Author: Masamichi Iizumi
-License: MIT
 """
 
 from .core import (
