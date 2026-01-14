@@ -69,7 +69,7 @@ def demo_text_message():
 def demo_binary_transfer():
     """Test binary data (file-like) transfer"""
     print("\n" + "=" * 70)
-    print("Demo 2: Binary Data Transfer (File Simulation)")
+    print("Demo 2: Binary Data Transfer (Small Packet)")
     print("=" * 70)
     
     # Create nodes
@@ -80,17 +80,18 @@ def demo_binary_transfer():
     alice.add_peer("Bob", bob.get_meteor_id())
     bob.add_peer("Alice", alice.get_meteor_id())
     
-    # Create "file" data (random binary)
-    print("\n[*] Creating simulated file (10KB)...")
-    file_data = os.urandom(10 * 1024)  # 10KB random data
-    file_name = "secret_document.pdf"
+    # MeteorNode has 252-byte limit (n=256 - 4 byte header)
+    # For larger files, use MeteorPractical instead
+    print("\n[*] Creating small binary packet (200 bytes)...")
+    file_data = os.urandom(150)  # 150 bytes random data
+    file_name = "data.bin"
     
-    # Create header + data
-    header = f"FILE:{file_name}:{len(file_data)}:".encode()
+    # Create header + data (must fit in 252 bytes)
+    header = f"BIN:{file_name}:".encode()  # ~15 bytes
     payload = header + file_data
-    print(f"  File: {file_name}")
-    print(f"  Size: {len(file_data):,} bytes")
-    print(f"  Total payload: {len(payload):,} bytes")
+    print(f"  Header: {len(header)} bytes")
+    print(f"  Data: {len(file_data)} bytes")
+    print(f"  Total payload: {len(payload)} bytes (max: 252)")
     
     # Send
     print("\n[*] Sending file...")
@@ -106,15 +107,16 @@ def demo_binary_transfer():
     recv_time = time.time() - start
     print(f"  ✓ Decrypted in {recv_time*1000:.2f}ms")
     
-    # Parse header
-    parts = decrypted.split(b':', 3)
+    # Parse header (BIN:filename:data)
+    parts = decrypted.split(b':', 2)
+    recv_type = parts[0].decode()
     recv_name = parts[1].decode()
-    recv_size = int(parts[2])
-    recv_data = parts[3]
+    recv_data = parts[2]
     
-    print(f"\n[Received File]")
+    print(f"\n[Received Packet]")
+    print(f"  Type: {recv_type}")
     print(f"  Name: {recv_name}")
-    print(f"  Size: {recv_size:,} bytes")
+    print(f"  Size: {len(recv_data)} bytes")
     print(f"  Data match: {'✅' if recv_data == file_data else '❌'}")
     
     print("\n✅ Binary Transfer: PASS")
@@ -213,7 +215,7 @@ def demo_meteor_protocol():
     # Network stats
     print("\n[*] Network statistics...")
     stats = protocol.get_network_stats()
-    print(f"  Nodes: {stats['num_nodes']}")
+    print(f"  Nodes: {stats['nodes']}")
     print(f"  Total messages: {stats['total_messages']}")
     print(f"  Total bytes: {stats['total_bytes']:,}")
     
@@ -356,11 +358,18 @@ def demo_stats_and_cleanup():
     return True
 
 
-def demo_large_file():
-    """Test large file transfer"""
+def demo_chunked_transfer():
+    """Test chunked data transfer (within MeteorNode limits)"""
     print("\n" + "=" * 70)
-    print("Demo 8: Large File Transfer (1MB)")
+    print("Demo 8: Chunked Data Transfer")
     print("=" * 70)
+    
+    # NOTE: MeteorNode has 252-byte message limit (n=256 - 4 header)
+    # For large files (KB/MB), use MeteorPractical instead!
+    # This demo shows small chunked transfer within limits.
+    
+    print("\n[*] NOTE: MeteorNode has 252-byte limit per message")
+    print("    For large files, use MeteorPractical (see test_string_encryption.py)")
     
     # Create nodes
     print("\n[*] Creating nodes...")
@@ -370,38 +379,35 @@ def demo_large_file():
     alice.add_peer("Bob", bob.get_meteor_id())
     bob.add_peer("Alice", alice.get_meteor_id())
     
-    # Create large data (1MB)
-    print("\n[*] Creating 1MB data...")
-    large_data = os.urandom(1024 * 1024)
-    print(f"  Size: {len(large_data):,} bytes")
-    
-    # Split into chunks (256 * 256 = 65536 bytes max per message)
-    chunk_size = 60000  # Safe size under n*n
-    chunks = [large_data[i:i+chunk_size] for i in range(0, len(large_data), chunk_size)]
-    print(f"  Chunks: {len(chunks)}")
+    # Create small data that fits within limits
+    print("\n[*] Creating chunked data (2KB in 200-byte chunks)...")
+    total_data = os.urandom(2000)  # 2KB
+    chunk_size = 200  # Fits in 252-byte limit
+    chunks = [total_data[i:i+chunk_size] for i in range(0, len(total_data), chunk_size)]
+    print(f"  Total size: {len(total_data):,} bytes")
+    print(f"  Chunk size: {chunk_size} bytes")
+    print(f"  Num chunks: {len(chunks)}")
     
     # Send as batch
     print("\n[*] Sending chunks...")
     start = time.time()
     encrypted_chunks = alice.send_batch("Bob", chunks)
     send_time = time.time() - start
-    print(f"  ✓ Encrypted in {send_time:.2f}s")
-    print(f"  ✓ Throughput: {len(large_data)/send_time/1024/1024:.2f} MB/s")
+    print(f"  ✓ Encrypted in {send_time*1000:.2f}ms")
     
     # Receive
     print("\n[*] Receiving chunks...")
     start = time.time()
     decrypted_chunks = bob.receive_batch(encrypted_chunks)
     recv_time = time.time() - start
-    print(f"  ✓ Decrypted in {recv_time:.2f}s")
-    print(f"  ✓ Throughput: {len(large_data)/recv_time/1024/1024:.2f} MB/s")
+    print(f"  ✓ Decrypted in {recv_time*1000:.2f}ms")
     
     # Reassemble
     reassembled = b''.join(decrypted_chunks)
-    match = reassembled == large_data
+    match = reassembled == total_data
     print(f"\n[Result] Data integrity: {'✅' if match else '❌'}")
     
-    print("\n✅ Large File: PASS")
+    print("\n✅ Chunked Transfer: PASS")
     return match
 
 
@@ -428,7 +434,7 @@ def main():
         ('bidirectional', demo_bidirectional),
         ('serialization', demo_message_serialization),
         ('stats_cleanup', demo_stats_and_cleanup),
-        ('large_file', demo_large_file),
+        ('chunked_transfer', demo_chunked_transfer),
     ]
     
     for name, func in demos:
