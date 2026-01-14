@@ -5,8 +5,6 @@ include CHANGELOG.md
 
 # Include configuration files
 include pyproject.toml
-include setup.py
-include setup.cfg
 
 # Include type hints marker
 include meteor_nc/py.typed
