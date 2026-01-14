@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import secrets
 import struct
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -345,9 +345,15 @@ class LWEKEM:
         s_dot_u = self.sk.s @ u
         return self._mod_q(v - s_dot_u)
     
-    def encaps(self) -> Tuple[bytes, LWECiphertext]:
+    def encaps(
+        self,
+        rng: Optional[Callable[[int], bytes]] = None,
+    ) -> Tuple[bytes, LWECiphertext]:
         """
         KEM encapsulation.
+        
+        Args:
+            rng: Optional random bytes generator (default: secrets.token_bytes)
         
         Returns:
             K: Shared secret (32 bytes)
@@ -356,7 +362,8 @@ class LWEKEM:
         if self.pk is None:
             raise ValueError("Public key not initialized")
         
-        m = secrets.token_bytes(MSG_BYTES)
+        rng = rng or secrets.token_bytes
+        m = rng(MSG_BYTES)
         r = _sha256(b"random", m, self.pk.pk_hash)
         
         m_encoded = self._encode_message(m)
