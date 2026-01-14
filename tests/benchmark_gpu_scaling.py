@@ -8,9 +8,6 @@ Validates three-fold security (LTDF/NCSP/Procrustes).
 Usage:
     # In Google Colab with A100 GPU
     !cd /content/meteor-nc && python tests/benchmark_gpu_scaling.py
-
-Author: Masamichi Iizumi
-License: MIT
 """
 
 # ============================================================================
