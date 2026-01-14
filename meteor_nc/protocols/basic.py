@@ -141,6 +141,7 @@ class MeteorNode:
         security_level: 128, 256, 512, 1024, or 2048 bits
         device_id: GPU device ID
         seed: Optional seed (if None, auto-generated)
+        gpu: Use GPU acceleration (requires CuPy)
         
     Example:
         >>> node = MeteorNode("Alice", security_level=256)
@@ -152,17 +153,20 @@ class MeteorNode:
                  name: str = "Node",
                  security_level: int = 256,
                  device_id: int = 0,
-                 seed: Optional[bytes] = None):
+                 seed: Optional[bytes] = None,
+                 gpu: bool = True):
         """Initialize Meteor node."""
         
         self.name = name
         self.security_level = security_level
+        self.gpu = gpu
         
         # Create cryptographic instance
         self.crypto = create_kdf_meteor(
             security_level=security_level,
             device_id=device_id,
-            seed=seed
+            seed=seed,
+            gpu=gpu
         )
         
         # Generate/set seed
@@ -238,7 +242,8 @@ class MeteorNode:
             # Create crypto instance from peer's seed
             peer_crypto = create_kdf_meteor(
                 security_level=self.security_level,
-                seed=meteor_id
+                seed=meteor_id,
+                gpu=self.gpu
             )
             peer_crypto.expand_keys(verbose=False)
             self._peer_crypto_cache[meteor_id] = peer_crypto
