@@ -13,6 +13,7 @@ Features:
     - APN (Adaptive Precision Noise) support
     - Suitable for testing and low-volume use
 
+Paper: https://github.com/miosync-masa/meteor-nc
 Author: Masamichi Iizumi
 License: MIT
 """
