@@ -36,7 +36,6 @@ jobs:
         run: black --check --diff meteor_nc/ || true
         continue-on-error: true
 
-  # Import check (no GPU needed for import)
   import-check:
     runs-on: ubuntu-latest
     steps:
@@ -58,7 +57,7 @@ jobs:
           sys.path.insert(0, '.')
           
           # These should import without GPU
-          from meteor_nc.cryptography.core import MeteorCore
-          from meteor_nc.protocols.base import MeteorNode, MeteorProtocol
-          print('✅ Core imports OK')
+          from meteor_nc.cryptography.core import MeteorNC
+          from meteor_nc.protocols.basic import MeteorNode, MeteorProtocol
+          print('Core imports OK')
           "
