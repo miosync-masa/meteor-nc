@@ -21,6 +21,9 @@ Usage:
     
     # Specify security level
     python tests/test_security_validation.py --gpu --level 512
+
+Author: Masamichi Iizumi
+License: MIT
 """
 
 import numpy as np
@@ -484,8 +487,14 @@ class PhaseDiagramAnalyzer:
 
         for _ in range(trials):
             try:
-                # Create crypto with custom parameters
-                crypto = create_kdf_meteor(self.n, gpu=self.gpu)
+                # Create crypto with explicit n, m parameters
+                if self.gpu:
+                    from meteor_nc import MeteorKDF
+                    crypto = MeteorKDF(n=self.n, m=self.m)
+                else:
+                    from meteor_nc import MeteorKDF_CPU
+                    crypto = MeteorKDF_CPU(n=self.n, m=self.m)
+                
                 # Override parameters
                 crypto.noise_std = noise_std
                 crypto.rank_reduction = rank_reduction
@@ -493,13 +502,12 @@ class PhaseDiagramAnalyzer:
                 crypto.key_gen(verbose=False)
                 crypto.expand_keys(verbose=False)
 
-                # Test encryption/decryption
-                xp = crypto.xp if hasattr(crypto, 'xp') else np
-                message = xp.random.randn(self.n).astype(xp.float64)
+                # Test encryption/decryption (always use numpy for I/O)
+                message = np.random.randn(self.n).astype(np.float64)
                 ciphertext = crypto.encrypt(message)
                 recovered = crypto.decrypt(ciphertext)
 
-                error = float(xp.linalg.norm(message - recovered) / xp.linalg.norm(message))
+                error = float(np.linalg.norm(message - recovered) / np.linalg.norm(message))
                 errors.append(error)
 
                 if error < 1e-3:  # Success threshold
@@ -648,9 +656,9 @@ def run_validation_suite(gpu: bool = False, security_level: int = 256):
     print(f"  Max error: {max_error:.2e}")
     print(f"  Throughput: {100000/batch_decrypt_time:.0f} msg/s")
 
-    # Phase transition scan (smaller dimension for speed)
+    # Phase transition scan (using same security level)
     print(f"\n[Phase Transition Scan]")
-    analyzer = PhaseDiagramAnalyzer(n=64, m=6, gpu=gpu)
+    analyzer = PhaseDiagramAnalyzer(n=security_level, m=crypto.m, gpu=gpu)
     lambda_range = [0.5, 0.7, 0.9, 1.0, 1.1, 1.3, 1.5]
     phase_results = analyzer.scan_lambda_range(lambda_range)
 
