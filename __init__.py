@@ -58,12 +58,10 @@ Security:
     - Quantum-resistant (no known quantum attacks)
     - GPU-accelerated (820K msg/s) or CPU fallback
 
-Author: Masamichi Iizumi
-License: MIT
 """
 
 __version__ = "1.0.0"
-__author__ = "Masamichi Iizumi"
+__author__ = ""
 
 # Convenience imports from cryptography
 from .cryptography import (
