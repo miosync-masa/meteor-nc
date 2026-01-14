@@ -612,4 +612,3 @@ def run_tests() -> bool:
 
 if __name__ == "__main__":
     run_tests()
-ト)
