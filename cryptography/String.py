@@ -76,14 +76,34 @@ class MeteorPractical(MeteorKDF):
                  n: int = 256, 
                  m: Optional[int] = None, 
                  seed: Optional[bytes] = None,
-                 device_id: int = 0):
-        """Initialize practical Meteor-NC."""
+                 device_id: int = 0,
+                 apn_enabled: bool = True,
+                 apn_dynamic: bool = True,
+                 apn_iterations: int = 20):
+        """
+        Initialize practical Meteor-NC.
+        
+        Args:
+            n: Dimension (security level)
+            m: Number of layers (auto-computed if None)
+            seed: Optional seed for key restoration
+            device_id: GPU device ID
+            apn_enabled: Enable Adaptive Precision Noise
+            apn_dynamic: Use dynamic κ estimation (PowerIteration)
+            apn_iterations: Iterations for condition number estimation
+        """
         # Auto-compute m if not provided
         if m is None:
             m = compute_layer_count(n)
         
         # Initialize parent (MeteorKDF)
+        # Note: MeteorKDF.__init__ calls MeteorNC.__init__ with these params
         super().__init__(n=n, m=m, seed=seed, device_id=device_id)
+        
+        # Set APN parameters (inherited from MeteorNC)
+        self.apn_enabled = apn_enabled
+        self.apn_dynamic = apn_dynamic
+        self.apn_iterations = apn_iterations
         
         # Additional statistics for practical operations
         self.practical_stats = {
