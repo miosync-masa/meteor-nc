@@ -440,4 +440,3 @@ def test_gpu_blake3():
 
 if __name__ == "__main__":
     test_gpu_blake3()
-  → 数十ミリ秒
