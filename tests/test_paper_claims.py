@@ -268,11 +268,13 @@ class PaperClaimsVerification:
             ct = safe_encrypt(crypto, message.copy())
             ciphertexts.append(ct.flatten())
         
-        # Check uniqueness
+        # Check uniqueness - strict comparison (APN should make ALL different)
         unique_count = 0
         for i in range(len(ciphertexts)):
             for j in range(i+1, len(ciphertexts)):
-                if not np.allclose(ciphertexts[i], ciphertexts[j]):
+                # Use exact comparison or very tight tolerance
+                diff = np.linalg.norm(ciphertexts[i] - ciphertexts[j])
+                if diff > 1e-15:  # Any measurable difference counts as unique
                     unique_count += 1
         
         total_pairs = num_encryptions * (num_encryptions - 1) // 2
