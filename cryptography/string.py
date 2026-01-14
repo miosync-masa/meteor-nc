@@ -27,6 +27,8 @@ Usage:
     crypto.decrypt_file("secret.enc", "recovered.pdf")
 """
 
+from __future__ import annotations
+
 import numpy as np
 import time
 import base64
@@ -96,14 +98,16 @@ class MeteorPractical(MeteorKDF):
         if m is None:
             m = compute_layer_count(n)
         
-        # Initialize parent (MeteorKDF)
-        # Note: MeteorKDF.__init__ calls MeteorNC.__init__ with these params
-        super().__init__(n=n, m=m, seed=seed, device_id=device_id)
-        
-        # Set APN parameters (inherited from MeteorNC)
-        self.apn_enabled = apn_enabled
-        self.apn_dynamic = apn_dynamic
-        self.apn_iterations = apn_iterations
+        # Initialize parent (MeteorKDF → MeteorNC)
+        super().__init__(
+            n=n, 
+            m=m, 
+            seed=seed, 
+            device_id=device_id,
+            apn_enabled=apn_enabled,
+            apn_dynamic=apn_dynamic,
+            apn_iterations=apn_iterations
+        )
         
         # Additional statistics for practical operations
         self.practical_stats = {
