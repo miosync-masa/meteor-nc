@@ -11,6 +11,8 @@ from .batch_kernels import (
     bdot_R,
     b_from_As,
     sdot_U,
+    unpack_to_encoded,
+    pack_bits_gpu,
 )
 
 __all__ = [
@@ -20,4 +22,6 @@ __all__ = [
     "bdot_R",
     "b_from_As",
     "sdot_U",
+    "unpack_to_encoded",
+    "pack_bits_gpu",
 ]
