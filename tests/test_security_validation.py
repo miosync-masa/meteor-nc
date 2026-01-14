@@ -614,7 +614,7 @@ def run_validation_suite(gpu: bool = False, security_level: int = 256):
     xp = crypto.xp if hasattr(crypto, 'xp') else np
     
     # Single message test
-    message = xp.random.randn(security_level).astype(xp.float64)
+    message = np.random.randn(security_level).astype(np.float64)
     
     start = time.time()
     ciphertext = crypto.encrypt(message)
@@ -624,7 +624,7 @@ def run_validation_suite(gpu: bool = False, security_level: int = 256):
     recovered = crypto.decrypt(ciphertext)
     decrypt_time = (time.time() - start) * 1000
     
-    error = float(xp.linalg.norm(message - recovered) / xp.linalg.norm(message))
+    error = float(np.linalg.norm(message - recovered) / np.linalg.norm(message))
     
     print(f"  Single encrypt: {encrypt_time:.2f} ms")
     print(f"  Single decrypt: {decrypt_time:.2f} ms")
@@ -633,7 +633,7 @@ def run_validation_suite(gpu: bool = False, security_level: int = 256):
 
     # Batch test
     print(f"\n[Batch Test (100 messages)]")
-    messages = xp.random.randn(100, security_level).astype(xp.float64)
+    messages = np.random.randn(100, security_level).astype(np.float64)
     
     start = time.time()
     ciphertexts = crypto.encrypt_batch(messages)
@@ -643,8 +643,8 @@ def run_validation_suite(gpu: bool = False, security_level: int = 256):
     recovered_batch, _ = crypto.decrypt_batch(ciphertexts)
     batch_decrypt_time = (time.time() - start) * 1000
     
-    batch_errors = xp.linalg.norm(messages - recovered_batch, axis=1) / xp.linalg.norm(messages, axis=1)
-    max_error = float(xp.max(batch_errors))
+    batch_errors = np.linalg.norm(messages - recovered_batch, axis=1) / np.linalg.norm(messages, axis=1)
+    max_error = float(np.max(batch_errors))
     
     print(f"  Batch encrypt: {batch_encrypt_time:.2f} ms ({batch_encrypt_time/100:.3f} ms/msg)")
     print(f"  Batch decrypt: {batch_decrypt_time:.2f} ms ({batch_decrypt_time/100:.3f} ms/msg)")
