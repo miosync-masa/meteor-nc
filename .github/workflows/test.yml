@@ -1,14 +1,11 @@
-# GitHub Actions workflow for Meteor-NC
-# Runs tests on multiple Python versions and OS
-
 name: Tests
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [main, master, develop]
   pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:  # Manual trigger
+    branches: [main, master]
+  workflow_dispatch:
 
 jobs:
   test:
@@ -17,142 +14,123 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
         exclude:
-          # macOS + older Python can be slow, skip some
           - os: macos-latest
-            python-version: '3.8'
+            python-version: "3.8"
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
-    - name: Cache pip dependencies
-      uses: actions/cache@v4
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-${{ matrix.python-version }}-
-          ${{ runner.os }}-pip-
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e ".[dev]"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
 
-    - name: Run basic import test
-      run: |
-        python -c "from meteor_nc import MeteorKDF, MeteorNode, MeteorProtocol; print('✅ Import OK')"
+      - name: Run basic import test
+        run: python -c "from meteor_nc import MeteorKDF, MeteorNode, MeteorProtocol; print('Import OK')"
 
-    - name: Run security validation tests
-      run: |
-        python tests/test_security_validation.py
-      continue-on-error: false
+      - name: Run security validation tests
+        run: python tests/test_security_validation.py
 
-    - name: Run basic protocol tests
-      run: |
-        python tests/test_basic_protocol.py
-      continue-on-error: false
+      - name: Run basic protocol tests
+        run: python tests/test_basic_protocol.py
 
-    - name: Run string encryption tests
-      run: |
-        python tests/test_string_encryption.py
-      continue-on-error: false
+      - name: Run string encryption tests
+        run: python tests/test_string_encryption.py
 
-    - name: Run integrated tests
-      run: |
-        python tests/test_integrated.py
-      continue-on-error: false
+      - name: Run integrated tests
+        run: python tests/test_integrated.py
 
-    - name: Run advanced tests (Web4)
-      run: |
-        python tests/test_advanced_web4.py
-      continue-on-error: true  # Web4 deps may not be available
+      - name: Run advanced tests (Web4)
+        run: python tests/test_advanced_web4.py
+        continue-on-error: true
 
-  # Separate job for linting
   lint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - uses: actions/checkout@v4
 
-    - name: Install linters
-      run: |
-        pip install flake8 black mypy
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Check code style with Black
-      run: |
-        black --check --diff meteor_nc/ tests/ || true
-      continue-on-error: true
+      - name: Install linters
+        run: pip install flake8 black mypy
 
-    - name: Lint with flake8
-      run: |
-        # Stop on syntax errors or undefined names
-        flake8 meteor_nc/ --count --select=E9,F63,F7,F82 --show-source --statistics
-        # Warnings (don't fail)
-        flake8 meteor_nc/ --count --exit-zero --max-complexity=15 --max-line-length=120 --statistics
-      continue-on-error: true
+      - name: Check code style with Black
+        run: black --check --diff meteor_nc/ tests/ || true
+        continue-on-error: true
 
-  # Quick smoke test
+      - name: Lint with flake8
+        run: |
+          flake8 meteor_nc/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 meteor_nc/ --count --exit-zero --max-complexity=15 --max-line-length=120 --statistics
+        continue-on-error: true
+
   smoke-test:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - uses: actions/checkout@v4
 
-    - name: Install package
-      run: |
-        pip install -e .
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Smoke test - Encryption round-trip
-      run: |
-        python -c "
-from meteor_nc import MeteorKDF
-import numpy as np
+      - name: Install package
+        run: pip install -e .
 
-# Quick encryption test
-kdf = MeteorKDF(n=128)
-kdf.key_gen()
-kdf.expand_keys()
+      - name: Smoke test - Encryption round-trip
+        run: |
+          python << 'EOF'
+          from meteor_nc import MeteorKDF
+          import numpy as np
+          
+          kdf = MeteorKDF(n=128)
+          kdf.key_gen()
+          kdf.expand_keys()
+          
+          message = np.random.randn(128)
+          encrypted = kdf.encrypt(message)
+          decrypted = kdf.decrypt(encrypted)
+          
+          error = np.max(np.abs(message - decrypted))
+          assert error < 1e-6, f"Decryption error too high: {error}"
+          print(f"Smoke test passed! Error: {error:.2e}")
+          EOF
 
-message = np.random.randn(128)
-encrypted = kdf.encrypt(message)
-decrypted = kdf.decrypt(encrypted)
-
-error = np.max(np.abs(message - decrypted))
-assert error < 1e-6, f'Decryption error too high: {error}'
-print(f'✅ Smoke test passed! Error: {error:.2e}')
-"
-
-    - name: Smoke test - P2P communication
-      run: |
-        python -c "
-from meteor_nc import MeteorNode
-
-alice = MeteorNode('Alice', security_level=128)
-bob = MeteorNode('Bob', security_level=128)
-
-alice.add_peer('Bob', bob.get_meteor_id())
-bob.add_peer('Alice', alice.get_meteor_id())
-
-message = b'Hello Bob!'
-encrypted = alice.send('Bob', message)
-decrypted = bob.receive(encrypted)
-
-assert message == decrypted, 'P2P communication failed'
-print('✅ P2P smoke test passed!')
-"
+      - name: Smoke test - P2P communication
+        run: |
+          python << 'EOF'
+          from meteor_nc import MeteorNode
+          
+          alice = MeteorNode("Alice", security_level=128)
+          bob = MeteorNode("Bob", security_level=128)
+          
+          alice.add_peer("Bob", bob.get_meteor_id())
+          bob.add_peer("Alice", alice.get_meteor_id())
+          
+          message = b"Hello Bob!"
+          encrypted = alice.send("Bob", message)
+          decrypted = bob.receive(encrypted)
+          
+          assert message == decrypted, "P2P communication failed"
+          print("P2P smoke test passed!")
+          EOF
