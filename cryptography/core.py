@@ -110,6 +110,8 @@ class MeteorNC:
                  rank_reduction: float = 0.3,
                  device_id: int = 0,
                  apn_enabled: bool = True,
+                 apn_dynamic: bool = True,
+                 apn_iterations: int = 20,
                  apn_safety_factor: float = 10000.0,
                  semantic_noise_scale: float = 0.0):
         """
@@ -122,7 +124,9 @@ class MeteorNC:
             rank_reduction: Projection rank deficit ratio
             device_id: GPU device ID
             apn_enabled: Enable Adaptive Precision Noise
-            apn_safety_factor: APN safety factor κ
+            apn_dynamic: Use dynamic κ estimation (PowerIteration/InverseIteration)
+            apn_iterations: Number of iterations for condition number estimation
+            apn_safety_factor: Static APN safety factor κ (fallback if dynamic fails)
             semantic_noise_scale: Legacy parameter (deprecated)
         """
         if not GPU_AVAILABLE:
@@ -139,7 +143,12 @@ class MeteorNC:
         
         # APN (Adaptive Precision Noise) settings
         self.apn_enabled = apn_enabled
+        self.apn_dynamic = apn_dynamic
+        self.apn_iterations = apn_iterations
         self.apn_safety_factor = apn_safety_factor
+        
+        # Cached condition number (computed on first use)
+        self._condition_number_cache = None
         
         # Legacy fixed-scale noise (deprecated, for backward compatibility)
         self.semantic_noise_scale = semantic_noise_scale
@@ -244,17 +253,16 @@ class MeteorNC:
         # Transfer to GPU
         M = cp.asarray(message, dtype=cp.float64)
 
-        # Apply layers
+        # Apply layers (compute C0 = Π·M)
         C = M.copy()
         for public_key in self.public_keys_gpu:
             C = public_key @ C
 
-        # APN (Adaptive Precision Noise) - IND-CPA security
+        # APN (Adaptive Precision Noise) - Algorithm 5
         if self.apn_enabled:
             magnitude = float(cp.linalg.norm(C))
-            noise_floor = magnitude * self.FP64_EPSILON * self.apn_safety_factor / np.sqrt(self.n)
-            effective_std = max(self.noise_std, noise_floor)
-            C += cp.random.normal(0, effective_std, self.n, dtype=cp.float64)
+            sigma_eff = self._get_apn_sigma(magnitude)
+            C += cp.random.normal(0, sigma_eff, self.n, dtype=cp.float64)
         
         # Legacy fixed-scale noise (deprecated)
         elif self.semantic_noise_scale > 0:
@@ -283,17 +291,29 @@ class MeteorNC:
         # Transfer to GPU
         M = cp.asarray(messages, dtype=cp.float64)
 
-        # Apply transformations
+        # Apply transformations (C0 = Π·M for each message)
         C = M.copy()
         for public_key in self.public_keys_gpu:
             C = C @ public_key.T
 
-        # APN (Adaptive Precision Noise) - IND-CPA security
+        # APN (Adaptive Precision Noise) - Algorithm 5
         if self.apn_enabled:
+            # Get condition number (computed once, cached)
+            if self.apn_dynamic and self._condition_number_cache is None:
+                self._condition_number_cache = self._estimate_condition_number()
+            
+            kappa = self._condition_number_cache if self.apn_dynamic else self.apn_safety_factor
+            
+            # σcond = ||C||_F · ε · κ / √n for each message
             magnitudes = cp.linalg.norm(C, axis=1, keepdims=True)
-            noise_floors = magnitudes * self.FP64_EPSILON * self.apn_safety_factor / np.sqrt(self.n)
+            sigma_cond = magnitudes * self.FP64_EPSILON * kappa / np.sqrt(self.n)
+            
+            # σeff = max(σ0, σcond)
+            sigma_eff = cp.maximum(self.noise_std, sigma_cond)
+            
+            # Add noise: η ~ N(0, σeff²)
             eta = cp.random.normal(0, 1, (batch_size, self.n), dtype=cp.float64)
-            C += eta * noise_floors
+            C += eta * sigma_eff
         
         # Legacy fixed-scale noise (deprecated)
         elif self.semantic_noise_scale > 0:
@@ -702,6 +722,145 @@ class MeteorNC:
             R = cp.random.randn(self.n, self.n, dtype=cp.float64) * scale
 
         return R
+
+    # =========================================================================
+    # APN: Condition Number Estimation (Algorithm 5)
+    # =========================================================================
+    
+    def _power_iteration(self, A: cp.ndarray, k: int = 20) -> float:
+        """
+        Estimate maximum singular value via power iteration.
+        
+        Algorithm: σmax ← PowerIteration(A, k)
+        
+        Args:
+            A: Matrix to analyze
+            k: Number of iterations
+            
+        Returns:
+            Estimated σmax
+        """
+        n = A.shape[0]
+        v = cp.random.randn(n, dtype=cp.float64)
+        v = v / cp.linalg.norm(v)
+        
+        for _ in range(k):
+            Av = A @ v
+            v = Av / cp.linalg.norm(Av)
+        
+        # Rayleigh quotient
+        sigma_max = float(cp.linalg.norm(A @ v))
+        return sigma_max
+    
+    def _inverse_iteration(self, A: cp.ndarray, k: int = 20) -> float:
+        """
+        Estimate minimum singular value via inverse iteration.
+        
+        Algorithm: σmin ← InverseIteration(A, k)
+        
+        Args:
+            A: Matrix to analyze
+            k: Number of iterations
+            
+        Returns:
+            Estimated σmin
+        """
+        n = A.shape[0]
+        v = cp.random.randn(n, dtype=cp.float64)
+        v = v / cp.linalg.norm(v)
+        
+        # Use A^T A for numerical stability
+        ATA = A.T @ A
+        
+        # Add small regularization for numerical stability
+        reg = 1e-12 * cp.eye(n, dtype=cp.float64)
+        ATA_reg = ATA + reg
+        
+        try:
+            for _ in range(k):
+                # Solve (A^T A) w = v
+                w = cp.linalg.solve(ATA_reg, v)
+                v = w / cp.linalg.norm(w)
+            
+            # σmin = 1 / sqrt(v^T (A^T A)^{-1} v)
+            # Approximated by ||A v|| after convergence
+            sigma_min = float(cp.linalg.norm(A @ v))
+            
+            # Ensure positive
+            sigma_min = max(sigma_min, 1e-15)
+            
+        except Exception:
+            # Fallback to SVD-based estimation if solve fails
+            try:
+                s = cp.linalg.svd(A, compute_uv=False)
+                sigma_min = float(cp.min(s[s > 1e-15]))
+            except:
+                sigma_min = 1e-10
+        
+        return sigma_min
+    
+    def _estimate_condition_number(self, composite: cp.ndarray = None) -> float:
+        """
+        Estimate condition number κ(Π) = σmax/σmin.
+        
+        Algorithm 5 from paper:
+            σmax ← PowerIteration(Π, k=20)
+            σmin ← InverseIteration(Π, k=20)
+            κ ← σmax / σmin
+        
+        Args:
+            composite: Composite transformation matrix (if None, compute from keys)
+            
+        Returns:
+            Estimated condition number κ
+        """
+        if composite is None:
+            composite = cp.eye(self.n, dtype=cp.float64)
+            for pk in self.public_keys_gpu:
+                composite = pk @ composite
+        
+        sigma_max = self._power_iteration(composite, k=self.apn_iterations)
+        sigma_min = self._inverse_iteration(composite, k=self.apn_iterations)
+        
+        # Compute condition number
+        kappa = sigma_max / sigma_min
+        
+        # Clamp to reasonable range [1, 10^8]
+        kappa = max(1.0, min(kappa, 1e8))
+        
+        return kappa
+    
+    def _get_apn_sigma(self, ciphertext_norm: float, composite: cp.ndarray = None) -> float:
+        """
+        Compute APN effective noise standard deviation.
+        
+        Algorithm 5:
+            σcond ← ||C0||_F · ε · κ / √n
+            σeff ← max(σ0, σcond)
+        
+        Args:
+            ciphertext_norm: ||C0||_F
+            composite: Composite matrix (for dynamic κ estimation)
+            
+        Returns:
+            Effective noise σeff
+        """
+        if self.apn_dynamic:
+            # Dynamic condition number estimation
+            if self._condition_number_cache is None:
+                self._condition_number_cache = self._estimate_condition_number(composite)
+            kappa = self._condition_number_cache
+        else:
+            # Static safety factor
+            kappa = self.apn_safety_factor
+        
+        # σcond = ||C||_F · ε · κ / √n
+        sigma_cond = ciphertext_norm * self.FP64_EPSILON * kappa / np.sqrt(self.n)
+        
+        # σeff = max(σ0, σcond)
+        sigma_eff = max(self.noise_std, sigma_cond)
+        
+        return sigma_eff
 
 
 # =============================================================================
