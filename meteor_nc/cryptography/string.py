@@ -569,7 +569,8 @@ def quick_encrypt_string(text: str,
         crypto.import_seed(seed)
         crypto.expand_keys()
     else:
-        seed = crypto.key_gen()
+        crypto.key_gen()  # Initialize (returns time, not seed)
+        seed = crypto.export_seed()  # Get actual seed bytes
         crypto.expand_keys()
     
     enc = crypto.encrypt_string(text)
