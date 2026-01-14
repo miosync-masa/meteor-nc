@@ -6,25 +6,38 @@ non-commutative matrix projections.
 
 Core Components:
     - MeteorNC: GPU-accelerated encryption with APN
-    - MeteorKDF: 32-byte seed key derivation
+    - MeteorKDF: 32-byte seed key derivation  
     - MeteorPractical: String/file encryption utilities
 
+Class Hierarchy:
+    MeteorNC → MeteorKDF → MeteorPractical
+
+Layer Count Formula:
+    m = max(8, n // 32 + 2)
+    
+    n=128  → m=8
+    n=256  → m=10
+    n=512  → m=18
+    n=1024 → m=34
+    n=2048 → m=66
+
 Example:
-    >>> from meteor_nc.cryptography import MeteorNC, create_meteor
+    >>> from meteor_nc.cryptography import create_meteor, create_kdf_meteor
     >>>
-    >>> # Quick start
-    >>> crypto = create_meteor(256)
+    >>> # Quick start (auto m calculation)
+    >>> crypto = create_meteor(256)  # n=256, m=10
     >>> crypto.key_gen()
     >>>
-    >>> # Encrypt/Decrypt
-    >>> ciphertext = crypto.encrypt(message)
-    >>> plaintext = crypto.decrypt(ciphertext)
-    >>>
-    >>> # Or use KDF for compact storage
-    >>> from meteor_nc.cryptography import MeteorKDF
-    >>> kdf = MeteorKDF(n=256, m=10)
+    >>> # With KDF for compact storage
+    >>> kdf = create_kdf_meteor(256)
     >>> kdf.key_gen()
     >>> seed = kdf.export_seed()  # Only 32 bytes!
+    >>>
+    >>> # Practical string encryption
+    >>> from meteor_nc.cryptography import create_practical_meteor
+    >>> practical = create_practical_meteor(256)
+    >>> practical.key_gen()
+    >>> enc = practical.encrypt_string("Hello!")
 """
 
 from .core import (
@@ -45,6 +58,7 @@ from .kdf import (
 from .string import (
     MeteorPractical,
     MeteorNC_Practical,  # Backward compatibility
+    create_practical_meteor,
     quick_encrypt_string,
     quick_decrypt_string,
 )
@@ -66,6 +80,7 @@ __all__ = [
     # Practical (String/File)
     'MeteorPractical',
     'MeteorNC_Practical',
+    'create_practical_meteor',
     'quick_encrypt_string',
     'quick_decrypt_string',
 ]
