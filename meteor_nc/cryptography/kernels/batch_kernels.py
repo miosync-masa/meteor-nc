@@ -6,6 +6,7 @@ BatchKEM CUDA batch_kernels
 """
 
 import cupy as cp
+import numpy as np 
 
 # =============================================================================
 # CBD Kernel (int32 output)
@@ -197,10 +198,13 @@ def cbd_i32(seeds: cp.ndarray, dim: int, eta: int) -> cp.ndarray:
     
     threads = 256
     blocks = (total + threads - 1) // threads
-    _CBD_KERNEL_I32((blocks,), (threads,), (seeds, out, dim, batch, eta, _STRIDE_SEED))
+    
+    _CBD_KERNEL_I32(
+        (blocks,), (threads,),
+        (seeds, out, np.int32(dim), np.int32(batch), np.int32(eta), _STRIDE_SEED)
+    )
     
     return out.reshape((batch, dim)).T
-
 
 def matmul_AT_R(A: cp.ndarray, R: cp.ndarray, E1: cp.ndarray) -> cp.ndarray:
     """U = A.T @ R + E1 (mod 2^32)"""
