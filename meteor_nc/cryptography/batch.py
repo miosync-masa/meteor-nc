@@ -161,7 +161,7 @@ class BatchLWEKEM:
         
         # 7. V = B_dot_R + E2 + M_encoded (mod 2^32)
         E2_u32 = E2.astype(cp.uint32)  # (MSG_BITS, batch)
-        V = B_dot_R[None, :] + E2_u32 + M_encoded.T  # auto wrap uint32
+        V = B_dot_R[None, :] + E2_u32 + M_encoded # auto wrap uint32
         
         # 8. Transpose for output
         U_t = cp.ascontiguousarray(U.T)  # (batch, n) uint32
