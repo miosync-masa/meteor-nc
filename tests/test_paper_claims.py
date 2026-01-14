@@ -164,6 +164,95 @@ class PaperClaimsVerification:
         return result
     
     # =========================================================================
+    # Section 6.5.1: Million Message Test (BATCH - High Throughput)
+    # =========================================================================
+    def test_million_messages_batch(self, num_messages: int = 100000, 
+                                     batch_size: int = 5000) -> dict:
+        """
+        Paper claim (Section 6.5.1) - BATCH VERSION for throughput:
+        - Throughput: 700,000 msg/s (METEOR-256, A100)
+        - Zero failures across 10^6 messages
+        
+        This version uses encrypt_batch/decrypt_batch for maximum throughput.
+        """
+        self.log(f"\n{'='*60}")
+        self.log(f"TEST: Million Message BATCH Test (n={num_messages:,}, batch={batch_size})")
+        self.log(f"{'='*60}")
+        
+        if not USE_GPU:
+            self.log("  ⚠️ SKIPPED - GPU required")
+            return {'skipped': True, 'reason': 'GPU required'}
+        
+        crypto = create_crypto(n=self.n)
+        crypto.key_gen()
+        crypto.expand_keys()
+        
+        num_batches = num_messages // batch_size
+        
+        max_error = 0.0
+        total_failures = 0
+        batch_errors = []
+        
+        start_time = time.time()
+        
+        for batch_idx in range(num_batches):
+            # Generate random messages as (batch_size, n) array
+            messages = np.random.randint(0, 256, size=(batch_size, self.n)).astype(np.float64)
+            
+            # Batch encrypt
+            ciphertexts = crypto.encrypt_batch(messages)
+            
+            # Batch decrypt
+            decrypted, _ = crypto.decrypt_batch(ciphertexts)
+            
+            # Calculate errors for all messages in batch
+            errors = np.max(np.abs(decrypted - messages), axis=1)
+            batch_max_error = np.max(errors)
+            max_error = max(max_error, batch_max_error)
+            batch_errors.append(np.mean(errors))
+            
+            # Count failures (error > 0.5 means wrong integer)
+            failures_in_batch = np.sum(errors > 0.5)
+            total_failures += failures_in_batch
+            
+            if self.verbose and (batch_idx + 1) % 10 == 0:
+                elapsed = time.time() - start_time
+                rate = (batch_idx + 1) * batch_size / elapsed
+                print(f"  Progress: {(batch_idx+1)*batch_size:,}/{num_messages:,} "
+                      f"({rate:,.0f} msg/s, max_err={max_error:.2e})")
+        
+        elapsed_time = time.time() - start_time
+        throughput = num_messages / elapsed_time
+        
+        if hasattr(crypto, 'cleanup'):
+            crypto.cleanup()
+        
+        result = {
+            'total_messages': num_messages,
+            'batch_size': batch_size,
+            'failures': total_failures,
+            'success_rate': (num_messages - total_failures) / num_messages * 100,
+            'max_error': max_error,
+            'mean_error': np.mean(batch_errors),
+            'elapsed_time': elapsed_time,
+            'throughput': throughput,
+            'passed': total_failures == 0 and max_error < 1e-6
+        }
+        
+        self.log(f"\n  Results:")
+        self.log(f"  - Total messages: {result['total_messages']:,}")
+        self.log(f"  - Batch size: {result['batch_size']}")
+        self.log(f"  - Failures: {result['failures']}")
+        self.log(f"  - Success rate: {result['success_rate']:.4f}%")
+        self.log(f"  - Max error: {result['max_error']:.2e}")
+        self.log(f"  - Mean error: {result['mean_error']:.2e}")
+        self.log(f"  - Throughput: {result['throughput']:,.0f} msg/s")
+        self.log(f"  - PASSED: {'✅' if result['passed'] else '❌'}")
+        
+        self.results['million_messages_batch'] = result
+        return result
+    
+    # =========================================================================
     # Section 5.3.3: Cached Cholesky Speedup
     # =========================================================================
     def test_cached_cholesky_speedup(self, num_iterations: int = 100) -> dict:
@@ -614,10 +703,12 @@ class PaperClaimsVerification:
         # Determine parameters based on mode
         if quick:
             million_msg_count = 10000
+            batch_msg_count = 100000  # Batch test uses more messages (faster)
             long_term_cycles = 500
             distribution_samples = 500
         else:
             million_msg_count = 1000000
+            batch_msg_count = 1000000
             long_term_cycles = 10000
             distribution_samples = 1000
         
@@ -628,6 +719,7 @@ class PaperClaimsVerification:
         self.test_long_term_stability(long_term_cycles)
         self.test_cached_cholesky_speedup()
         self.test_million_messages(million_msg_count)
+        self.test_million_messages_batch(batch_msg_count)
         
         # Summary
         self.log("\n" + "="*70)
