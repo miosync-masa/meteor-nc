@@ -21,9 +21,6 @@ Usage:
     
     # Specify security level
     python tests/test_security_validation.py --gpu --level 512
-
-Author: Masamichi Iizumi
-License: MIT
 """
 
 import numpy as np
