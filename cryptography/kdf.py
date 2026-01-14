@@ -637,19 +637,21 @@ def create_kdf_meteor(security_level: int = 256,
                      device_id: int = 0,
                      seed: Optional[bytes] = None,
                      apn_enabled: bool = True,
-                     apn_dynamic: bool = True) -> MeteorKDF:
+                     apn_dynamic: bool = True,
+                     gpu: bool = True) -> 'MeteorKDF':
     """
     Create KDF-based Meteor-NC with predefined security level.
     
     Args:
         security_level: 128, 256, 512, 1024, or 2048 bits
-        device_id: GPU device ID
+        device_id: GPU device ID (ignored if gpu=False)
         seed: Optional 32-byte seed
         apn_enabled: Enable Adaptive Precision Noise
         apn_dynamic: Use dynamic κ estimation (PowerIteration)
+        gpu: Use GPU acceleration (requires CuPy)
         
     Returns:
-        MeteorKDF instance
+        MeteorKDF instance (GPU or CPU version)
         
     Example:
         >>> # Create and save
@@ -660,6 +662,9 @@ def create_kdf_meteor(security_level: int = 256,
         >>> # Restore later
         >>> crypto2 = create_kdf_meteor(256, seed=seed)
         >>> crypto2.expand_keys()
+        
+        >>> # CPU-only mode (no CuPy required)
+        >>> crypto_cpu = create_kdf_meteor(256, gpu=False)
     """
     from .core import compute_layer_count
     
@@ -671,6 +676,19 @@ def create_kdf_meteor(security_level: int = 256,
     n = security_level
     m = compute_layer_count(n)
     
+    # Use CPU version if GPU not available or not requested
+    if not gpu or not GPU_AVAILABLE:
+        from .kdf_cpu import MeteorKDF_CPU
+        return MeteorKDF_CPU(
+            n=n,
+            m=m,
+            seed=seed,
+            device_id=device_id,
+            apn_enabled=apn_enabled,
+            apn_dynamic=apn_dynamic
+        )
+    
+    # GPU version
     return MeteorKDF(
         n=n,
         m=m,
