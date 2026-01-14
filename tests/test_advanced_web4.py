@@ -55,18 +55,18 @@ def demo_meteor_network():
     print("\n[*] Creating full mesh topology...")
     network.create_full_mesh()
     
-    # Run broadcast test
+    # Run broadcast test (message_size must be <= 252 for n=256)
     print("\n[*] Running broadcast test...")
-    results = network.run_broadcast_test(messages_per_node=10)
+    results = network.run_broadcast_test(sender="Node_00", message_size=200)
     
     print(f"\n[Results]")
-    print(f"  Total messages: {results['total_messages']}")
+    print(f"  Messages sent: {results['messages_sent']}")
+    print(f"  Messages received: {results['messages_received']}")
     print(f"  Success rate: {results['success_rate']*100:.1f}%")
-    print(f"  Λ stability: {results['lambda_stability']:.4f}")
-    print(f"  Total time: {results['total_time']:.2f}s")
+    print(f"  Total time: {results['total_time_ms']:.2f}ms")
     
     # Get network stats
-    stats = network.get_stats()
+    stats = network.get_network_stats()
     print(f"\n[Network Stats]")
     print(f"  Nodes: {stats['num_nodes']}")
     print(f"  Connections: {stats['total_connections']}")
@@ -106,11 +106,9 @@ def demo_latency_simulator():
     print(f"  Messages sent: {results['messages_sent']}")
     print(f"  Messages received: {results['messages_received']}")
     print(f"  Messages dropped: {results['messages_dropped']}")
-    print(f"  Delivery rate: {results['delivery_rate']*100:.1f}%")
+    print(f"  Success rate: {results['success_rate']*100:.1f}%")
     print(f"  Avg latency: {results['avg_latency_ms']:.2f}ms")
-    print(f"  Min latency: {results['min_latency_ms']:.2f}ms")
-    print(f"  Max latency: {results['max_latency_ms']:.2f}ms")
-    print(f"  Λ stability: {results.get('lambda_stability', 'N/A')}")
+    print(f"  Resync score: {results.get('resynchronization_score', 'N/A')}")
     
     print("\n✅ LatencySimulator: PASS")
     return True
@@ -139,7 +137,7 @@ def demo_session_manager():
     print(f"\n[Results]")
     print(f"  ID consistency: {results['id_consistency']*100:.1f}%")
     print(f"  Comm success rate: {results['communication_success_rate']*100:.1f}%")
-    print(f"  Avg reconnect time: {results['avg_reconnect_time']*1000:.2f}ms")
+    print(f"  Avg reconnect time: {results['avg_reconnect_time_ms']:.2f}ms")
     print(f"  All IDs match: {'✅' if results['id_consistency'] == 1.0 else '❌'}")
     
     print("\n✅ SessionManager: PASS")
@@ -205,9 +203,9 @@ def demo_meteor_ipfs():
         print("\n[*] Creating MeteorIPFS...")
         ipfs = MeteorIPFS()
         
-        # Check connection
-        print("\n[*] Checking IPFS connection...")
-        connected = ipfs.is_connected()
+        # Try to connect
+        print("\n[*] Connecting to IPFS daemon...")
+        connected = ipfs.connect()
         
         if not connected:
             print("  ⚠️ IPFS daemon not running")
@@ -219,12 +217,12 @@ def demo_meteor_ipfs():
         # Add data
         print("\n[*] Adding data to IPFS...")
         data = f"Hello from Meteor-NC! Time: {time.time()}".encode()
-        cid = ipfs.add(data)
+        cid = ipfs.add_bytes(data)
         print(f"  CID: {cid}")
         
         # Get data
         print("\n[*] Retrieving data...")
-        retrieved = ipfs.get(cid)
+        retrieved = ipfs.get_bytes(cid)
         print(f"  Retrieved: {len(retrieved)} bytes")
         print(f"  Match: {'✅' if data == retrieved else '❌'}")
         
@@ -242,20 +240,19 @@ def demo_comprehensive_tests():
     print("Demo 6: Comprehensive Tests (All-in-One)")
     print("=" * 70)
     
-    print("\n[*] Running comprehensive tests (5 nodes, 50 messages)...")
+    print("\n[*] Running comprehensive tests (5 nodes)...")
     print("    This may take a minute...\n")
     
     try:
         results = run_comprehensive_tests(
             num_nodes=5,
-            messages_per_test=50,
             security_level=256
         )
         
         print(f"\n[Summary]")
-        print(f"  Mesh network: {'✅' if results.get('mesh_test', {}).get('success', False) else '❌'}")
-        print(f"  Latency simulation: {'✅' if results.get('latency_test', {}).get('success', False) else '❌'}")
-        print(f"  Session reconnection: {'✅' if results.get('session_test', {}).get('success', False) else '❌'}")
+        print(f"  Network test: {'✅' if results.get('network', {}).get('success', False) else '❌'}")
+        print(f"  Latency test: {'✅' if results.get('latency', {}).get('success', False) else '❌'}")
+        print(f"  Session test: {'✅' if results.get('session', {}).get('success', False) else '❌'}")
         
         return results.get('all_passed', False)
         
