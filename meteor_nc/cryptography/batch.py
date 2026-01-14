@@ -231,7 +231,7 @@ class BatchLWEKEM:
         # We need to compute H(U||V) for key derivation
         # For now, use first 32 bytes of U as proxy (simplified)
         # TODO: Full ct_hash if needed
-        ct_hash_proxy = U_t[:, :32].astype(cp.uint8)  # (batch, 32)
+        ct_hash_proxy = cp.ascontiguousarray(U_t[:, :32].astype(cp.uint8))
         
         # 7. Derive shared keys via GPU BLAKE3 (NO PYTHON LOOP!)
         # For encaps, all are "good" keys
@@ -313,7 +313,7 @@ class BatchLWEKEM:
         ok_mask = (U_match & V_match).astype(cp.uint8)
         
         # 7. Compute ciphertext hash proxy
-        ct_hash_proxy = U_gpu[:, :32].astype(cp.uint8)
+        ct_hash_proxy = cp.ascontiguousarray(U_gpu[:, :32].astype(cp.uint8))
         
         # 8. Derive keys with implicit rejection (GPU BLAKE3)
         K_gpu = self._blake3.derive_keys_batch(
