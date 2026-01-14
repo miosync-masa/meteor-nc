@@ -25,7 +25,7 @@ Parameters:
 
 Example:
     >>> from meteor_nc.cryptography import MeteorNC
-    >>> crypto = MeteorNC(n=256, m=10)
+    >>> crypto = MeteorNC(n=256)
     >>> crypto.key_gen()
     >>>
     >>> # IND-CPA secure encryption
@@ -111,13 +111,14 @@ class MeteorNC:
                  noise_std: float = 1e-10,
                  rank_reduction: float = 0.3,
                  device_id: int = 0,
+                 gpu: bool = True,
                  apn_enabled: bool = True,
                  apn_dynamic: bool = True,
                  apn_iterations: int = 20,
                  apn_safety_factor: float = 10000.0,
                  semantic_noise_scale: float = 0.0):
         """
-        Initialize GPU-accelerated Meteor-NC with APN.
+        Initialize Meteor-NC with APN.
         
         Args:
             n: Matrix dimension (security level)
@@ -125,17 +126,26 @@ class MeteorNC:
             noise_std: Base noise standard deviation
             rank_reduction: Projection rank deficit ratio
             device_id: GPU device ID
+            gpu: Use GPU acceleration (requires CuPy)
             apn_enabled: Enable Adaptive Precision Noise
             apn_dynamic: Use dynamic κ estimation (PowerIteration/InverseIteration)
             apn_iterations: Number of iterations for condition number estimation
             apn_safety_factor: Static APN safety factor κ (fallback if dynamic fails)
             semantic_noise_scale: Legacy parameter (deprecated)
         """
-        if not GPU_AVAILABLE:
-            raise RuntimeError("CuPy not available. GPU acceleration requires CuPy.")
-
-        # Set GPU device
-        cp.cuda.Device(device_id).use()
+        # Determine if GPU mode is available and requested
+        self.gpu = gpu and GPU_AVAILABLE
+        
+        if gpu and not GPU_AVAILABLE:
+            import warnings
+            warnings.warn("CuPy not available, falling back to NumPy (CPU mode)")
+        
+        # Array library (CuPy or NumPy)
+        if self.gpu:
+            self.xp = cp
+            cp.cuda.Device(device_id).use()
+        else:
+            self.xp = np
 
         self.n = n
         self.m = m
@@ -155,7 +165,7 @@ class MeteorNC:
         # Legacy fixed-scale noise (deprecated, for backward compatibility)
         self.semantic_noise_scale = semantic_noise_scale
 
-        # Keys on GPU
+        # Keys (on GPU or CPU)
         self.S_gpu = None
         self.S_inv_gpu = None
         self.public_keys_gpu = []
@@ -466,7 +476,7 @@ class MeteorNC:
         
         results = {}
         
-        # Λ-IPP (Inverse Projection Problem)
+        # LTDF (Lossy Trapdoor Function) - Section 4.2
         rank_deficits_P = []
         for P in self.private_P_gpu:
             s = cp.linalg.svd(P, compute_uv=False)
@@ -480,20 +490,20 @@ class MeteorNC:
             rank = int(cp.sum(s > self.noise_std * 10))
             public_ranks.append(rank)
         
-        results['ipp_private_deficit'] = float(np.mean(rank_deficits_P))
-        results['ipp_public_rank'] = float(np.mean(public_ranks))
-        results['ipp_secure'] = (
-            results['ipp_private_deficit'] > self.n * 0.2 and
-            results['ipp_public_rank'] > self.n * 0.95
+        results['ltdf_private_deficit'] = float(np.mean(rank_deficits_P))
+        results['ltdf_public_rank'] = float(np.mean(public_ranks))
+        results['ltdf_secure'] = (
+            results['ltdf_private_deficit'] > self.n * 0.2 and
+            results['ltdf_public_rank'] > self.n * 0.95
         )
         
         if verbose:
-            print(f"[Λ-IPP (Inverse Projection Problem)]")
-            print(f"  Private deficit: {results['ipp_private_deficit']:.1f} / {self.n}")
-            print(f"  Public rank: {results['ipp_public_rank']:.1f} / {self.n}")
-            print(f"  Status: {'✅ SECURE' if results['ipp_secure'] else '⚠️ WEAK'}")
+            print(f"[LTDF (Lossy Trapdoor Function)]")
+            print(f"  Private deficit: {results['ltdf_private_deficit']:.1f} / {self.n}")
+            print(f"  Public rank: {results['ltdf_public_rank']:.1f} / {self.n}")
+            print(f"  Status: {'✅ SECURE' if results['ltdf_secure'] else '⚠️ WEAK'}")
         
-        # Λ-CP (Conjugacy Problem)
+        # NCSP (Non-Commutative Security Parameter) - Section 4.3
         commutators = []
         for i in range(len(self.public_keys_gpu) - 1):
             pi_i = self.public_keys_gpu[i]
@@ -502,52 +512,54 @@ class MeteorNC:
             comm_norm = float(cp.linalg.norm(comm, 'fro'))
             commutators.append(comm_norm)
         
-        results['cp_commutator_norm'] = float(np.mean(commutators))
-        threshold = 8.0 * np.sqrt(self.n / 256.0)
-        results['cp_threshold'] = threshold
-        results['cp_secure'] = results['cp_commutator_norm'] > threshold
+        results['ncsp_commutator_norm'] = float(np.mean(commutators))
+        threshold = 0.5 * np.sqrt(self.n)  # Paper Table 13
+        results['ncsp_threshold'] = threshold
+        results['ncsp_secure'] = results['ncsp_commutator_norm'] > threshold
         
         if verbose:
-            print(f"\n[Λ-CP (Conjugacy Problem)]")
-            print(f"  Commutator norm: {results['cp_commutator_norm']:.2f}")
+            print(f"\n[NCSP (Non-Commutative Security Parameter)]")
+            print(f"  Commutator norm: {results['ncsp_commutator_norm']:.2f}")
             print(f"  Threshold: {threshold:.2f}")
-            print(f"  Status: {'✅ SECURE' if results['cp_secure'] else '⚠️ WEAK'}")
+            margin = results['ncsp_commutator_norm'] / threshold
+            print(f"  Margin: {margin:.1f}×")
+            print(f"  Status: {'✅ SECURE' if results['ncsp_secure'] else '⚠️ WEAK'}")
         
-        # Λ-RRP (Rotation Recovery Problem)
+        # Procrustes (Noisy Orthogonal Procrustes Problem) - Section 4.4
         r_norms = []
         for R in self.private_R_gpu:
             R_norm = float(cp.linalg.norm(R, 'fro'))
             r_norms.append(R_norm)
         
-        results['rrp_r_norm'] = float(np.mean(r_norms))
-        rrp_lower = 0.01
-        rrp_upper = 10.0 * np.sqrt(self.n / 256.0)
-        results['rrp_lower'] = rrp_lower
-        results['rrp_upper'] = rrp_upper
-        results['rrp_secure'] = rrp_lower < results['rrp_r_norm'] < rrp_upper
+        results['procrustes_r_norm'] = float(np.mean(r_norms))
+        procrustes_lower = 0.01
+        procrustes_upper = 10.0 * np.sqrt(self.n / 256.0)
+        results['procrustes_lower'] = procrustes_lower
+        results['procrustes_upper'] = procrustes_upper
+        results['procrustes_secure'] = procrustes_lower < results['procrustes_r_norm'] < procrustes_upper
         
         if verbose:
-            print(f"\n[Λ-RRP (Rotation Recovery Problem)]")
-            print(f"  R Frobenius norm: {results['rrp_r_norm']:.4f}")
-            print(f"  Valid range: [{rrp_lower:.2f}, {rrp_upper:.2f}]")
-            print(f"  Status: {'✅ SECURE' if results['rrp_secure'] else '⚠️ WEAK'}")
+            print(f"\n[Procrustes (Noisy Orthogonal Procrustes)]")
+            print(f"  R Frobenius norm: {results['procrustes_r_norm']:.4f}")
+            print(f"  Valid range: [{procrustes_lower:.2f}, {procrustes_upper:.2f}]")
+            print(f"  Status: {'✅ SECURE' if results['procrustes_secure'] else '⚠️ WEAK'}")
         
         # Overall
         results['secure'] = all([
-            results['ipp_secure'],
-            results['cp_secure'],
-            results['rrp_secure']
+            results['ltdf_secure'],
+            results['ncsp_secure'],
+            results['procrustes_secure']
         ])
         
         if verbose:
             print(f"\n{'='*70}")
             if results['secure']:
-                print(f"✅ OVERALL: ALL THREE Λ-CRITERIA SATISFIED")
+                print(f"✅ OVERALL: THREE-FOLD SECURITY SATISFIED")
             else:
                 failed = []
-                if not results['ipp_secure']: failed.append('Λ-IPP')
-                if not results['cp_secure']: failed.append('Λ-CP')
-                if not results['rrp_secure']: failed.append('Λ-RRP')
+                if not results['ltdf_secure']: failed.append('LTDF')
+                if not results['ncsp_secure']: failed.append('NCSP')
+                if not results['procrustes_secure']: failed.append('Procrustes')
                 print(f"⚠️ OVERALL: FAILED CRITERIA: {', '.join(failed)}")
             print(f"{'='*70}")
         
