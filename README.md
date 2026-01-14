@@ -39,18 +39,30 @@ pip install ".[gpu]"
 ### Basic Usage
 
 ```python
-from meteor_nc import MeteorKDF
+from meteor_nc import create_kdf_meteor
+import numpy as np
 
-# Create and generate keys
-crypto = MeteorKDF(n=256, m=10)
+# Create instance (m is auto-calculated: m = max(8, n//32 + 2))
+crypto = create_kdf_meteor(256)  # n=256, m=10 auto
 crypto.key_gen()
+crypto.expand_keys()
 
 # Save seed (only 32 bytes!)
 seed = crypto.export_seed()
 
-# Encrypt/Decrypt
+# Encrypt/Decrypt single vector (shape: (n,))
+message = np.random.randint(0, 256, size=(256,)).astype(np.float64)
 ciphertext = crypto.encrypt(message)
 plaintext = crypto.decrypt(ciphertext)
+
+# Batch mode for high throughput (700K msg/s on A100)
+messages = np.random.randint(0, 256, size=(1000, 256)).astype(np.float64)
+ciphertexts = crypto.encrypt_batch(messages)
+plaintexts, _ = crypto.decrypt_batch(ciphertexts)
+
+# Restore from seed later
+crypto2 = create_kdf_meteor(256, seed=seed)
+crypto2.expand_keys()  # Deterministic key recovery
 ```
 
 ### String Encryption
