@@ -20,9 +20,8 @@ _BLAKE3_MSG_PERMUTATION = np.array([
 ], dtype=np.int32)
 
 
-_BLAKE3_KERNEL = cp.RawKernel(r'''
+_BLAKE3_CODE = r'''
 // BLAKE3 GPU Kernel
-// 1 thread = 1 hash (for batch of small messages)
 
 __constant__ unsigned int IV[8] = {
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -50,12 +49,10 @@ __device__ void g(unsigned int* state, int a, int b, int c, int d,
 }
 
 __device__ void round_fn(unsigned int* state, unsigned int* m) {
-    // Column step
     g(state, 0, 4,  8, 12, m[0],  m[1]);
     g(state, 1, 5,  9, 13, m[2],  m[3]);
     g(state, 2, 6, 10, 14, m[4],  m[5]);
     g(state, 3, 7, 11, 15, m[6],  m[7]);
-    // Diagonal step
     g(state, 0, 5, 10, 15, m[8],  m[9]);
     g(state, 1, 6, 11, 12, m[10], m[11]);
     g(state, 2, 7,  8, 13, m[12], m[13]);
@@ -74,16 +71,15 @@ __device__ void permute(unsigned int* m) {
 
 extern "C" __global__
 void blake3_hash_batch(
-    const unsigned char* __restrict__ inputs,  // (batch, 64) padded messages
-    unsigned char* __restrict__ outputs,       // (batch, 32) hashes
+    const unsigned char* __restrict__ inputs,
+    unsigned char* __restrict__ outputs,
     const int batch,
-    const int input_len,                       // actual message length (<=64)
-    const unsigned int flags                   // BLAKE3 flags
+    const int input_len,
+    const unsigned int flags
 ) {
     int tid = blockDim.x * blockIdx.x + threadIdx.x;
     if (tid >= batch) return;
 
-    // Load message block (64 bytes = 16 words)
     const unsigned char* in_ptr = inputs + tid * 64;
     unsigned int m[16];
     for (int i = 0; i < 16; i++) {
@@ -93,30 +89,20 @@ void blake3_hash_batch(
              | ((unsigned int)in_ptr[i*4 + 3] << 24);
     }
 
-    // Initialize state
     unsigned int state[16];
     for (int i = 0; i < 8; i++) state[i] = IV[i];
-    state[8]  = IV[0];
-    state[9]  = IV[1];
-    state[10] = IV[2];
-    state[11] = IV[3];
-    state[12] = 0;              // counter low
-    state[13] = 0;              // counter high
-    state[14] = input_len;      // block length
-    state[15] = flags;          // flags (CHUNK_START | CHUNK_END | ROOT for single block)
+    state[8]  = IV[0]; state[9]  = IV[1];
+    state[10] = IV[2]; state[11] = IV[3];
+    state[12] = 0; state[13] = 0;
+    state[14] = input_len; state[15] = flags;
 
-    // 7 rounds
     for (int r = 0; r < 7; r++) {
         round_fn(state, m);
         if (r < 6) permute(m);
     }
 
-    // Finalize: XOR first 8 words with last 8
-    for (int i = 0; i < 8; i++) {
-        state[i] ^= state[i + 8];
-    }
+    for (int i = 0; i < 8; i++) state[i] ^= state[i + 8];
 
-    // Output 32 bytes
     unsigned char* out_ptr = outputs + tid * 32;
     for (int i = 0; i < 8; i++) {
         out_ptr[i*4 + 0] = (unsigned char)(state[i]);
@@ -126,28 +112,20 @@ void blake3_hash_batch(
     }
 }
 
-
-// Extended version: hash + derive 3 seeds in one kernel
 extern "C" __global__
 void blake3_derive_seeds_batch(
-    const unsigned char* __restrict__ messages,   // (batch, 32) raw messages
-    const unsigned char* __restrict__ pk_hash,    // (32,) public key hash
-    unsigned long long* __restrict__ seeds_r,     // (batch,) output
-    unsigned long long* __restrict__ seeds_e1,    // (batch,) output
-    unsigned long long* __restrict__ seeds_e2,    // (batch,) output
+    const unsigned char* __restrict__ messages,
+    const unsigned char* __restrict__ pk_hash,
+    unsigned long long* __restrict__ seeds_r,
+    unsigned long long* __restrict__ seeds_e1,
+    unsigned long long* __restrict__ seeds_e2,
     const int batch
 ) {
     int tid = blockDim.x * blockIdx.x + threadIdx.x;
     if (tid >= batch) return;
 
-    // Build input: "fo-seeds" (8) + m (32) + pk_hash (32) = 72 bytes
-    // Pad to 64 bytes for first block, remaining in second
-    // Actually, let's do simpler: concatenate and hash 64 bytes
-    
     const unsigned char* m_ptr = messages + tid * 32;
     
-    // Build padded message block (64 bytes)
-    // Layout: m[0:32] + pk_hash[0:32]
     unsigned int m[16];
     for (int i = 0; i < 8; i++) {
         m[i] = ((unsigned int)m_ptr[i*4 + 0])
@@ -162,45 +140,32 @@ void blake3_derive_seeds_batch(
                | ((unsigned int)pk_hash[i*4 + 3] << 24);
     }
 
-    // BLAKE3 compression
     unsigned int state[16];
     for (int i = 0; i < 8; i++) state[i] = IV[i];
-    state[8]  = IV[0];
-    state[9]  = IV[1];
-    state[10] = IV[2];
-    state[11] = IV[3];
-    state[12] = 0;
-    state[13] = 0;
-    state[14] = 64;
-    state[15] = 0x0B;  // CHUNK_START | CHUNK_END | ROOT
+    state[8]  = IV[0]; state[9]  = IV[1];
+    state[10] = IV[2]; state[11] = IV[3];
+    state[12] = 0; state[13] = 0;
+    state[14] = 64; state[15] = 0x0B;
 
     for (int r = 0; r < 7; r++) {
         round_fn(state, m);
         if (r < 6) permute(m);
     }
 
-    for (int i = 0; i < 8; i++) {
-        state[i] ^= state[i + 8];
-    }
+    for (int i = 0; i < 8; i++) state[i] ^= state[i + 8];
 
-    // Extract 24 bytes as 3 seeds (8 bytes each)
-    seeds_r[tid]  = ((unsigned long long)state[0]) 
-                  | ((unsigned long long)state[1] << 32);
-    seeds_e1[tid] = ((unsigned long long)state[2]) 
-                  | ((unsigned long long)state[3] << 32);
-    seeds_e2[tid] = ((unsigned long long)state[4]) 
-                  | ((unsigned long long)state[5] << 32);
+    seeds_r[tid]  = ((unsigned long long)state[0]) | ((unsigned long long)state[1] << 32);
+    seeds_e1[tid] = ((unsigned long long)state[2]) | ((unsigned long long)state[3] << 32);
+    seeds_e2[tid] = ((unsigned long long)state[4]) | ((unsigned long long)state[5] << 32);
 }
 
-
-// Shared key derivation kernel
 extern "C" __global__
 void blake3_derive_keys_batch(
-    const unsigned char* __restrict__ messages,   // (batch, 32) m or m'
-    const unsigned char* __restrict__ ct_hashes, // (batch, 32) H(U||V)
-    const unsigned char* __restrict__ z,          // (32,) implicit rejection seed
-    const unsigned char* __restrict__ ok_mask,    // (batch,) 1=good, 0=fail
-    unsigned char* __restrict__ keys,             // (batch, 32) output K
+    const unsigned char* __restrict__ messages,
+    const unsigned char* __restrict__ ct_hashes,
+    const unsigned char* __restrict__ z,
+    const unsigned char* __restrict__ ok_mask,
+    unsigned char* __restrict__ keys,
     const int batch
 ) {
     int tid = blockDim.x * blockIdx.x + threadIdx.x;
@@ -210,14 +175,9 @@ void blake3_derive_keys_batch(
     const unsigned char* ct_ptr = ct_hashes + tid * 32;
     unsigned char is_ok = ok_mask[tid];
 
-    // Build input based on ok/fail
-    // Good: "shared" + m + ct_hash
-    // Fail: "fail" + z + ct_hash
-    
     unsigned int m[16];
     
     if (is_ok) {
-        // m[0:32] + ct_hash[0:32]
         for (int i = 0; i < 8; i++) {
             m[i] = ((unsigned int)m_ptr[i*4 + 0])
                  | ((unsigned int)m_ptr[i*4 + 1] << 8)
@@ -225,7 +185,6 @@ void blake3_derive_keys_batch(
                  | ((unsigned int)m_ptr[i*4 + 3] << 24);
         }
     } else {
-        // z[0:32] + ct_hash[0:32]
         for (int i = 0; i < 8; i++) {
             m[i] = ((unsigned int)z[i*4 + 0])
                  | ((unsigned int)z[i*4 + 1] << 8)
@@ -241,28 +200,20 @@ void blake3_derive_keys_batch(
                | ((unsigned int)ct_ptr[i*4 + 3] << 24);
     }
 
-    // BLAKE3 compression
     unsigned int state[16];
     for (int i = 0; i < 8; i++) state[i] = IV[i];
-    state[8]  = IV[0];
-    state[9]  = IV[1];
-    state[10] = IV[2];
-    state[11] = IV[3];
-    state[12] = 0;
-    state[13] = 0;
-    state[14] = 64;
-    state[15] = 0x0B;
+    state[8]  = IV[0]; state[9]  = IV[1];
+    state[10] = IV[2]; state[11] = IV[3];
+    state[12] = 0; state[13] = 0;
+    state[14] = 64; state[15] = 0x0B;
 
     for (int r = 0; r < 7; r++) {
         round_fn(state, m);
         if (r < 6) permute(m);
     }
 
-    for (int i = 0; i < 8; i++) {
-        state[i] ^= state[i + 8];
-    }
+    for (int i = 0; i < 8; i++) state[i] ^= state[i + 8];
 
-    // Output key
     unsigned char* out_ptr = keys + tid * 32;
     for (int i = 0; i < 8; i++) {
         out_ptr[i*4 + 0] = (unsigned char)(state[i]);
@@ -271,13 +222,13 @@ void blake3_derive_keys_batch(
         out_ptr[i*4 + 3] = (unsigned char)(state[i] >> 24);
     }
 }
-''', ('blake3_hash_batch', 'blake3_derive_seeds_batch', 'blake3_derive_keys_batch'))
-
+'''
 
 # Extract individual kernels
-_blake3_hash_kernel = cp.RawKernel(_BLAKE3_KERNEL.code, 'blake3_hash_batch')
-_blake3_derive_seeds_kernel = cp.RawKernel(_BLAKE3_KERNEL.code, 'blake3_derive_seeds_batch')
-_blake3_derive_keys_kernel = cp.RawKernel(_BLAKE3_KERNEL.code, 'blake3_derive_keys_batch')
+_BLAKE3_MODULE = cp.RawModule(code=_BLAKE3_CODE)
+_blake3_hash_kernel = _BLAKE3_MODULE.get_function('blake3_hash_batch')
+_blake3_derive_seeds_kernel = _BLAKE3_MODULE.get_function('blake3_derive_seeds_batch')
+_blake3_derive_keys_kernel = _BLAKE3_MODULE.get_function('blake3_derive_keys_batch')
 
 
 class GPUBlake3:
@@ -288,19 +239,9 @@ class GPUBlake3:
         self._threads = 256
     
     def hash_batch(self, messages: np.ndarray) -> cp.ndarray:
-        """
-        Hash batch of messages.
-        
-        Args:
-            messages: (batch, msg_len) uint8, msg_len <= 64
-            
-        Returns:
-            (batch, 32) uint8 hashes
-        """
         batch = messages.shape[0]
         msg_len = messages.shape[1] if messages.ndim > 1 else len(messages)
         
-        # Pad to 64 bytes
         if messages.ndim == 1:
             messages = messages.reshape(1, -1)
         
