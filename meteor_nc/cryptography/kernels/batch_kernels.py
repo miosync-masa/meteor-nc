@@ -1,6 +1,6 @@
 # meteor_nc/cryptography/kernels/batch_kernels.py
 """
-BatchKEM専用CUDAカーネル群 (1D grid版)
+BatchKEM(1D grid)
 """
 
 import cupy as cp
