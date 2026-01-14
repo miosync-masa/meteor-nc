@@ -334,6 +334,46 @@ class GPUChaCha20Poly1305:
         p = Poly1305(key)
         p.update(msg)
         return p.finalize()
+
+    def encrypt_batch_fixed(
+        self,
+        pt: cp.ndarray,
+        nonces: cp.ndarray,
+        aad: cp.ndarray,
+        lens: cp.ndarray,
+    ) -> Tuple[cp.ndarray, cp.ndarray]:
+        """
+        Batch encrypt fixed-size chunks.
+        
+        Args:
+            pt:     (batch, chunk_size) uint8 (padded)
+            nonces: (batch, 24) uint8
+            aad:    (batch, 32) uint8
+            lens:   (batch,) uint32 (real length per chunk)
+        
+        Returns:
+            ct:  (batch, chunk_size) uint8
+            tag: (batch, 16) uint8
+        """
+        batch, chunk_size = pt.shape
+        ct = cp.empty_like(pt)
+        tag = cp.empty((batch, 16), dtype=cp.uint8)
+        
+        # 暫定実装（ループ）- 後でカーネル統合で高速化
+        for i in range(int(batch)):
+            clen = int(lens[i].get())
+            pt_i = cp.asnumpy(pt[i, :clen]).tobytes()
+            nonce_i = cp.asnumpy(nonces[i]).tobytes()
+            aad_i = cp.asnumpy(aad[i]).tobytes()
+            
+            ct_i, tag_i = self.encrypt(pt_i, nonce_i, aad_i)
+            
+            ct[i, :clen] = cp.asarray(np.frombuffer(ct_i, dtype=np.uint8))
+            if clen < chunk_size:
+                ct[i, clen:] = 0
+            tag[i] = cp.asarray(np.frombuffer(tag_i, dtype=np.uint8))
+        
+        return ct, tag
     
     @staticmethod
     def _constant_time_compare(a: bytes, b: bytes) -> bool:
