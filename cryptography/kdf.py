@@ -34,6 +34,8 @@ Usage:
     plaintexts = crypto2.decrypt_batch(ciphertexts)
 """
 
+from __future__ import annotations
+
 import numpy as np
 import time
 from typing import Optional, Tuple, Dict
