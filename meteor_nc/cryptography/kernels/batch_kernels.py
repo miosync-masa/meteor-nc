@@ -213,7 +213,10 @@ def matmul_AT_R(A: cp.ndarray, R: cp.ndarray, E1: cp.ndarray) -> cp.ndarray:
     U = cp.empty((n, batch), dtype=cp.uint32)
     
     grid = (n, batch)
-    _MATMUL_AT_R(grid, (256,), (A, R, E1, U, k, n, batch))
+    _MATMUL_AT_R(grid, (256,), (
+        A, R, E1, U, 
+        np.int32(k), np.int32(n), np.int32(batch)  # ← 明示的に
+    ))
     return U
 
 
@@ -225,9 +228,11 @@ def bdot_R(b: cp.ndarray, R: cp.ndarray) -> cp.ndarray:
     
     threads = 256
     blocks = (batch + threads - 1) // threads
-    _BDOTR((blocks,), (threads,), (b, R, out, k, batch))
+    _BDOTR((blocks,), (threads,), (
+        b, R, out, 
+        np.int32(k), np.int32(batch)
+    ))
     return out
-
 
 def b_from_As(A: cp.ndarray, s: cp.ndarray, e: cp.ndarray) -> cp.ndarray:
     """b = A @ s + e (mod 2^32)"""
@@ -236,9 +241,11 @@ def b_from_As(A: cp.ndarray, s: cp.ndarray, e: cp.ndarray) -> cp.ndarray:
     
     threads = 256
     blocks = (k + threads - 1) // threads
-    _B_FROM_AS((blocks,), (threads,), (A, s, e, b, k, n))
+    _B_FROM_AS((blocks,), (threads,), (
+        A, s, e, b, 
+        np.int32(k), np.int32(n)
+    ))
     return b
-
 
 def sdot_U(s: cp.ndarray, U: cp.ndarray) -> cp.ndarray:
     """S_dot_U = s @ U.T (mod 2^32), U is (batch, n)"""
@@ -248,5 +255,8 @@ def sdot_U(s: cp.ndarray, U: cp.ndarray) -> cp.ndarray:
     
     threads = 256
     blocks = (batch + threads - 1) // threads
-    _SDOTU((blocks,), (threads,), (s, U, out, n, batch))
+    _SDOTU((blocks,), (threads,), (
+        s, U, out, 
+        np.int32(n), np.int32(batch)
+    ))
     return out
