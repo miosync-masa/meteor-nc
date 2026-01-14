@@ -70,7 +70,7 @@ class StreamDEM:
         
         self.session_key = session_key
         self.stream_id = stream_id or os.urandom(16)
-        self.gpu = gpu and GPU_AVAILABLE
+        self.gpu = gpu and STREAM_GPU_AVAILABLE 
         self.device_id = device_id
         
         # Derive sub-keys
