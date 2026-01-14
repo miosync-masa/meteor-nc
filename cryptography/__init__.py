@@ -81,8 +81,19 @@ from .string import (
     quick_decrypt_string,
 )
 
+# CPU-only versions (no CuPy required)
+from .core_cpu import (
+    MeteorNC_CPU,
+    create_meteor_cpu,
+)
+
+from .kdf_cpu import (
+    MeteorKDF_CPU,
+    create_kdf_meteor_cpu,
+)
+
 __all__ = [
-    # Core
+    # Core (GPU)
     'MeteorNC',
     'MeteorNC_GPU',
     'create_meteor',
@@ -90,11 +101,19 @@ __all__ = [
     'check_gpu_available',
     'compute_layer_count',
     
-    # KDF
+    # Core (CPU)
+    'MeteorNC_CPU',
+    'create_meteor_cpu',
+    
+    # KDF (GPU)
     'MeteorKDF',
     'MeteorNC_KDF',
     'create_kdf_meteor',
     'HKDF',
+    
+    # KDF (CPU)
+    'MeteorKDF_CPU',
+    'create_kdf_meteor_cpu',
     
     # Practical (String/File)
     'MeteorPractical',
