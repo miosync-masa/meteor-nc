@@ -26,17 +26,33 @@ try:
 except ImportError:
     BATCH_AVAILABLE = False
 
+# Stream DEM
+try:
+    from .stream import StreamDEM, EncryptedChunk, StreamHeader
+    STREAM_AVAILABLE = True
+except ImportError:
+    STREAM_AVAILABLE = False
+
 __all__ = [
+    # Core
     "HKDF",
     "LWEKEM",
     "HybridKEM",
     "SymmetricMixer",
+    # Batch
     "BatchLWEKEM",
+    # Stream
+    "StreamDEM",
+    "EncryptedChunk",
+    "StreamHeader",
+    # Constants
     "Q_DEFAULT",
     "MSG_BYTES",
     "MSG_BITS",
     "SECURITY_PARAMS",
+    # Flags
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
     "BATCH_AVAILABLE",
+    "STREAM_AVAILABLE",
 ]
