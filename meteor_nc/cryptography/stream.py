@@ -219,7 +219,8 @@ class StreamDEM:
         # Build headers (vectorized)
         headers = np.zeros((batch,), dtype=HEADER_DTYPE)
         headers["stream_id"] = np.frombuffer(self.stream_id, dtype="S16")[0]
-        headers["seq"] = np.arange(start_seq, start_seq + batch, dtype=np.uint64)
+        seqs = np.arange(start_seq, start_seq + batch, dtype=np.uint64)
+        headers["seq"] = seqs
 
         # Chunk lengths
         lens = np.full((batch,), chunk_size, dtype=np.uint32)
@@ -229,7 +230,7 @@ class StreamDEM:
         headers["flags"] = np.uint32(flags)
 
         # Nonces: (batch, 24)
-        seq_le = headers["seq"].view(np.uint8).reshape(batch, 8).copy()
+        seq_le = seqs.view(np.uint8).reshape(batch, 8)
         nonces = np.empty((batch, self.NONCE_BYTES), dtype=np.uint8)
         nonces[:, :16] = np.frombuffer(self.stream_id, dtype=np.uint8)[None, :]
         nonces[:, 16:] = seq_le
