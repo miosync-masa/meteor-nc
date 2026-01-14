@@ -33,6 +33,7 @@ from .core import (
     create_meteor,
     create_meteor_gpu,  # Backward compatibility
     check_gpu_available,
+    compute_layer_count,
 )
 
 from .kdf import (
@@ -55,6 +56,7 @@ __all__ = [
     'create_meteor',
     'create_meteor_gpu',
     'check_gpu_available',
+    'compute_layer_count',
     
     # KDF
     'MeteorKDF',
