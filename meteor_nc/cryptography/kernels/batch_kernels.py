@@ -9,6 +9,64 @@ import numpy as np
 
 _STRIDE_SEED = np.uint64(0xD1B54A32D192ED03)
 
+# =============================================================================
+# GPU Unpack: (batch, 32) uint8 → (batch, 256) uint32 * delta
+# =============================================================================
+
+_UNPACK_TO_ENCODED = cp.RawKernel(r'''
+extern "C" __global__
+void unpack_to_encoded(
+    const unsigned char* __restrict__ M_bytes,
+    unsigned int* __restrict__ M_encoded,
+    const unsigned int delta,
+    const int batch
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = batch * 256;
+    if (idx >= total) return;
+    
+    int b = idx / 256;
+    int bit_idx = idx % 256;
+    int byte_idx = bit_idx / 8;
+    int bit_in_byte = 7 - (bit_idx % 8);  // MSB first
+    
+    unsigned char byte_val = M_bytes[b * 32 + byte_idx];
+    unsigned int bit = (byte_val >> bit_in_byte) & 1;
+    
+    // Output: F-contiguous (bit_idx, b)
+    M_encoded[bit_idx + 256 * b] = bit * delta;
+}
+''', 'unpack_to_encoded')
+
+
+# =============================================================================
+# GPU Pack: (batch, 256) uint8 bits → (batch, 32) uint8 bytes
+# =============================================================================
+
+_PACK_BITS = cp.RawKernel(r'''
+extern "C" __global__
+void pack_bits(
+    const unsigned char* __restrict__ bits,
+    unsigned char* __restrict__ bytes,
+    const int batch
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = batch * 32;
+    if (idx >= total) return;
+    
+    int b = idx / 32;
+    int byte_idx = idx % 32;
+    
+    unsigned char result = 0;
+    for (int i = 0; i < 8; i++) {
+        int bit_idx = byte_idx * 8 + i;
+        unsigned char bit = bits[b * 256 + bit_idx];
+        result |= (bit << (7 - i));
+    }
+    bytes[b * 32 + byte_idx] = result;
+}
+''', 'pack_bits')
+
 
 # =============================================================================
 # CBD Kernel (int32 output)
@@ -173,6 +231,42 @@ void sdotu_u32_1d(
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+
+def unpack_to_encoded(M_gpu: cp.ndarray, delta: int) -> cp.ndarray:
+    """
+    (batch, 32) uint8 → (256, batch) uint32 * delta
+    F-contiguous output for matrix ops
+    """
+    batch = M_gpu.shape[0]
+    M_encoded = cp.empty((256, batch), dtype=cp.uint32, order='F')
+    
+    total = batch * 256
+    threads = 256
+    blocks = (total + threads - 1) // threads
+    
+    _UNPACK_TO_ENCODED((blocks,), (threads,), (
+        M_gpu, M_encoded, np.uint32(delta), np.int32(batch)
+    ))
+    return M_encoded
+
+
+def pack_bits_gpu(bits: cp.ndarray) -> cp.ndarray:
+    """
+    (batch, 256) uint8 → (batch, 32) uint8
+    """
+    batch = bits.shape[0]
+    bytes_out = cp.empty((batch, 32), dtype=cp.uint8)
+    
+    total = batch * 32
+    threads = 256
+    blocks = (total + threads - 1) // threads
+    
+    _PACK_BITS((blocks,), (threads,), (
+        bits, bytes_out, np.int32(batch)
+    ))
+    return bytes_out
+
 
 def cbd_i32(seeds: cp.ndarray, dim: int, eta: int) -> cp.ndarray:
     """CBD samples as int32, shape (dim, batch), F-contiguous"""
