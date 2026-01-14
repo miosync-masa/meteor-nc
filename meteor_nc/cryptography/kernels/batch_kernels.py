@@ -186,7 +186,7 @@ void sdotu_u32(
 # Helper functions
 # =============================================================================
 
-_STRIDE_SEED = 0xD1B54A32D192ED03
+_STRIDE_SEED = np.uint64(0xD1B54A32D192ED03)
 
 
 def cbd_i32(seeds: cp.ndarray, dim: int, eta: int) -> cp.ndarray:
