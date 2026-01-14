@@ -134,9 +134,9 @@ class MeteorPractical:
             stream_id=stream_id,
             gpu=self.gpu,
             device_id=self.device_id,
-    )
-    
-    return time.time() - start
+        )
+        
+        return time.time() - start
     
     @property
     def keys_ready(self) -> bool:
