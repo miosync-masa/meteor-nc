@@ -6,9 +6,6 @@ CPU-only version using NumPy (no CuPy required).
 
 Key size: 32 bytes (seed only)
 Reduction: 99.9998% from original
-
-Author: Masamichi Iizumi
-License: MIT
 """
 
 import numpy as np
