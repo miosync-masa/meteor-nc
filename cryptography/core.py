@@ -54,6 +54,33 @@ def check_gpu_available() -> bool:
     return GPU_AVAILABLE
 
 
+def compute_layer_count(n: int) -> int:
+    """
+    Compute optimal layer count for given dimension.
+    
+    Formula: m = max(8, floor(n/32) + 2)
+    
+    This ensures:
+    - Minimum security floor (m >= 8)
+    - NCSP scaling proportional to dimension
+    - Sufficient lossiness for preimage resistance
+    
+    Args:
+        n: Matrix dimension
+        
+    Returns:
+        Optimal layer count m
+        
+    Examples:
+        n=128  -> m=8   (min floor)
+        n=256  -> m=10
+        n=512  -> m=18
+        n=1024 -> m=34
+        n=2048 -> m=66
+    """
+    return max(8, n // 32 + 2)
+
+
 class MeteorNC:
     """
     GPU-accelerated Meteor-NC with Adaptive Precision Noise (APN)
@@ -702,21 +729,17 @@ def create_meteor(security_level: int = 256,
         >>> crypto.key_gen()
         >>> ciphertext = crypto.encrypt(message)
     """
-    security_configs = {
-        128: {'n': 128, 'm': 8},
-        256: {'n': 256, 'm': 10},
-        512: {'n': 512, 'm': 12},
-        1024: {'n': 1024, 'm': 12},
-        2048: {'n': 2048, 'm': 14},
-    }
-
-    if security_level not in security_configs:
-        raise ValueError(f"Security level must be one of {list(security_configs.keys())}")
-
-    config = security_configs[security_level]
+    valid_levels = [128, 256, 512, 1024, 2048]
+    
+    if security_level not in valid_levels:
+        raise ValueError(f"Security level must be one of {valid_levels}")
+    
+    n = security_level
+    m = compute_layer_count(n)
+    
     return MeteorNC(
-        n=config['n'], 
-        m=config['m'], 
+        n=n, 
+        m=m, 
         device_id=device_id,
         apn_enabled=apn_enabled,
         apn_safety_factor=apn_safety_factor
