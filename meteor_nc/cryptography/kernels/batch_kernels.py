@@ -191,20 +191,21 @@ _STRIDE_SEED = np.uint64(0xD1B54A32D192ED03)
 
 
 def cbd_i32(seeds: cp.ndarray, dim: int, eta: int) -> cp.ndarray:
-    """CBD samples as int32, shape (dim, batch)"""
+    """CBD samples as int32, shape (dim, batch), F-contiguous"""
     batch = int(seeds.size)
     total = dim * batch
     out = cp.empty(total, dtype=cp.int32)
     
     threads = 256
     blocks = (total + threads - 1) // threads
-    
     _CBD_KERNEL_I32(
         (blocks,), (threads,),
         (seeds, out, np.int32(dim), np.int32(batch), np.int32(eta), _STRIDE_SEED)
     )
     
-    return out.reshape((batch, dim)).T
+    # F-contiguous (column-major) for CUDA kernel compatibility
+    result = out.reshape((batch, dim)).T
+    return cp.asfortranarray(result)
 
 def matmul_AT_R(A: cp.ndarray, R: cp.ndarray, E1: cp.ndarray) -> cp.ndarray:
     """U = A.T @ R + E1 (mod 2^32)"""
