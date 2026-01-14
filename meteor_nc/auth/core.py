@@ -96,6 +96,7 @@ class MeteorAuth:
         security_level: 128, 256, 512, 1024, or 2048 bits
         apn_enabled: Enable Adaptive Precision Noise
         apn_dynamic: Enable dynamic m calculation
+        gpu: Use GPU acceleration (requires CuPy)
         
     Example:
         >>> auth = MeteorAuth(security_level=256)
@@ -107,7 +108,8 @@ class MeteorAuth:
     def __init__(self,
                  security_level: int = 256,
                  apn_enabled: bool = True,
-                 apn_dynamic: bool = True):
+                 apn_dynamic: bool = True,
+                 gpu: bool = True):
         """
         Initialize Meteor-Auth client.
         
@@ -115,10 +117,12 @@ class MeteorAuth:
             security_level: 128, 256, 512, 1024, or 2048 bits
             apn_enabled: Enable Adaptive Precision Noise
             apn_dynamic: Enable dynamic m calculation based on κ
+            gpu: Use GPU acceleration (requires CuPy)
         """
         self.security_level = security_level
         self.apn_enabled = apn_enabled
         self.apn_dynamic = apn_dynamic
+        self.gpu = gpu
     
     def get_device_fingerprint(self) -> bytes:
         """
@@ -249,7 +253,8 @@ class MeteorAuth:
         node = MeteorNode(
             name=node_name or "Client",
             security_level=self.security_level,
-            seed=auth_seed
+            seed=auth_seed,
+            gpu=self.gpu
         )
         
         # Override meteor_id to use our derived ID
@@ -317,6 +322,7 @@ class MeteorAuthServer:
     Parameters:
         node_name: Server node display name
         security_level: Crypto security level
+        gpu: Use GPU acceleration (requires CuPy)
         
     Example:
         >>> server = MeteorAuthServer("AuthServer")
@@ -327,16 +333,19 @@ class MeteorAuthServer:
     
     def __init__(self,
                  node_name: str = "AuthServer",
-                 security_level: int = 256):
+                 security_level: int = 256,
+                 gpu: bool = True):
         """
         Initialize authentication server.
         
         Args:
             node_name: Server node name
             security_level: Crypto security level
+            gpu: Use GPU acceleration (requires CuPy)
         """
-        self.node = MeteorNode(name=node_name, security_level=security_level)
+        self.node = MeteorNode(name=node_name, security_level=security_level, gpu=gpu)
         self.security_level = security_level
+        self.gpu = gpu
         
         # User database (token -> UserRecord)
         self.users: Dict[str, UserRecord] = {}
