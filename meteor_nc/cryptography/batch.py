@@ -213,8 +213,10 @@ class BatchLWEKEM:
         E2 = _cbd_from_seeds(seeds_e2, MSG_BITS, self.eta)    # (MSG_BITS, batch)
         
         # 4. Encode messages
-        M_bits = cp.unpackbits(M_gpu.view(cp.uint8), axis=1)  # (batch, MSG_BITS)
-        M_encoded = M_bits.astype(cp.int64) * self.delta
+        M_np = np.frombuffer(M_bytes, dtype=np.uint8).reshape(batch, MSG_BYTES)
+        M_bits_np = np.unpackbits(M_np, axis=1)  # (batch, MSG_BITS) on CPU
+        M_bits = cp.asarray(M_bits_np, dtype=cp.int64)
+        M_encoded = M_bits * self.delta
         
         # 5. GPU matrix operations
         U = (self.A.T @ R + E1) % self.q                      # (n, batch)
@@ -285,7 +287,9 @@ class BatchLWEKEM:
         M_bits = (cp.abs(V_centered) > threshold).astype(cp.uint8)  # (batch, MSG_BITS)
         
         # Pack bits to bytes
-        M_recovered = cp.packbits(M_bits, axis=1)  # (batch, MSG_BYTES)
+        M_bits_np = cp.asnumpy(M_bits).astype(np.uint8)
+        M_recovered_np = np.packbits(M_bits_np, axis=1)  # (batch, MSG_BYTES) on CPU
+        M_recovered = cp.asarray(M_recovered_np)
         
         # 4. Re-derive FO seeds via GPU BLAKE3
         seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(
