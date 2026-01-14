@@ -1,21 +1,20 @@
 """
 Meteor-NC: String & File Encryption Extension
 
-Supports encryption for strings, binary data, and files.
-
-Provides practical encryption functionalities as an upper layer of the KDF implementation.
+Extends MeteorKDF with practical string, binary, and file encryption.
 
 Features:
-    - String encryption/decryption
+    - String encryption/decryption (UTF-8)
     - Binary data encryption/decryption
     - File encryption/decryption
-    - Base64 serialization support
+    - Base64 serialization for transport
+    - Checksum verification
 
 Usage:
     from meteor_nc.cryptography import MeteorPractical
     
-    # Initialization
-    crypto = MeteorPractical(n=256, m=10)
+    # Create and initialize
+    crypto = MeteorPractical(n=256)
     crypto.key_gen()
     crypto.expand_keys()
     
@@ -36,107 +35,74 @@ import hashlib
 from typing import Optional, Tuple, Dict, Union
 from pathlib import Path
 
+from .kdf import MeteorKDF
+from .core import compute_layer_count
 
-class MeteorPractical:
+
+class MeteorPractical(MeteorKDF):
     """
-    Practical Meteor-NC implementation with encryption capabilities.
+    Practical Meteor-NC with string/binary/file encryption.
     
-    Internally uses a KDF to provide encryption/decryption for strings,
-    binary data, and files.
+    Inherits from MeteorKDF, adding high-level encryption methods
+    for practical use cases.
     
     Encoding Strategy:
-        - 1 byte → 1 float64 element (to guarantee precision)
-        - 256 bytes per chunk (when n=256)
-        - Normalization: [0,255] → [-1,1] (approximates a Gaussian distribution)
+        - 1 byte → 1 float64 element (precision guarantee)
+        - n bytes per chunk (dimension-sized blocks)
+        - Normalization: [0,255] → [-1,1]
     
     Parameters:
         n: Dimension (default 256)
-        m: Number of layers (default 10)
+        m: Number of layers (auto-computed if None)
+        seed: Optional seed for key restoration
+        device_id: GPU device ID
         
     Example:
         >>> crypto = MeteorPractical()
         >>> crypto.key_gen()
+        >>> crypto.expand_keys()
         >>>
         >>> # String
         >>> enc = crypto.encrypt_string("Secret message")
         >>> dec = crypto.decrypt_string(enc)
         >>> print(dec)  # "Secret message"
+        >>>
+        >>> # File
+        >>> crypto.encrypt_file("doc.pdf", "doc.enc")
+        >>> crypto.decrypt_file("doc.enc", "doc_recovered.pdf")
     """
     
-    def __init__(self, n: int = 256, m: int = 10, device_id: int = 0):
+    def __init__(self, 
+                 n: int = 256, 
+                 m: Optional[int] = None, 
+                 seed: Optional[bytes] = None,
+                 device_id: int = 0):
         """Initialize practical Meteor-NC."""
-        self.n = n
-        self.m = m
-        self.device_id = device_id
+        # Auto-compute m if not provided
+        if m is None:
+            m = compute_layer_count(n)
         
-        # KDF instance used internally
-        self._kdf = None
-        self._keys_ready = False
+        # Initialize parent (MeteorKDF)
+        super().__init__(n=n, m=m, seed=seed, device_id=device_id)
         
-        # Statistics
-        self.stats = {
+        # Additional statistics for practical operations
+        self.practical_stats = {
             'strings_encrypted': 0,
-            'bytes_processed': 0,
-            'files_encrypted': 0
+            'strings_decrypted': 0,
+            'bytes_encrypted': 0,
+            'bytes_decrypted': 0,
+            'files_encrypted': 0,
+            'files_decrypted': 0,
+            'total_bytes_processed': 0
         }
     
-    def _init_kdf(self):
-        """Lazily initialize the KDF instance."""
-        if self._kdf is None:
-            try:
-                from .kdf import MeteorKDF
-                self._kdf = MeteorKDF(
-                    n=self.n, 
-                    m=self.m, 
-                    device_id=self.device_id
-                )
-            except ImportError:
-                raise ImportError(
-                    "KDF module is required.\n"
-                    "Ensure meteor_nc.cryptography.kdf is available."
-                )
-    
-    def key_gen(self, verbose: bool = False) -> bytes:
-        """
-        Generate keys (seed only).
-        
-        Returns:
-            32-byte master seed
-        """
-        self._init_kdf()
-        self._kdf.key_gen(verbose=verbose)
-        return self._kdf.export_seed()
-    
-    def expand_keys(self, verbose: bool = False) -> float:
-        """
-        Expand keys from the seed.
-        
-        Returns:
-            Expansion time in seconds
-        """
-        self._init_kdf()
-        expand_time = self._kdf.expand_keys(verbose=verbose)
-        self._keys_ready = True
-        return expand_time
-    
-    def import_seed(self, seed: bytes):
-        """Import a seed."""
-        self._init_kdf()
-        self._kdf.import_seed(seed)
-        self._keys_ready = False
-    
-    def export_seed(self) -> bytes:
-        """Export the current seed."""
-        self._init_kdf()
-        return self._kdf.export_seed()
-    
     # =========================================================================
-    # Internal conversion methods
+    # Byte/Vector Conversion
     # =========================================================================
     
     def _bytes_to_vectors(self, data: bytes) -> np.ndarray:
         """
-        Convert byte sequence into vector chunks.
+        Convert bytes to encryption-ready vectors.
         
         Strategy:
             - 1 byte = 1 float64 element
@@ -144,431 +110,432 @@ class MeteorPractical:
             - Zero-pad to multiples of n
         
         Args:
-            data: Input byte sequence
+            data: Input bytes
             
         Returns:
-            numpy array of shape (num_chunks, n)
+            Array of shape (num_chunks, n)
         """
-        original_len = len(data)
-        padded_len = ((original_len + self.n - 1) // self.n) * self.n
-        padding_len = padded_len - original_len
+        # Pad to multiple of n
+        padded_len = ((len(data) + self.n - 1) // self.n) * self.n
+        padded = data + b'\x00' * (padded_len - len(data))
         
-        # Zero padding
-        padded = data + b'\x00' * padding_len
+        # Convert to float64 array
+        byte_array = np.frombuffer(padded, dtype=np.uint8).astype(np.float64)
         
-        # Split into chunks and normalize
+        # Normalize [0,255] → [-1,1]
+        normalized = (byte_array - 128.0) / 128.0
+        
+        # Reshape to (num_chunks, n)
         num_chunks = padded_len // self.n
-        vectors = np.zeros((num_chunks, self.n), dtype=np.float64)
-        
-        for i in range(num_chunks):
-            chunk = padded[i * self.n : (i + 1) * self.n]
-            byte_array = np.frombuffer(chunk, dtype=np.uint8).astype(np.float64)
-            vectors[i] = (byte_array - 128.0) / 128.0
-        
-        return vectors
+        return normalized.reshape(num_chunks, self.n)
     
     def _vectors_to_bytes(self, vectors: np.ndarray, original_len: int) -> bytes:
         """
-        Restore byte sequence from vector chunks.
+        Convert decrypted vectors back to bytes.
         
         Args:
-            vectors: Array of shape (num_chunks, n)
-            original_len: Original byte length (used to remove padding)
+            vectors: Decrypted vectors of shape (num_chunks, n)
+            original_len: Original byte length (for truncation)
             
         Returns:
-            Reconstructed byte sequence
+            Original bytes
         """
-        result = bytearray()
+        # Flatten
+        flat = vectors.flatten()
         
-        for vec in vectors:
-            byte_array = vec * 128.0 + 128.0
-            byte_array = np.clip(np.round(byte_array), 0, 255).astype(np.uint8)
-            result.extend(byte_array.tobytes())
+        # Denormalize [-1,1] → [0,255]
+        denormalized = flat * 128.0 + 128.0
         
-        return bytes(result[:original_len])
-    
-    def _ensure_keys(self):
-        """Ensure keys are prepared."""
-        if not self._keys_ready:
-            if self._kdf is None:
-                raise ValueError("Call key_gen() first")
-            self.expand_keys(verbose=False)
+        # Clip and convert to uint8
+        byte_array = np.clip(np.round(denormalized), 0, 255).astype(np.uint8)
+        
+        # Truncate to original length
+        return byte_array.tobytes()[:original_len]
     
     # =========================================================================
-    # String encryption
+    # String Encryption
     # =========================================================================
     
-    def encrypt_string(self, text: str, encoding: str = 'utf-8') -> dict:
+    def encrypt_string(self, text: str, encoding: str = 'utf-8') -> Dict:
         """
         Encrypt a string.
         
         Args:
             text: String to encrypt
-            encoding: Character encoding
+            encoding: Text encoding (default UTF-8)
             
         Returns:
-            Dictionary containing ciphertext and metadata
+            Dictionary with ciphertext and metadata
         """
-        self._ensure_keys()
+        # Auto-expand keys if needed
+        if not self._keys_expanded:
+            self.expand_keys()
         
+        # Encode string to bytes
         data = text.encode(encoding)
         original_len = len(data)
         
-        checksum = hashlib.sha256(data).hexdigest()[:16]
-        
+        # Convert to vectors
         vectors = self._bytes_to_vectors(data)
-        ciphertexts = self._kdf.encrypt_batch(vectors)
         
-        self.stats['strings_encrypted'] += 1
-        self.stats['bytes_processed'] += original_len
+        # Encrypt
+        start = time.time()
+        ciphertext = self.encrypt_batch(vectors)
+        encrypt_time = time.time() - start
+        
+        # Compute checksum
+        checksum = hashlib.sha256(data).hexdigest()
+        
+        # Update stats
+        self.practical_stats['strings_encrypted'] += 1
+        self.practical_stats['bytes_encrypted'] += original_len
+        self.practical_stats['total_bytes_processed'] += original_len
         
         return {
-            'ciphertext': ciphertexts,
+            'ciphertext': ciphertext,
             'original_len': original_len,
             'encoding': encoding,
-            'checksum': checksum
+            'checksum': checksum,
+            'encrypt_time': encrypt_time,
+            'num_chunks': len(vectors)
         }
     
-    def decrypt_string(self, encrypted: dict) -> str:
+    def decrypt_string(self, encrypted: Dict) -> str:
         """
-        Decrypt ciphertext into a string.
+        Decrypt an encrypted string.
         
         Args:
-            encrypted: Result from encrypt_string()
+            encrypted: Dictionary from encrypt_string()
             
         Returns:
             Decrypted string
         """
-        self._ensure_keys()
+        # Auto-expand keys if needed
+        if not self._keys_expanded:
+            self.expand_keys()
         
-        ciphertexts = encrypted['ciphertext']
-        original_len = encrypted['original_len']
-        encoding = encrypted.get('encoding', 'utf-8')
-        expected_checksum = encrypted.get('checksum')
+        # Decrypt
+        start = time.time()
+        decrypted_vectors, _ = self.decrypt_batch(encrypted['ciphertext'])
+        decrypt_time = time.time() - start
         
-        recovered, _ = self._kdf.decrypt_batch(ciphertexts)
-        data = self._vectors_to_bytes(recovered, original_len)
+        # Convert back to bytes
+        data = self._vectors_to_bytes(decrypted_vectors, encrypted['original_len'])
         
-        if expected_checksum:
-            actual_checksum = hashlib.sha256(data).hexdigest()[:16]
-            if actual_checksum != expected_checksum:
-                raise ValueError(
-                    f"Checksum mismatch! Data is corrupted.\n"
-                    f"Expected: {expected_checksum}, Actual: {actual_checksum}"
-                )
+        # Verify checksum
+        actual_checksum = hashlib.sha256(data).hexdigest()
+        if actual_checksum != encrypted['checksum']:
+            raise ValueError(
+                f"Checksum mismatch! Expected {encrypted['checksum'][:16]}..., "
+                f"got {actual_checksum[:16]}..."
+            )
         
-        return data.decode(encoding)
+        # Update stats
+        self.practical_stats['strings_decrypted'] += 1
+        self.practical_stats['bytes_decrypted'] += encrypted['original_len']
+        self.practical_stats['total_bytes_processed'] += encrypted['original_len']
+        
+        # Decode to string
+        return data.decode(encrypted.get('encoding', 'utf-8'))
     
     # =========================================================================
-    # Binary encryption
+    # Binary Encryption
     # =========================================================================
     
-    def encrypt_bytes(self, data: bytes) -> dict:
+    def encrypt_bytes(self, data: bytes) -> Dict:
         """
-        Encrypt a byte sequence.
+        Encrypt binary data.
         
         Args:
-            data: Input bytes
+            data: Bytes to encrypt
             
         Returns:
-            Dictionary containing encrypted result
+            Dictionary with ciphertext and metadata
         """
-        self._ensure_keys()
+        if not self._keys_expanded:
+            self.expand_keys()
         
         original_len = len(data)
-        checksum = hashlib.sha256(data).hexdigest()[:16]
-        
         vectors = self._bytes_to_vectors(data)
-        ciphertexts = self._kdf.encrypt_batch(vectors)
         
-        self.stats['bytes_processed'] += original_len
+        start = time.time()
+        ciphertext = self.encrypt_batch(vectors)
+        encrypt_time = time.time() - start
+        
+        checksum = hashlib.sha256(data).hexdigest()
+        
+        self.practical_stats['bytes_encrypted'] += original_len
+        self.practical_stats['total_bytes_processed'] += original_len
         
         return {
-            'ciphertext': ciphertexts,
+            'ciphertext': ciphertext,
             'original_len': original_len,
-            'checksum': checksum
+            'checksum': checksum,
+            'encrypt_time': encrypt_time,
+            'num_chunks': len(vectors)
         }
     
-    def decrypt_bytes(self, encrypted: dict) -> bytes:
+    def decrypt_bytes(self, encrypted: Dict) -> bytes:
         """
-        Decrypt into bytes.
+        Decrypt encrypted binary data.
         
         Args:
-            encrypted: Result from encrypt_bytes()
+            encrypted: Dictionary from encrypt_bytes()
             
         Returns:
-            Decrypted data
+            Decrypted bytes
         """
-        self._ensure_keys()
+        if not self._keys_expanded:
+            self.expand_keys()
         
-        ciphertexts = encrypted['ciphertext']
-        original_len = encrypted['original_len']
-        expected_checksum = encrypted.get('checksum')
+        start = time.time()
+        decrypted_vectors, _ = self.decrypt_batch(encrypted['ciphertext'])
+        decrypt_time = time.time() - start
         
-        recovered, _ = self._kdf.decrypt_batch(ciphertexts)
-        data = self._vectors_to_bytes(recovered, original_len)
+        data = self._vectors_to_bytes(decrypted_vectors, encrypted['original_len'])
         
-        if expected_checksum:
-            actual_checksum = hashlib.sha256(data).hexdigest()[:16]
-            if actual_checksum != expected_checksum:
-                raise ValueError("Checksum mismatch!")
+        actual_checksum = hashlib.sha256(data).hexdigest()
+        if actual_checksum != encrypted['checksum']:
+            raise ValueError(
+                f"Checksum mismatch! Expected {encrypted['checksum'][:16]}..., "
+                f"got {actual_checksum[:16]}..."
+            )
+        
+        self.practical_stats['bytes_decrypted'] += encrypted['original_len']
+        self.practical_stats['total_bytes_processed'] += encrypted['original_len']
         
         return data
     
     # =========================================================================
-    # File encryption
+    # File Encryption
     # =========================================================================
     
-    def encrypt_file(self, input_path: str, output_path: str, 
-                     verbose: bool = False) -> dict:
+    def encrypt_file(self, input_path: str, output_path: str) -> Dict:
         """
         Encrypt a file.
         
         Args:
-            input_path: Input file path
-            output_path: Output file path
-            verbose: Show progress
+            input_path: Path to input file
+            output_path: Path to output encrypted file
             
         Returns:
-            Metadata dictionary
+            Encryption metadata
         """
-        self._ensure_keys()
-        
         input_path = Path(input_path)
         output_path = Path(output_path)
         
         if not input_path.exists():
-            raise FileNotFoundError(f"File not found: {input_path}")
+            raise FileNotFoundError(f"Input file not found: {input_path}")
         
-        if verbose:
-            print(f"[*] Encrypting: {input_path}")
-        
-        start = time.time()
-        
-        with open(input_path, 'rb') as f:
-            data = f.read()
-        
+        # Read file
+        data = input_path.read_bytes()
         original_len = len(data)
-        original_name = input_path.name
-        checksum = hashlib.sha256(data).hexdigest()
         
-        if verbose:
-            print(f"    Size: {original_len:,} bytes")
+        # Encrypt
+        encrypted = self.encrypt_bytes(data)
         
-        vectors = self._bytes_to_vectors(data)
-        ciphertexts = self._kdf.encrypt_batch(vectors)
-        
-        metadata = {
-            'version': '1.0',
-            'algorithm': 'Meteor-NC',
-            'n': self.n,
-            'm': self.m,
-            'original_name': original_name,
-            'original_len': original_len,
-            'checksum': checksum,
-            'chunks': ciphertexts.shape[0],
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
-        }
-        
-        with open(output_path, 'wb') as f:
-            meta_json = json.dumps(metadata).encode('utf-8')
-            meta_b64 = base64.b64encode(meta_json)
-            header = f"MNC1:{len(meta_b64)}:".encode('ascii')
-            f.write(header)
-            f.write(meta_b64)
-            f.write(b'\n')
-            f.write(ciphertexts.tobytes())
-        
-        elapsed = time.time() - start
-        
-        self.stats['files_encrypted'] += 1
-        self.stats['bytes_processed'] += original_len
-        
-        if verbose:
-            output_size = output_path.stat().st_size
-            ratio = output_size / original_len * 100
-            print(f"[✓] Done: {elapsed:.2f}s")
-            print(f"    Output: {output_path} ({output_size:,} bytes, {ratio:.1f}%)")
-        
-        return metadata
-    
-    def decrypt_file(self, input_path: str, output_path: Optional[str] = None,
-                     verbose: bool = False) -> str:
-        """
-        Decrypt a file.
-        
-        Args:
-            input_path: Encrypted file path
-            output_path: Output file path (default: original name)
-            verbose: Show progress
-            
-        Returns:
-            Output file path
-        """
-        self._ensure_keys()
-        
-        input_path = Path(input_path)
-        
-        if not input_path.exists():
-            raise FileNotFoundError(f"File not found: {input_path}")
-        
-        if verbose:
-            print(f"[*] Decrypting: {input_path}")
-        
-        start = time.time()
-        
-        with open(input_path, 'rb') as f:
-            header_line = b''
-            while True:
-                c = f.read(1)
-                if c == b'\n':
-                    break
-                header_line += c
-            
-            parts = header_line.split(b':')
-            if parts[0] != b'MNC1':
-                raise ValueError("Invalid file format")
-            
-            meta_len = int(parts[1])
-            meta_b64 = parts[2][:meta_len]
-            meta_json = base64.b64decode(meta_b64)
-            metadata = json.loads(meta_json.decode('utf-8'))
-            
-            ciphertext_bytes = f.read()
-        
-        if metadata['n'] != self.n or metadata['m'] != self.m:
-            raise ValueError(
-                f"Parameter mismatch: "
-                f"File(n={metadata['n']}, m={metadata['m']}) vs "
-                f"Current(n={self.n}, m={self.m})"
-            )
-        
-        chunks = metadata['chunks']
-        ciphertexts = np.frombuffer(ciphertext_bytes, dtype=np.float64)
-        ciphertexts = ciphertexts.reshape(chunks, self.n)
-        
-        if verbose:
-            print(f"    Chunks: {chunks}")
-        
-        recovered, _ = self._kdf.decrypt_batch(ciphertexts)
-        data = self._vectors_to_bytes(recovered, metadata['original_len'])
-        
-        actual_checksum = hashlib.sha256(data).hexdigest()
-        if actual_checksum != metadata['checksum']:
-            raise ValueError("Checksum mismatch! File is corrupted or the key is incorrect.")
-        
-        if output_path is None:
-            output_path = input_path.parent / metadata['original_name']
-        output_path = Path(output_path)
-        
-        with open(output_path, 'wb') as f:
-            f.write(data)
-        
-        elapsed = time.time() - start
-        
-        if verbose:
-            print(f"[✓] Done: {elapsed:.2f}s")
-            print(f"    Output: {output_path} ({len(data):,} bytes)")
-        
-        return str(output_path)
-    
-    # =========================================================================
-    # Serialization (JSON-compatible output)
-    # =========================================================================
-    
-    def serialize_encrypted(self, encrypted: dict) -> str:
-        """
-        Serialize encrypted result into JSON.
-        
-        Base64-encoded for text-based storage and transfer.
-        
-        Args:
-            encrypted: Result from encrypt_string/bytes()
-            
-        Returns:
-            JSON string
-        """
-        serialized = {
-            'ciphertext_b64': base64.b64encode(
-                encrypted['ciphertext'].tobytes()
-            ).decode('ascii'),
-            'shape': list(encrypted['ciphertext'].shape),
+        # Prepare output data
+        output_data = {
+            'ciphertext': encrypted['ciphertext'].tolist(),
             'original_len': encrypted['original_len'],
-            'checksum': encrypted.get('checksum'),
-            'encoding': encrypted.get('encoding'),
-            'algorithm': 'Meteor-NC',
+            'checksum': encrypted['checksum'],
+            'original_name': input_path.name,
             'n': self.n,
             'm': self.m
         }
-        return json.dumps(serialized, ensure_ascii=False, indent=2)
+        
+        # Write encrypted file
+        output_path.write_text(json.dumps(output_data))
+        
+        self.practical_stats['files_encrypted'] += 1
+        
+        return {
+            'input_file': str(input_path),
+            'output_file': str(output_path),
+            'original_size': original_len,
+            'encrypted_size': output_path.stat().st_size,
+            'encrypt_time': encrypted['encrypt_time']
+        }
     
-    def deserialize_encrypted(self, json_str: str) -> dict:
+    def decrypt_file(self, input_path: str, output_path: str) -> Dict:
         """
-        Deserialize JSON string back into encrypted structure.
+        Decrypt an encrypted file.
         
         Args:
-            json_str: Output from serialize_encrypted()
+            input_path: Path to encrypted file
+            output_path: Path to output decrypted file
             
         Returns:
-            Dictionary ready for decryption
+            Decryption metadata
+        """
+        input_path = Path(input_path)
+        output_path = Path(output_path)
+        
+        if not input_path.exists():
+            raise FileNotFoundError(f"Encrypted file not found: {input_path}")
+        
+        # Read encrypted file
+        encrypted_data = json.loads(input_path.read_text())
+        
+        # Reconstruct encrypted dict
+        encrypted = {
+            'ciphertext': np.array(encrypted_data['ciphertext']),
+            'original_len': encrypted_data['original_len'],
+            'checksum': encrypted_data['checksum']
+        }
+        
+        # Decrypt
+        start = time.time()
+        data = self.decrypt_bytes(encrypted)
+        decrypt_time = time.time() - start
+        
+        # Write decrypted file
+        output_path.write_bytes(data)
+        
+        self.practical_stats['files_decrypted'] += 1
+        
+        return {
+            'input_file': str(input_path),
+            'output_file': str(output_path),
+            'decrypted_size': len(data),
+            'original_name': encrypted_data.get('original_name', 'unknown'),
+            'decrypt_time': decrypt_time
+        }
+    
+    # =========================================================================
+    # Serialization (for network transport)
+    # =========================================================================
+    
+    def serialize_encrypted(self, encrypted: Dict) -> str:
+        """
+        Serialize encrypted data to JSON string.
+        
+        Args:
+            encrypted: Dictionary from encrypt_string/encrypt_bytes
+            
+        Returns:
+            JSON string (Base64 encoded ciphertext)
+        """
+        ciphertext_bytes = encrypted['ciphertext'].tobytes()
+        ciphertext_b64 = base64.b64encode(ciphertext_bytes).decode('ascii')
+        
+        serialized = {
+            'ciphertext_b64': ciphertext_b64,
+            'ciphertext_shape': list(encrypted['ciphertext'].shape),
+            'original_len': encrypted['original_len'],
+            'checksum': encrypted['checksum'],
+            'encoding': encrypted.get('encoding', 'utf-8'),
+            'n': self.n,
+            'm': self.m
+        }
+        
+        return json.dumps(serialized)
+    
+    def deserialize_encrypted(self, json_str: str) -> Dict:
+        """
+        Deserialize JSON string to encrypted dictionary.
+        
+        Args:
+            json_str: JSON string from serialize_encrypted
+            
+        Returns:
+            Dictionary compatible with decrypt_string/decrypt_bytes
         """
         data = json.loads(json_str)
         
-        if data['n'] != self.n or data['m'] != self.m:
-            raise ValueError("Parameter mismatch")
-        
         ciphertext_bytes = base64.b64decode(data['ciphertext_b64'])
         ciphertext = np.frombuffer(ciphertext_bytes, dtype=np.float64)
-        ciphertext = ciphertext.reshape(data['shape'])
+        ciphertext = ciphertext.reshape(data['ciphertext_shape'])
         
         return {
             'ciphertext': ciphertext,
             'original_len': data['original_len'],
-            'checksum': data.get('checksum'),
-            'encoding': data.get('encoding')
+            'checksum': data['checksum'],
+            'encoding': data.get('encoding', 'utf-8')
         }
     
     # =========================================================================
-    # Utilities
+    # Statistics
     # =========================================================================
     
-    def get_stats(self) -> dict:
-        """Return statistics."""
+    def get_practical_stats(self) -> Dict:
+        """Get practical operation statistics."""
         return {
-            **self.stats,
-            'chunk_size_bytes': self.n,
-            'overhead_ratio': (self.n * 8) / self.n  # float64 = 8 bytes
+            **self.practical_stats,
+            'n': self.n,
+            'm': self.m,
+            'keys_expanded': self._keys_expanded
         }
-    
-    def cleanup(self):
-        """Release resources."""
-        if self._kdf:
-            self._kdf.cleanup()
 
 
-# =============================================================================
-# Helper functions
-# =============================================================================
+# =========================================================================
+# Factory Functions
+# =========================================================================
 
-def quick_encrypt_string(text: str, seed: Optional[bytes] = None) -> Tuple[str, bytes]:
+def create_practical_meteor(security_level: int = 256,
+                            device_id: int = 0,
+                            seed: Optional[bytes] = None) -> MeteorPractical:
     """
-    One-liner string encryption.
+    Factory function for MeteorPractical.
+    
+    Automatically computes optimal layer count.
     
     Args:
-        text: Text to encrypt
-        seed: Seed (auto-generated if omitted)
+        security_level: Security level (128, 256, 512, 1024, 2048)
+        device_id: GPU device ID
+        seed: Optional seed for key restoration
         
     Returns:
-        Tuple of (encrypted JSON, seed)
+        Configured MeteorPractical instance
+        
+    Example:
+        >>> crypto = create_practical_meteor(256)
+        >>> crypto.key_gen()
+        >>> crypto.expand_keys()
+        >>> enc = crypto.encrypt_string("Hello!")
     """
-    crypto = MeteorPractical()
+    valid_levels = [128, 256, 512, 1024, 2048]
     
-    if seed:
+    if security_level not in valid_levels:
+        raise ValueError(f"Security level must be one of {valid_levels}")
+    
+    n = security_level
+    m = compute_layer_count(n)
+    
+    return MeteorPractical(n=n, m=m, seed=seed, device_id=device_id)
+
+
+# =========================================================================
+# Quick Helper Functions
+# =========================================================================
+
+def quick_encrypt_string(text: str, 
+                         seed: Optional[bytes] = None,
+                         security_level: int = 256) -> Tuple[str, bytes]:
+    """
+    Quick one-shot string encryption.
+    
+    Args:
+        text: String to encrypt
+        seed: Optional seed (generated if None)
+        security_level: Security level
+        
+    Returns:
+        Tuple of (encrypted JSON string, seed)
+        
+    Example:
+        >>> json_str, seed = quick_encrypt_string("Secret!")
+        >>> # Save seed securely
+        >>> text = quick_decrypt_string(json_str, seed)
+    """
+    crypto = create_practical_meteor(security_level)
+    
+    if seed is not None:
         crypto.import_seed(seed)
+        crypto.expand_keys()
     else:
         seed = crypto.key_gen()
-    
-    crypto.expand_keys()
+        crypto.expand_keys()
     
     enc = crypto.encrypt_string(text)
     json_str = crypto.serialize_encrypted(enc)
@@ -578,18 +545,21 @@ def quick_encrypt_string(text: str, seed: Optional[bytes] = None) -> Tuple[str, 
     return json_str, seed
 
 
-def quick_decrypt_string(json_str: str, seed: bytes) -> str:
+def quick_decrypt_string(json_str: str, 
+                         seed: bytes,
+                         security_level: int = 256) -> str:
     """
-    Decrypt encrypted JSON string.
+    Quick one-shot string decryption.
     
     Args:
-        json_str: Encrypted JSON
+        json_str: Encrypted JSON from quick_encrypt_string
         seed: Seed used for encryption
+        security_level: Security level
         
     Returns:
-        Decrypted text
+        Decrypted string
     """
-    crypto = MeteorPractical()
+    crypto = create_practical_meteor(security_level)
     crypto.import_seed(seed)
     crypto.expand_keys()
     
@@ -601,5 +571,8 @@ def quick_decrypt_string(json_str: str, seed: bytes) -> str:
     return text
 
 
-# Backward compatibility alias
+# =========================================================================
+# Backward Compatibility
+# =========================================================================
+
 MeteorNC_Practical = MeteorPractical
