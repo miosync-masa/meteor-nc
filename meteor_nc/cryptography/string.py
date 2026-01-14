@@ -192,7 +192,7 @@ class MeteorPractical(MeteorKDF):
             Dictionary with ciphertext and metadata
         """
         # Auto-expand keys if needed
-        if not self._keys_expanded:
+        if not self.keys_expanded:
             self.expand_keys()
         
         # Encode string to bytes
@@ -235,7 +235,7 @@ class MeteorPractical(MeteorKDF):
             Decrypted string
         """
         # Auto-expand keys if needed
-        if not self._keys_expanded:
+        if not self.keys_expanded:
             self.expand_keys()
         
         # Decrypt
@@ -276,7 +276,7 @@ class MeteorPractical(MeteorKDF):
         Returns:
             Dictionary with ciphertext and metadata
         """
-        if not self._keys_expanded:
+        if not self.keys_expanded:
             self.expand_keys()
         
         original_len = len(data)
@@ -309,7 +309,7 @@ class MeteorPractical(MeteorKDF):
         Returns:
             Decrypted bytes
         """
-        if not self._keys_expanded:
+        if not self.keys_expanded:
             self.expand_keys()
         
         start = time.time()
@@ -488,7 +488,7 @@ class MeteorPractical(MeteorKDF):
             **self.practical_stats,
             'n': self.n,
             'm': self.m,
-            'keys_expanded': self._keys_expanded
+            'keys_expanded': self.keys_expanded
         }
 
 
