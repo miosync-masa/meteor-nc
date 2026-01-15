@@ -1,0 +1,120 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meteor-nc"
+version = "2.0.0"
+description = "Post-Quantum Hybrid Key Encapsulation Mechanism with GPU Acceleration"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+keywords = [
+    "post-quantum",
+    "cryptography",
+    "lattice",
+    "LWE",
+    "KEM",
+    "GPU",
+    "CUDA",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Scientific/Engineering",
+]
+
+# Core dependencies
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+]
+
+[project.optional-dependencies]
+# GPU acceleration (CUDA 12.x)
+gpu = [
+    "cupy-cuda12x>=12.0.0",
+]
+# GPU acceleration (CUDA 11.x)
+gpu-cuda11 = [
+    "cupy-cuda11x>=11.0.0",
+]
+# Stream encryption (XChaCha20-Poly1305)
+stream = [
+    "cryptography>=3.4.0",
+]
+# Web 4.0 protocol (P2P, DHT, PubSub)
+web4 = [
+    "pynacl>=1.5.0",
+    "libp2p>=0.1.0",
+    "ipfshttpclient>=0.8.0",
+    "multiaddr>=0.0.9",
+]
+# Full installation
+full = [
+    "cupy-cuda12x>=12.0.0",
+    "cryptography>=3.4.0",
+    "pynacl>=1.5.0",
+]
+# Development dependencies
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+]
+
+[project.urls]
+# NOTE: Update these URLs after blind review
+# Repository = "https://github.com/..."
+# Documentation = "https://..."
+
+[tool.setuptools]
+packages = ["meteor_nc", "meteor_nc.cryptography", "meteor_nc.protocols", "meteor_nc.auth"]
+package-dir = {"" = "."}
+
+[tool.setuptools.package-data]
+"meteor_nc.cryptography" = ["kernels/*.cu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311", "py312"]
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+    | \.mypy_cache
+    | \.pytest_cache
+    | __pycache__
+    | build
+    | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["meteor_nc"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
