@@ -1,8 +1,8 @@
 # meteor_nc/__init__.py
 """
 Meteor-NC: Post-Quantum Hybrid Cryptosystem
-
 WEB4.0 Protocol Ready!
+
 - Post-Quantum Key Encapsulation (LWE-KEM)
 - High-Speed Streaming Encryption (XChaCha20-Poly1305)
 - P2P Communication Protocol
@@ -65,6 +65,19 @@ try:
 except ImportError:
     PROTOCOL_AVAILABLE = False
 
+# Advanced Protocol Testing
+try:
+    from .protocols.advanced import (
+        MeteorNetwork,
+        LatencySimulator,
+        LatencyProfile,
+        SessionManager,
+        run_comprehensive_tests,
+    )
+    ADVANCED_AVAILABLE = True
+except ImportError:
+    ADVANCED_AVAILABLE = False
+
 __all__ = [
     # Version
     "__version__",
@@ -89,11 +102,18 @@ __all__ = [
     "quick_encrypt",
     "quick_decrypt",
     
-    # Protocol
+    # Protocol (Basic)
     "MeteorNode",
     "MeteorPeer",
     "MeteorMessage",
     "MeteorProtocol",
+    
+    # Protocol (Advanced)
+    "MeteorNetwork",
+    "LatencySimulator",
+    "LatencyProfile",
+    "SessionManager",
+    "run_comprehensive_tests",
     
     # Constants
     "Q_DEFAULT",
@@ -108,4 +128,5 @@ __all__ = [
     "STREAM_AVAILABLE",
     "PRACTICAL_AVAILABLE",
     "PROTOCOL_AVAILABLE",
+    "ADVANCED_AVAILABLE",
 ]
