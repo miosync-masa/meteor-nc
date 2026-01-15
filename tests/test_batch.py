@@ -1,6 +1,11 @@
 # tests/test_batch.py
 """
 Meteor-NC Batch KEM Test Suite for TCHES
+
+Supports multiple security levels:
+  - 128-bit (n=256) - NIST Level 1
+  - 192-bit (n=512) - NIST Level 3
+  - 256-bit (n=1024) - NIST Level 5
 """
 
 import secrets
@@ -25,9 +30,9 @@ if not GPU_AVAILABLE:
 # B1. Correctness Tests
 # =============================================================================
 
-def test_b1_batch_encaps_decaps() -> Dict:
+def test_b1_batch_encaps_decaps(n: int = 256) -> Dict:
     """B1: Batch encaps/decaps consistency"""
-    print("\n[B1] Batch Encaps/Decaps Consistency")
+    print(f"\n[B1] Batch Encaps/Decaps Consistency (n={n})")
     print("-" * 50)
     
     if not GPU_AVAILABLE:
@@ -38,17 +43,23 @@ def test_b1_batch_encaps_decaps() -> Dict:
     
     results = {'tests': [], 'pass': 0, 'fail': 0}
     
-    batch_sizes = [1, 10, 100, 1000]
+    # Adjust batch sizes based on n (larger n = smaller max batch)
+    if n <= 256:
+        batch_sizes = [1, 10, 100, 1000]
+    elif n <= 512:
+        batch_sizes = [1, 10, 100, 500]
+    else:
+        batch_sizes = [1, 10, 100, 200]
     
     for bs in batch_sizes:
         try:
-            kem = BatchLWEKEM(n=256, device_id=0)
+            kem = BatchLWEKEM(n=n, device_id=0)
             kem.key_gen()
             
-            # Batch encaps - 戻り値は (K, U, V)
+            # Batch encaps
             K_batch, U, V = kem.encaps_batch(bs, return_ct=True)
             
-            # Batch decaps - 引数は (U, V)
+            # Batch decaps
             K_dec_batch = kem.decaps_batch(U, V)
             
             # Check all match
@@ -75,9 +86,9 @@ def test_b1_batch_encaps_decaps() -> Dict:
     return results
 
 
-def test_b1_2_batch_no_ct_mode() -> Dict:
+def test_b1_2_batch_no_ct_mode(n: int = 256) -> Dict:
     """B1.2: Batch encaps without returning CT"""
-    print("\n[B1.2] Batch Encaps (No CT Return)")
+    print(f"\n[B1.2] Batch Encaps No CT Return (n={n})")
     print("-" * 50)
     
     if not GPU_AVAILABLE:
@@ -88,11 +99,17 @@ def test_b1_2_batch_no_ct_mode() -> Dict:
     
     results = {'pass': 0, 'fail': 0}
     
-    batch_sizes = [100, 1000, 10000]
+    # Adjust batch sizes based on n
+    if n <= 256:
+        batch_sizes = [100, 1000, 10000]
+    elif n <= 512:
+        batch_sizes = [100, 1000, 5000]
+    else:
+        batch_sizes = [100, 500, 1000]
     
     for bs in batch_sizes:
         try:
-            kem = BatchLWEKEM(n=256, device_id=0)
+            kem = BatchLWEKEM(n=n, device_id=0)
             kem.key_gen()
             
             # return_ct=False
@@ -120,9 +137,9 @@ def test_b1_2_batch_no_ct_mode() -> Dict:
 # B2. Implicit Rejection Tests
 # =============================================================================
 
-def test_b2_batch_implicit_rejection() -> Dict:
+def test_b2_batch_implicit_rejection(n: int = 256) -> Dict:
     """B2: Implicit rejection in batch mode"""
-    print("\n[B2] Batch Implicit Rejection")
+    print(f"\n[B2] Batch Implicit Rejection (n={n})")
     print("-" * 50)
     
     if not GPU_AVAILABLE:
@@ -133,7 +150,7 @@ def test_b2_batch_implicit_rejection() -> Dict:
     
     results = {'isolated': 0, 'total': 0}
     
-    kem = BatchLWEKEM(n=256, device_id=0)
+    kem = BatchLWEKEM(n=n, device_id=0)
     kem.key_gen()
     
     batch_size = 100
@@ -168,9 +185,9 @@ def test_b2_batch_implicit_rejection() -> Dict:
 # B3. ct_hash Consistency
 # =============================================================================
 
-def test_b3_ct_hash_consistency() -> Dict:
+def test_b3_ct_hash_consistency(n: int = 256) -> Dict:
     """B3: ct_hash GPU≡CPU consistency"""
-    print("\n[B3] ct_hash GPU≡CPU Consistency")
+    print(f"\n[B3] ct_hash GPU≡CPU Consistency (n={n})")
     print("-" * 50)
     
     if not GPU_AVAILABLE:
@@ -181,7 +198,7 @@ def test_b3_ct_hash_consistency() -> Dict:
     
     results = {'unique_keys': 0}
     
-    kem = BatchLWEKEM(n=256, device_id=0)
+    kem = BatchLWEKEM(n=n, device_id=0)
     kem.key_gen()
     
     batch_size = 100
@@ -204,9 +221,9 @@ def test_b3_ct_hash_consistency() -> Dict:
 # B4. Robustness Tests
 # =============================================================================
 
-def test_b4_dtype_shape() -> Dict:
+def test_b4_dtype_shape(n: int = 256) -> Dict:
     """B4: Dtype and shape handling"""
-    print("\n[B4] Dtype/Shape Handling")
+    print(f"\n[B4] Dtype/Shape Handling (n={n})")
     print("-" * 50)
     
     if not GPU_AVAILABLE:
@@ -217,7 +234,7 @@ def test_b4_dtype_shape() -> Dict:
     
     results = {'tests': [], 'pass': 0, 'fail': 0}
     
-    kem = BatchLWEKEM(n=256, device_id=0)
+    kem = BatchLWEKEM(n=n, device_id=0)
     kem.key_gen()
     
     # Get valid ct
@@ -255,9 +272,9 @@ def test_b4_dtype_shape() -> Dict:
 # B5. Reproducibility Tests
 # =============================================================================
 
-def test_b5_determinism() -> Dict:
+def test_b5_determinism(n: int = 256) -> Dict:
     """B5: Batch key generation determinism"""
-    print("\n[B5] Batch Determinism")
+    print(f"\n[B5] Batch Determinism (n={n})")
     print("-" * 50)
     
     if not GPU_AVAILABLE:
@@ -272,10 +289,10 @@ def test_b5_determinism() -> Dict:
     for _ in range(results['total']):
         seed = secrets.token_bytes(32)
         
-        kem1 = BatchLWEKEM(n=256, device_id=0)
+        kem1 = BatchLWEKEM(n=n, device_id=0)
         kem1.key_gen(seed=seed)
         
-        kem2 = BatchLWEKEM(n=256, device_id=0)
+        kem2 = BatchLWEKEM(n=n, device_id=0)
         kem2.key_gen(seed=seed)
         
         # Compare A matrices
@@ -297,9 +314,9 @@ def test_b5_determinism() -> Dict:
 # B6. Performance Tests
 # =============================================================================
 
-def test_b6_performance() -> Dict:
+def test_b6_performance(n: int = 256) -> Dict:
     """B6: Batch performance benchmark"""
-    print("\n[B6] Batch Performance")
+    print(f"\n[B6] Batch Performance (n={n})")
     print("-" * 50)
     
     if not GPU_AVAILABLE:
@@ -309,9 +326,9 @@ def test_b6_performance() -> Dict:
     from meteor_nc.cryptography.batch import BatchLWEKEM
     import cupy as cp
     
-    results = {}
+    results = {'n': n}
     
-    kem = BatchLWEKEM(n=256, device_id=0)
+    kem = BatchLWEKEM(n=n, device_id=0)
     kem.key_gen()
     
     # Warmup
@@ -319,8 +336,16 @@ def test_b6_performance() -> Dict:
         kem.encaps_batch(1000, return_ct=False)
     cp.cuda.Stream.null.synchronize()
     
+    # Adjust batch sizes based on n (memory constraints)
+    if n <= 256:
+        batch_sizes = [1000, 10000, 100000]
+    elif n <= 512:
+        batch_sizes = [1000, 10000, 50000]
+    else:
+        batch_sizes = [1000, 5000, 10000]
+    
     # Benchmark different batch sizes
-    for bs in [1000, 10000, 100000]:
+    for bs in batch_sizes:
         try:
             start = time.perf_counter()
             K, _, _ = kem.encaps_batch(bs, return_ct=False)
@@ -334,6 +359,12 @@ def test_b6_performance() -> Dict:
         except Exception as e:
             print(f"    batch_size={bs}: ERROR - {e}")
     
+    # Peak throughput (largest successful batch)
+    peak_key = max([k for k in results.keys() if k.startswith('batch_')], 
+                   key=lambda k: results.get(k, 0), default=None)
+    if peak_key:
+        results['peak_ops_sec'] = results[peak_key]
+    
     results['passed'] = True
     print(f"  Result: PASS ✓ (benchmark)")
     
@@ -341,11 +372,112 @@ def test_b6_performance() -> Dict:
 
 
 # =============================================================================
-# Main Test Runner
+# Single Level Test Runner
+# =============================================================================
+
+def run_tests_for_level(n: int, level_name: str) -> Dict:
+    """Run all batch tests for specific security level."""
+    print("\n" + "=" * 70)
+    print(f"SECURITY LEVEL: {level_name} (n={n})")
+    print("=" * 70)
+    
+    if not GPU_AVAILABLE:
+        print("  SKIPPED: GPU not available")
+        return {'all_passed': True, 'skipped': True}
+    
+    results = {}
+    
+    # B1: Correctness
+    results['b1_encaps_decaps'] = test_b1_batch_encaps_decaps(n=n)
+    results['b1_2_no_ct_mode'] = test_b1_2_batch_no_ct_mode(n=n)
+    
+    # B2: Implicit Rejection
+    results['b2_implicit_rejection'] = test_b2_batch_implicit_rejection(n=n)
+    
+    # B3: ct_hash Consistency
+    results['b3_ct_hash'] = test_b3_ct_hash_consistency(n=n)
+    
+    # B4: Robustness
+    results['b4_dtype_shape'] = test_b4_dtype_shape(n=n)
+    
+    # B5: Reproducibility
+    results['b5_determinism'] = test_b5_determinism(n=n)
+    
+    # B6: Performance
+    results['b6_performance'] = test_b6_performance(n=n)
+    
+    # Summary for this level
+    all_passed = all(r.get('passed', False) for r in results.values())
+    results['all_passed'] = all_passed
+    
+    return results
+
+
+# =============================================================================
+# Multi-Level Test Runner
+# =============================================================================
+
+def run_all_levels() -> Dict:
+    """Run batch tests for all security levels."""
+    print("=" * 70)
+    print("Meteor-NC Batch KEM Multi-Level Test Suite")
+    print("=" * 70)
+    print(f"GPU Available: {GPU_AVAILABLE}")
+    
+    if not GPU_AVAILABLE:
+        print("\nWARNING: All batch tests require GPU. Skipping.")
+        return {'all_levels_pass': True, 'skipped': True}
+    
+    levels = [
+        (256, "128-bit (NIST Level 1)"),
+        (512, "192-bit (NIST Level 3)"),
+        (1024, "256-bit (NIST Level 5)"),
+    ]
+    
+    all_results = {}
+    
+    for n, level_name in levels:
+        all_results[f"n={n}"] = run_tests_for_level(n, level_name)
+    
+    # Final Summary
+    print("\n" + "=" * 70)
+    print("FINAL SUMMARY - ALL SECURITY LEVELS (BATCH)")
+    print("=" * 70)
+    
+    for level_key, results in all_results.items():
+        if results.get('skipped'):
+            status = "⏭️ SKIP"
+        elif results.get('all_passed'):
+            status = "✅ PASS"
+        else:
+            status = "❌ FAIL"
+        
+        perf = results.get('b6_performance', {})
+        peak = perf.get('peak_ops_sec', 0)
+        
+        print(f"  {level_key}: {status}")
+        if peak:
+            print(f"    Peak throughput: {peak:,.0f} ops/sec")
+    
+    all_levels_pass = all(r.get('all_passed', False) or r.get('skipped', False) 
+                          for r in all_results.values())
+    
+    print(f"\n{'=' * 70}")
+    print(f"RESULT: {'✅ ALL LEVELS PASSED' if all_levels_pass else '❌ SOME LEVELS FAILED'}")
+    print(f"{'=' * 70}")
+    
+    return {
+        'results': all_results,
+        'all_levels_pass': all_levels_pass,
+    }
+
+
+# =============================================================================
+# Original Single-Level Test Runner (for compatibility)
 # =============================================================================
 
 def run_all_batch_tests() -> Dict:
-    """Run all batch tests."""
+    """Run all batch tests (default n=256)."""
     print("=" * 70)
     print("Meteor-NC Batch KEM Test Suite (TCHES)")
     print("=" * 70)
@@ -438,4 +570,9 @@ def run_all_batch_tests() -> Dict:
 
 
 if __name__ == "__main__":
-    run_all_batch_tests()
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--all-levels":
+        run_all_levels()
+    else:
+        run_all_batch_tests()
