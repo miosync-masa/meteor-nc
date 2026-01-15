@@ -289,7 +289,7 @@ python -m tests.test_stream # Stream DEM
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](License).
 
 ---
 
