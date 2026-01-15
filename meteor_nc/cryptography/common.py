@@ -72,7 +72,7 @@ def prg_sha256(seed: bytes, out_len: int, domain: bytes = b"prg") -> bytes:
     out = bytearray()
     ctr = 0
     while len(out) < out_len:
-        out.extend(_sha256(domain, seed + struct.pack("<I", ctr)))
+        out.extend(_sha256(domain, seed, struct.pack("<I", ctr)))
         ctr += 1
     return bytes(out[:out_len])
 
