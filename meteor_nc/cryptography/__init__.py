@@ -11,6 +11,8 @@ from .common import (
     SECURITY_PARAMS,
     GPU_AVAILABLE,
     CRYPTO_AVAILABLE,
+    _sha256,
+    cbd_vector_from_seed,
 )
 
 from .core import (
@@ -41,8 +43,7 @@ except ImportError:
     PRACTICAL_AVAILABLE = False
 
 __all__ = [
-    # Core
-    "HKDF",
+    # CORE
     "LWEKEM",
     "HybridKEM",
     "SymmetricMixer",
@@ -57,11 +58,14 @@ __all__ = [
     "create_meteor",
     "quick_encrypt",
     "quick_decrypt",
-    # Constants
+    # common
+    "HKDF",
     "Q_DEFAULT",
     "MSG_BYTES",
     "MSG_BITS",
     "SECURITY_PARAMS",
+    "prg_sha256",
+    "cbd_vector_from_seed",
     # Flags
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
