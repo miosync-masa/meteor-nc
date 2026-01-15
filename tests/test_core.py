@@ -1097,11 +1097,15 @@ def test_e2_negative_comprehensive() -> Dict:
     
     K_good, ct = kem.encaps()
     
-    # Convert to numpy for manipulation
-    u_orig = np.array(ct.u.get() if GPU_AVAILABLE else ct.u, dtype=np.int64)
-    v_orig = np.array(ct.v.get() if GPU_AVAILABLE else ct.v, dtype=np.int64)
+    # Convert to numpy for manipulation (handle both CuPy and NumPy)
+    if hasattr(ct.u, 'get'):  # CuPy array
+        u_orig = ct.u.get().astype(np.int64)
+        v_orig = ct.v.get().astype(np.int64)
+    else:  # Already NumPy
+        u_orig = np.array(ct.u, dtype=np.int64)
+        v_orig = np.array(ct.v, dtype=np.int64)
     
-    # Test cases: (description, u_modifier, v_modifier)
+    # Test cases: (description, u_bad, v_bad)
     test_cases = []
     
     # u modifications
@@ -1160,7 +1164,6 @@ def test_e2_negative_comprehensive() -> Dict:
     print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
     
     return results
-
 
 def test_e3_serialization_roundtrip() -> Dict:
     """
