@@ -650,9 +650,322 @@ def test_a5_performance() -> Dict:
     
     return results
 
+# =============================================================================
+# B. KEM Implementation Security Tests (FO Compliance)
+# =============================================================================
+
+def test_b1_implicit_rejection_determinism(iterations: int = 100) -> Dict:
+    """
+    B1: Implicit rejection correctness
+    
+    B1.1: Same ct → same K_fail (deterministic)
+    B1.2: Different ct → different K_fail (CT-bound)
+    B1.3: K_fail != K_good (statistically)
+    """
+    print("\n[B1] Implicit Rejection Determinism")
+    print("-" * 50)
+    
+    results = {'b1_1': 0, 'b1_2': 0, 'b1_3': 0, 'total': iterations}
+    
+    kem = LWEKEM(n=256, gpu=GPU_AVAILABLE)
+    kem.key_gen()
+    
+    for _ in range(iterations):
+        K_good, ct = kem.encaps()
+        
+        # Create bad CT
+        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
+        ct_bad.u[0] ^= 1
+        
+        # B1.1: Same bad CT → same K_fail
+        K_fail_1 = kem.decaps(ct_bad)
+        K_fail_2 = kem.decaps(ct_bad)
+        if K_fail_1 == K_fail_2:
+            results['b1_1'] += 1
+        
+        # B1.2: Different bad CT → different K_fail
+        ct_bad2 = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
+        ct_bad2.u[1] ^= 1
+        K_fail_3 = kem.decaps(ct_bad2)
+        if K_fail_1 != K_fail_3:
+            results['b1_2'] += 1
+        
+        # B1.3: K_fail != K_good
+        if K_fail_1 != K_good:
+            results['b1_3'] += 1
+    
+    results['passed'] = (
+        results['b1_1'] == iterations and
+        results['b1_2'] == iterations and
+        results['b1_3'] == iterations
+    )
+    
+    print(f"  B1.1 (deterministic): {results['b1_1']}/{iterations}")
+    print(f"  B1.2 (CT-bound):      {results['b1_2']}/{iterations}")
+    print(f"  B1.3 (K_fail≠K_good): {results['b1_3']}/{iterations}")
+    print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
+    
+    return results
+
+
+def test_b2_cca_reencrypt_check(iterations: int = 100) -> Dict:
+    """
+    B2: CCA compliance (re-encryption check)
+    
+    B2.1: Valid CT passes re-encrypt check
+    B2.2: Modified CT fails re-encrypt check
+    """
+    print("\n[B2] CCA Re-encrypt Check")
+    print("-" * 50)
+    
+    results = {'valid_pass': 0, 'modified_fail': 0, 'total': iterations}
+    
+    kem = LWEKEM(n=256, gpu=GPU_AVAILABLE)
+    kem.key_gen()
+    
+    for _ in range(iterations):
+        K_good, ct = kem.encaps()
+        
+        # B2.1: Valid CT should pass
+        K_dec = kem.decaps(ct)
+        if K_dec == K_good:
+            results['valid_pass'] += 1
+        
+        # B2.2: Modified CT should fail (K_dec != K_good)
+        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
+        ct_bad.v[0] ^= 1
+        K_bad = kem.decaps(ct_bad)
+        if K_bad != K_good:
+            results['modified_fail'] += 1
+    
+    results['passed'] = (
+        results['valid_pass'] == iterations and
+        results['modified_fail'] == iterations
+    )
+    
+    print(f"  Valid CT pass:    {results['valid_pass']}/{iterations}")
+    print(f"  Modified CT fail: {results['modified_fail']}/{iterations}")
+    print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
+    
+    return results
+
+
+def test_b3_cpu_gpu_equivalence() -> Dict:
+    """
+    B3: CPU/GPU equivalence
+    
+    B3.1: Same seed → same A,b on CPU and GPU
+    B3.2: Same ct → same K on CPU and GPU decaps
+    """
+    print("\n[B3] CPU/GPU Equivalence")
+    print("-" * 50)
+    
+    if not GPU_AVAILABLE:
+        print("  SKIPPED: GPU not available")
+        return {'passed': True, 'skipped': True}
+    
+    import cupy as cp
+    
+    results = {'b3_1': 0, 'b3_2': 0, 'total': 50}
+    
+    for _ in range(results['total']):
+        seed = secrets.token_bytes(32)
+        
+        # CPU instance
+        kem_cpu = LWEKEM(n=256, gpu=False, seed=seed)
+        kem_cpu.key_gen()
+        
+        # GPU instance
+        kem_gpu = LWEKEM(n=256, gpu=True, seed=seed)
+        kem_gpu.key_gen()
+        
+        # B3.1: Compare A, b
+        A_cpu = kem_cpu.pk.A
+        A_gpu = cp.asnumpy(kem_gpu.pk.A)
+        b_cpu = kem_cpu.pk.b
+        b_gpu = cp.asnumpy(kem_gpu.pk.b)
+        
+        if np.array_equal(A_cpu, A_gpu) and np.array_equal(b_cpu, b_gpu):
+            results['b3_1'] += 1
+        
+        # B3.2: Same encaps result → same decaps
+        K_cpu, ct_cpu = kem_cpu.encaps()
+        
+        # Decaps on both
+        K_dec_cpu = kem_cpu.decaps(ct_cpu)
+        
+        # Convert ct for GPU
+        ct_gpu = LWECiphertext(
+            u=cp.asarray(ct_cpu.u),
+            v=cp.asarray(ct_cpu.v)
+        )
+        K_dec_gpu = kem_gpu.decaps(ct_gpu)
+        
+        if K_dec_cpu == K_dec_gpu:
+            results['b3_2'] += 1
+    
+    results['passed'] = (
+        results['b3_1'] == results['total'] and
+        results['b3_2'] == results['total']
+    )
+    
+    print(f"  B3.1 (A,b match):    {results['b3_1']}/{results['total']}")
+    print(f"  B3.2 (decaps match): {results['b3_2']}/{results['total']}")
+    print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
+    
+    return results
+
 
 # =============================================================================
-# Main Test Runner
+# D. Key Schedule & Session Management Tests
+# =============================================================================
+
+def test_d1_key_separation() -> Dict:
+    """
+    D1: Key derivation separation
+    
+    D1.1: Different labels → different derived keys
+    D1.2: Same K, different labels → different outputs
+    """
+    print("\n[D1] Key Separation")
+    print("-" * 50)
+    
+    results = {'tests': [], 'pass': 0, 'fail': 0}
+    
+    # Simulate session key
+    K = secrets.token_bytes(32)
+    
+    # Typical key derivation labels
+    labels = [
+        b"aead-key",
+        b"stream-enc",
+        b"stream-id",
+        b"session",
+        b"rekey",
+        b"auth-key",
+    ]
+    
+    derived = {label: _sha256(label, K) for label in labels}
+    
+    # D1.1: All pairs must be different
+    for i, l1 in enumerate(labels):
+        for l2 in labels[i+1:]:
+            if derived[l1] != derived[l2]:
+                results['pass'] += 1
+            else:
+                results['fail'] += 1
+                results['tests'].append(f"COLLISION: {l1} vs {l2}")
+    
+    # D1.2: Same label, different K → different output
+    K2 = secrets.token_bytes(32)
+    for label in labels[:3]:
+        d1 = _sha256(label, K)
+        d2 = _sha256(label, K2)
+        if d1 != d2:
+            results['pass'] += 1
+        else:
+            results['fail'] += 1
+    
+    results['passed'] = results['fail'] == 0
+    
+    print(f"  Pairs tested: {results['pass'] + results['fail']}")
+    print(f"  Collisions: {results['fail']}")
+    print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
+    
+    return results
+
+
+def test_d3_kem_dem_integration(chunks: int = 100) -> Dict:
+    """
+    D3: KEM → DEM End-to-End Integration
+    
+    D3.1: KEM session_key → StreamDEM encrypt/decrypt works
+    D3.2: KEM CT tamper → StreamDEM decrypt fails
+    """
+    print("\n[D3] KEM-DEM Integration")
+    print("-" * 50)
+    
+    if not CRYPTO_AVAILABLE:
+        print("  SKIPPED: cryptography library not available")
+        return {'passed': True, 'skipped': True}
+    
+    from meteor_nc.cryptography.stream import StreamDEM
+    
+    results = {'d3_1': True, 'd3_2': True}
+    
+    # Setup KEM
+    kem_alice = LWEKEM(n=256, gpu=GPU_AVAILABLE)
+    kem_alice.key_gen()
+    
+    kem_bob = LWEKEM(n=256, gpu=GPU_AVAILABLE)
+    kem_bob.pk = kem_alice.pk  # Bob has Alice's public key
+    kem_bob.sk = kem_alice.sk  # For test: Bob can decrypt
+    kem_bob.delta = kem_alice.delta
+    
+    # D3.1: Normal flow
+    print("  D3.1: Normal KEM → DEM flow...")
+    
+    K, ct = kem_bob.encaps()
+    K_dec = kem_alice.decaps(ct)
+    
+    if K != K_dec:
+        results['d3_1'] = False
+        print("    KEM key mismatch!")
+    else:
+        # Use derived key for StreamDEM
+        session_key = _sha256(b"session", K)
+        stream_id = _sha256(b"stream-id", K)[:16]
+        
+        stream_enc = StreamDEM(session_key=session_key, stream_id=stream_id, gpu=GPU_AVAILABLE)
+        stream_dec = StreamDEM(session_key=session_key, stream_id=stream_id, gpu=GPU_AVAILABLE)
+        
+        # Encrypt/decrypt multiple chunks
+        for i in range(chunks):
+            plaintext = f"Message {i}: {secrets.token_hex(32)}".encode()
+            chunk = stream_enc.encrypt_chunk(plaintext)
+            recovered = stream_dec.decrypt_chunk(chunk)
+            
+            if plaintext != recovered:
+                results['d3_1'] = False
+                print(f"    Chunk {i} mismatch!")
+                break
+        
+        if results['d3_1']:
+            print(f"    {chunks} chunks: OK")
+    
+    # D3.2: Tampered KEM CT → different session key → decrypt fails
+    print("  D3.2: Tampered KEM CT...")
+    
+    K_good, ct = kem_bob.encaps()
+    
+    # Tamper CT
+    ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
+    ct_bad.u[0] ^= 1
+    
+    K_bad = kem_alice.decaps(ct_bad)
+    
+    if K_bad == K_good:
+        results['d3_2'] = False
+        print("    ERROR: Tampered CT produced same key!")
+    else:
+        # Different keys → different session keys
+        session_good = _sha256(b"session", K_good)
+        session_bad = _sha256(b"session", K_bad)
+        
+        if session_good != session_bad:
+            print("    Tampered CT → different session key: OK")
+        else:
+            results['d3_2'] = False
+    
+    results['passed'] = results['d3_1'] and results['d3_2']
+    
+    print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
+    
+    return results
+
+
+# =============================================================================
+# Updated Main Test Runner
 # =============================================================================
 
 def run_all_tests() -> Dict:
@@ -706,6 +1019,23 @@ def run_all_tests() -> Dict:
     print("=" * 70)
     
     all_results['a5_performance'] = test_a5_performance()
+    
+    # B. KEM Implementation Security
+    print("\n" + "=" * 70)
+    print("B. KEM IMPLEMENTATION SECURITY (FO)")
+    print("=" * 70)
+    
+    all_results['b1_implicit_rejection_det'] = test_b1_implicit_rejection_determinism(iterations=100)
+    all_results['b2_cca_reencrypt'] = test_b2_cca_reencrypt_check(iterations=100)
+    all_results['b3_cpu_gpu_equiv'] = test_b3_cpu_gpu_equivalence()
+    
+    # D. Key Schedule
+    print("\n" + "=" * 70)
+    print("D. KEY SCHEDULE & INTEGRATION")
+    print("=" * 70)
+    
+    all_results['d1_key_separation'] = test_d1_key_separation()
+    all_results['d3_kem_dem_integration'] = test_d3_kem_dem_integration(chunks=100)
     
     # Summary
     print("\n" + "=" * 70)
