@@ -1000,7 +1000,274 @@ def test_d3_kem_dem_integration(chunks: int = 100) -> Dict:
     return results
 
 # =============================================================================
-# Updated Main Test Runner
+# E. Extended Security Tests (TCHES Reviewer Confidence)
+# =============================================================================
+
+def test_e1_kfail_uniformity(iterations: int = 1000) -> Dict:
+    """
+    E1: K_fail uniformity check
+    
+    Verify K_fail appears uniformly distributed (not biased by CT structure).
+    - No duplicate K_fail values
+    - First byte distribution roughly uniform
+    - Different tampered positions → different K_fail
+    """
+    print("\n[E1] K_fail Uniformity")
+    print("-" * 50)
+    
+    results = {
+        'duplicates': 0,
+        'unique_kfails': set(),
+        'first_byte_dist': [0] * 256,
+        'position_independence': 0,
+        'total': iterations
+    }
+    
+    kem = LWEKEM(n=256, gpu=GPU_AVAILABLE)
+    kem.key_gen()
+    
+    for i in range(iterations):
+        K_good, ct = kem.encaps()
+        
+        # Tamper at random position
+        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
+        pos = np.random.randint(0, len(ct_bad.u))
+        ct_bad.u[pos] ^= 1
+        
+        K_fail = kem.decaps(ct_bad)
+        
+        # Check uniqueness
+        if K_fail in results['unique_kfails']:
+            results['duplicates'] += 1
+        results['unique_kfails'].add(K_fail)
+        
+        # Track first byte distribution
+        first_byte = K_fail[0]
+        results['first_byte_dist'][first_byte] += 1
+    
+    # Position independence test
+    K_good, ct = kem.encaps()
+    kfails_by_pos = []
+    for pos in [0, 1, 10, 100, 200, 255]:
+        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
+        ct_bad.u[pos] ^= 1
+        kfails_by_pos.append(kem.decaps(ct_bad))
+    
+    # All should be different
+    results['position_independence'] = len(set(kfails_by_pos))
+    
+    # Chi-square-like check for first byte (simplified)
+    expected = iterations / 256
+    max_deviation = max(abs(count - expected) for count in results['first_byte_dist'])
+    results['max_byte_deviation'] = max_deviation
+    results['expected_per_byte'] = expected
+    
+    # Pass criteria
+    results['passed'] = (
+        results['duplicates'] == 0 and
+        results['position_independence'] == 6 and
+        max_deviation < expected * 3  # Allow 3x deviation (rough uniformity)
+    )
+    
+    print(f"  Unique K_fail: {len(results['unique_kfails'])}/{iterations}")
+    print(f"  Duplicates: {results['duplicates']}")
+    print(f"  Position independence: {results['position_independence']}/6 unique")
+    print(f"  First byte max deviation: {max_deviation:.1f} (expected: {expected:.1f})")
+    print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
+    
+    # Don't include the set in return (not serializable)
+    results['unique_count'] = len(results['unique_kfails'])
+    del results['unique_kfails']
+    del results['first_byte_dist']
+    
+    return results
+
+
+def test_e2_negative_comprehensive() -> Dict:
+    """
+    E2: Comprehensive negative tests
+    
+    Various tampering patterns → all must fail (K_dec != K_good)
+    """
+    print("\n[E2] Comprehensive Negative Tests")
+    print("-" * 50)
+    
+    results = {'tests': [], 'pass': 0, 'fail': 0}
+    
+    kem = LWEKEM(n=256, gpu=GPU_AVAILABLE)
+    kem.key_gen()
+    
+    K_good, ct = kem.encaps()
+    
+    # Test cases: (description, tamper_function)
+    test_cases = [
+        ("u[0] 1-bit flip", lambda u, v: (u.copy().__setitem__(0, u[0] ^ 1) or u, v)),
+        ("u[128] 1-bit flip", lambda u, v: (np.concatenate([u[:128], [u[128] ^ 1], u[129:]]), v)),
+        ("u[-1] 1-bit flip", lambda u, v: (np.concatenate([u[:-1], [u[-1] ^ 1]]), v)),
+        ("v[0] 1-bit flip", lambda u, v: (u, np.concatenate([[v[0] ^ 1], v[1:]]))),
+        ("v[-1] 1-bit flip", lambda u, v: (u, np.concatenate([v[:-1], [v[-1] ^ 1]]))),
+        ("u[0] = 0", lambda u, v: (np.concatenate([[0], u[1:]]), v)),
+        ("u all +1", lambda u, v: ((u + 1) % Q_DEFAULT, v)),
+        ("v all +1", lambda u, v: (u, (v + 1) % Q_DEFAULT)),
+        ("u,v both flip[0]", lambda u, v: (np.concatenate([[u[0] ^ 1], u[1:]]), np.concatenate([[v[0] ^ 1], v[1:]]))),
+        ("u random replace", lambda u, v: (np.random.randint(0, Q_DEFAULT, size=u.shape, dtype=np.int64), v)),
+    ]
+    
+    for desc, tamper_fn in test_cases:
+        try:
+            u_orig = ct.u.copy() if hasattr(ct.u, 'copy') else np.array(ct.u)
+            v_orig = ct.v.copy() if hasattr(ct.v, 'copy') else np.array(ct.v)
+            
+            u_bad, v_bad = tamper_fn(u_orig, v_orig)
+            ct_bad = LWECiphertext(u=np.array(u_bad, dtype=np.int64), v=np.array(v_bad, dtype=np.int64))
+            
+            K_bad = kem.decaps(ct_bad)
+            
+            if K_bad != K_good:
+                results['pass'] += 1
+                results['tests'].append((desc, "REJECTED ✓"))
+            else:
+                results['fail'] += 1
+                results['tests'].append((desc, "NOT REJECTED ✗"))
+        except Exception as e:
+            results['pass'] += 1  # Exception is also rejection
+            results['tests'].append((desc, f"EXCEPTION ✓ ({type(e).__name__})"))
+    
+    results['passed'] = results['fail'] == 0
+    
+    for desc, status in results['tests']:
+        print(f"    {desc}: {status}")
+    
+    print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
+    
+    return results
+
+
+def test_e3_serialization_roundtrip() -> Dict:
+    """
+    E3: Serialization compatibility
+    
+    FullCiphertext.to_bytes() → from_bytes() → decrypt works
+    Cross-platform: GPU encrypt → serialize → CPU decrypt
+    """
+    print("\n[E3] Serialization Round-trip")
+    print("-" * 50)
+    
+    if not CRYPTO_AVAILABLE:
+        print("  SKIPPED: cryptography library not available")
+        return {'passed': True, 'skipped': True}
+    
+    results = {'tests': [], 'pass': 0, 'fail': 0}
+    
+    # Test 1: Basic round-trip
+    print("  E3.1: Basic serialization...")
+    try:
+        hybrid = HybridKEM(security_level=128, gpu=GPU_AVAILABLE)
+        hybrid.key_gen()
+        
+        plaintext = b"Test message for serialization"
+        ct = hybrid.encrypt(plaintext)
+        
+        # Serialize
+        ct_bytes = ct.to_bytes()
+        
+        # Deserialize
+        ct_restored = FullCiphertext.from_bytes(ct_bytes)
+        
+        # Decrypt
+        recovered = hybrid.decrypt(ct_restored)
+        
+        if plaintext == recovered:
+            results['pass'] += 1
+            results['tests'].append(("Basic round-trip", "PASS"))
+        else:
+            results['fail'] += 1
+            results['tests'].append(("Basic round-trip", "FAIL"))
+    except Exception as e:
+        results['fail'] += 1
+        results['tests'].append(("Basic round-trip", f"ERROR: {e}"))
+    
+    # Test 2: Multiple sizes
+    print("  E3.2: Multiple sizes...")
+    test_sizes = [0, 1, 16, 100, 1000, 10000]
+    for size in test_sizes:
+        try:
+            plaintext = secrets.token_bytes(size) if size > 0 else b""
+            ct = hybrid.encrypt(plaintext)
+            ct_bytes = ct.to_bytes()
+            ct_restored = FullCiphertext.from_bytes(ct_bytes)
+            recovered = hybrid.decrypt(ct_restored)
+            
+            if plaintext == recovered:
+                results['pass'] += 1
+            else:
+                results['fail'] += 1
+                results['tests'].append((f"Size {size}", "FAIL"))
+        except Exception as e:
+            results['fail'] += 1
+            results['tests'].append((f"Size {size}", f"ERROR: {e}"))
+    
+    if results['fail'] == 0:
+        results['tests'].append((f"All sizes ({test_sizes})", "PASS"))
+    
+    # Test 3: Cross-platform (GPU → CPU) via serialization
+    print("  E3.3: Cross-platform (GPU → CPU)...")
+    if GPU_AVAILABLE:
+        try:
+            import cupy as cp
+            
+            # GPU encrypt
+            hybrid_gpu = HybridKEM(security_level=128, gpu=True)
+            hybrid_gpu.key_gen()
+            
+            plaintext = b"Cross-platform test"
+            ct_gpu = hybrid_gpu.encrypt(plaintext)
+            
+            # Serialize (converts to numpy/bytes)
+            ct_bytes = ct_gpu.to_bytes()
+            
+            # Create CPU instance with same keys
+            hybrid_cpu = HybridKEM(security_level=128, gpu=False)
+            hybrid_cpu.kem.pk = LWEPublicKey(
+                A=cp.asnumpy(hybrid_gpu.kem.pk.A),
+                b=cp.asnumpy(hybrid_gpu.kem.pk.b),
+                pk_hash=hybrid_gpu.kem.pk.pk_hash
+            )
+            hybrid_cpu.kem.sk = LWESecretKey(
+                s=cp.asnumpy(hybrid_gpu.kem.sk.s),
+                z=hybrid_gpu.kem.sk.z
+            )
+            hybrid_cpu.kem.q = hybrid_gpu.kem.q
+            hybrid_cpu.kem.delta = hybrid_gpu.kem.delta
+            hybrid_cpu.mixer = hybrid_gpu.mixer  # Mixer is CPU-based
+            
+            # Deserialize and decrypt on CPU
+            ct_cpu = FullCiphertext.from_bytes(ct_bytes)
+            recovered = hybrid_cpu.decrypt(ct_cpu)
+            
+            if plaintext == recovered:
+                results['pass'] += 1
+                results['tests'].append(("GPU→CPU cross-platform", "PASS"))
+            else:
+                results['fail'] += 1
+                results['tests'].append(("GPU→CPU cross-platform", "FAIL"))
+        except Exception as e:
+            results['fail'] += 1
+            results['tests'].append(("GPU→CPU cross-platform", f"ERROR: {e}"))
+    else:
+        results['tests'].append(("GPU→CPU cross-platform", "SKIPPED (no GPU)"))
+    
+    results['passed'] = results['fail'] == 0
+    
+    for desc, status in results['tests']:
+        print(f"    {desc}: {status}")
+    
+    print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
+    
+    return results
+
+# =============================================================================
+# Updated run_all_tests()
 # =============================================================================
 
 def run_all_tests() -> Dict:
@@ -1071,6 +1338,15 @@ def run_all_tests() -> Dict:
     
     all_results['d1_key_separation'] = test_d1_key_separation()
     all_results['d3_kem_dem_integration'] = test_d3_kem_dem_integration(chunks=100)
+    
+    # E. Extended Security (TCHES Reviewer Confidence)
+    print("\n" + "=" * 70)
+    print("E. EXTENDED SECURITY (TCHES)")
+    print("=" * 70)
+    
+    all_results['e1_kfail_uniformity'] = test_e1_kfail_uniformity(iterations=1000)
+    all_results['e2_negative_comprehensive'] = test_e2_negative_comprehensive()
+    all_results['e3_serialization_roundtrip'] = test_e3_serialization_roundtrip()
     
     # Summary
     print("\n" + "=" * 70)
