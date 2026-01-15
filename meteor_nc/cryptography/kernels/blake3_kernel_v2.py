@@ -223,12 +223,178 @@ _blake3_derive_seeds_v2_kernel = _BLAKE3_V2_MODULE.get_function('blake3_derive_s
 _blake3_derive_keys_v2_kernel = _BLAKE3_V2_MODULE.get_function('blake3_derive_keys_v2')
 
 
+_BLAKE3_UV_CONCAT_V2_CODE = r'''
+// U||V 連結ハッシュ v2 (可変サイズ対応)
+
+__constant__ unsigned int IV_UV[8] = {
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+};
+
+__constant__ int MSG_PERM_UV[16] = {
+    2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8
+};
+
+__device__ __forceinline__ unsigned int rotr_uv(unsigned int x, int n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+__device__ void g_uv(unsigned int* state, int a, int b, int c, int d,
+                     unsigned int mx, unsigned int my) {
+    state[a] = state[a] + state[b] + mx;
+    state[d] = rotr_uv(state[d] ^ state[a], 16);
+    state[c] = state[c] + state[d];
+    state[b] = rotr_uv(state[b] ^ state[c], 12);
+    state[a] = state[a] + state[b] + my;
+    state[d] = rotr_uv(state[d] ^ state[a], 8);
+    state[c] = state[c] + state[d];
+    state[b] = rotr_uv(state[b] ^ state[c], 7);
+}
+
+__device__ void round_fn_uv(unsigned int* state, unsigned int* m) {
+    g_uv(state, 0, 4,  8, 12, m[0],  m[1]);
+    g_uv(state, 1, 5,  9, 13, m[2],  m[3]);
+    g_uv(state, 2, 6, 10, 14, m[4],  m[5]);
+    g_uv(state, 3, 7, 11, 15, m[6],  m[7]);
+    g_uv(state, 0, 5, 10, 15, m[8],  m[9]);
+    g_uv(state, 1, 6, 11, 12, m[10], m[11]);
+    g_uv(state, 2, 7,  8, 13, m[12], m[13]);
+    g_uv(state, 3, 4,  9, 14, m[14], m[15]);
+}
+
+__device__ void permute_uv(unsigned int* m) {
+    unsigned int tmp[16];
+    for (int i = 0; i < 16; i++) tmp[i] = m[MSG_PERM_UV[i]];
+    for (int i = 0; i < 16; i++) m[i] = tmp[i];
+}
+
+__device__ void compress_block_uv(unsigned int* cv, const unsigned int* block, 
+                                   int block_len, unsigned int flags) {
+    unsigned int state[16];
+    for (int i = 0; i < 8; i++) state[i] = cv[i];
+    state[8]  = IV_UV[0]; state[9]  = IV_UV[1];
+    state[10] = IV_UV[2]; state[11] = IV_UV[3];
+    state[12] = 0;        state[13] = 0;
+    state[14] = block_len; state[15] = flags;
+
+    unsigned int m[16];
+    for (int i = 0; i < 16; i++) m[i] = block[i];
+
+    for (int r = 0; r < 7; r++) {
+        round_fn_uv(state, m);
+        if (r < 6) permute_uv(m);
+    }
+
+    for (int i = 0; i < 8; i++) cv[i] = state[i] ^ state[i + 8];
+}
+
+extern "C" __global__
+void blake3_hash_uv_concat_v2(
+    const unsigned int* __restrict__ U,
+    const unsigned int* __restrict__ V,
+    unsigned char* __restrict__ out,
+    const int batch,
+    const int n,
+    const int msg_bits
+) {
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    if (tid >= batch) return;
+
+    const unsigned int* u_ptr = U + tid * n;
+    const unsigned int* v_ptr = V + tid * msg_bits;
+
+    // Initialize chaining value
+    unsigned int cv[8];
+    for (int i = 0; i < 8; i++) cv[i] = IV_UV[i];
+
+    // Total input: n + msg_bits uint32s
+    int total_words = n + msg_bits;
+    int num_blocks = (total_words + 15) / 16;
+
+    unsigned int block[16];
+    int word_idx = 0;
+
+    for (int blk = 0; blk < num_blocks; blk++) {
+        // Fill block from U then V
+        for (int i = 0; i < 16; i++) {
+            if (word_idx < n) {
+                block[i] = u_ptr[word_idx];
+            } else if (word_idx < total_words) {
+                block[i] = v_ptr[word_idx - n];
+            } else {
+                block[i] = 0;
+            }
+            word_idx++;
+        }
+
+        // Flags
+        unsigned int flags = 0;
+        if (blk == 0) flags |= 0x01;
+        if (blk == num_blocks - 1) flags |= 0x02;
+        if (blk == num_blocks - 1) flags |= 0x08;
+
+        int block_len = 64;
+        if (blk == num_blocks - 1) {
+            int remaining = (total_words * 4) - (blk * 64);
+            if (remaining < 64) block_len = remaining;
+        }
+
+        compress_block_uv(cv, block, block_len, flags);
+    }
+
+    // Output hash
+    unsigned char* out_ptr = out + tid * 32;
+    for (int i = 0; i < 8; i++) {
+        out_ptr[i*4 + 0] = (unsigned char)(cv[i]);
+        out_ptr[i*4 + 1] = (unsigned char)(cv[i] >> 8);
+        out_ptr[i*4 + 2] = (unsigned char)(cv[i] >> 16);
+        out_ptr[i*4 + 3] = (unsigned char)(cv[i] >> 24);
+    }
+}
+'''
+
+_BLAKE3_UV_V2_MODULE = cp.RawModule(code=_BLAKE3_UV_CONCAT_V2_CODE)
+_blake3_hash_uv_v2_kernel = _BLAKE3_UV_V2_MODULE.get_function('blake3_hash_uv_concat_v2')
+
 class GPUBlake3V2:
     """GPU BLAKE3 v2 for variable message sizes."""
     
     def __init__(self, device_id: int = 0):
         cp.cuda.Device(device_id).use()
         self._threads = 256
+
+    def hash_u32_concat_batch(
+        self,
+        U: cp.ndarray,
+        V: cp.ndarray,
+        n: int = 256,
+        msg_bits: int = 256,
+    ) -> cp.ndarray:
+        """
+        Hash U||V concatenation for batch (variable sizes).
+        
+        Args:
+            U: (batch, n) uint32
+            V: (batch, msg_bits) uint32
+            n: dimension (256, 512, 1024)
+            msg_bits: message bits (256, 512, 1024)
+            
+        Returns:
+            (batch, 32) uint8 hashes
+        """
+        batch = U.shape[0]
+        out = cp.empty((batch, 32), dtype=cp.uint8)
+        
+        U_c = cp.ascontiguousarray(U)
+        V_c = cp.ascontiguousarray(V)
+        
+        blocks = (batch + self._threads - 1) // self._threads
+        _blake3_hash_uv_v2_kernel(
+            (blocks,), (self._threads,),
+            (U_c, V_c, out, batch, n, msg_bits)
+        )
+        
+        return out
     
     def derive_seeds_batch(
         self,
