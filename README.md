@@ -1,105 +1,215 @@
-# Meteor-NC: PQC with 32-Byte Identities
-  
-**A Post-Quantum KEM Stack with 32-Byte Identities for High-Throughput and P2P Systems**
+# Meteor-NC: A Lattice-Based Key Encapsulation Mechanism
 
-> This repository accompanies the TCHES submission "Meteor-NC: A Lattice-Based Cryptosystem "
+**Post-Quantum Hybrid KEM with GPU Acceleration**
 
----
-
-## Abstract
-
-Meteor-NC is a post-quantum hybrid key encapsulation mechanism (KEM) designed for practical deployment. The system combines LWE-based cryptography with GPU acceleration to achieve high throughput while maintaining strong security guarantees. Key features include:
-
-- **Extreme key compression**: 32-byte master seeds generate full key pairs
-- **GPU-accelerated batch operations**: 4M+ encapsulations/second
-- **Adaptive Precision Noise (APN)**: Dynamic noise scaling for IND-CPA security
-- **Fujisaki-Okamoto transform**: IND-CCA2 security
-- **Practical protocol layers**: P2P messaging, streaming encryption, authentication
+> This repository accompanies the TCHES submission  
+> "Meteor-NC: A Lattice-Based Cryptosystem with P2P"
 
 ---
 
-## Security Parameters
+## Overview
 
-| Parameter | n=256 | n=512 | n=1024 |
-|-----------|-------|-------|--------|
-| **NIST Level** | 1 | 3 | 5 |
-| **Classical Security** | 128-bit | 192-bit | 256-bit |
-| **Quantum Security** | ~64-bit | ~96-bit | ~128-bit |
-| **Message Bytes** | 32 | 64 | 128 |
-| **Public Key** | 32 bytes (seed) | 32 bytes (seed) | 32 bytes (seed) |
-| **Ciphertext** | ~66 KB | ~264 KB | ~1 MB |
-| **Layer Count (m)** | 10 | 18 | 34 |
+Meteor-NC is a post-quantum key encapsulation mechanism (KEM) based on the Learning With Errors (LWE) problem. The system consists of:
 
-### Layer Count Formula
+1. **MeteorNC-Core-KEM**: An LWE-based KEM with Fujisaki-Okamoto transform and implicit rejection (`class LWEKEM`)
+2. **HybridKEM**: A KEM-DEM hybrid encryption scheme combining the KEM with an AEAD (`class HybridKEM`)
+3. **Throughput Interfaces**: Batch encapsulation/decapsulation and streaming chunk encryption (optional)
+
+### High-Level Data Flow
+
 ```
-m = max(8, floor(n/32) + 2)
+KeyGen → Encaps → K → KDF → k_aead → AEAD.Enc/Dec
 ```
+
+The KEM shared secret K is never used directly as an AEAD key; a domain-separated hash derives the final symmetric key.
+
+---
+
+## Parameter Sets
+
+The implementation provides three parameter bundles:
+
+| Level | n | k | q | η | Message Size |
+|-------|-----|-----|----------|-----|--------------|
+| 128 | 256 | 256 | 2³²−5 | 2 | 32 bytes |
+| 192 | 512 | 512 | 2³²−5 | 2 | 64 bytes |
+| 256 | 1024 | 1024 | 2³²−5 | 3 | 128 bytes |
+
+**Note**: Concrete security should be assessed with standard LWE estimators. The numeric labels (128/192/256) expose a tunable dimension/modulus/error interface and do not constitute formal security claims.
+
+### Representation
+
+- Ring elements: signed 64-bit integers (Python/NumPy/CuPy)
+- Reduction: modulo q after additions and matrix products
+- Intermediate values remain within 2⁶³ signed range for the above parameters
+
+---
+
+## Cryptographic Construction
+
+### Message Encoding/Decoding
+
+The KEM encrypts a uniformly random m ∈ {0,1}^(8μ), where μ = 32 bytes.
+
+**Encoding**: Let δ = ⌊q/2⌋. The message is encoded bitwise as:
+```
+EncBits(m) := δ · bits(m) ∈ Z_q^(8μ)
+```
+
+**Decoding** (threshold at q/4): Each coordinate is centered into (−q/2, q/2] and outputs bit 1 iff |v| > q/4.
+
+### MeteorNC-Core-KEM
+
+#### Key Generation (`KeyGen`)
+
+Starting from a 32-byte master seed, using HKDF with parameter-derived salt:
+
+1. Sample A ← Z_q^(k×n) uniformly using seeded backend RNG
+2. Sample s ← χ_η^n and e ← χ_η^k using seeded CBD sampling
+3. Compute b = As + e ∈ Z_q^k
+4. Compute pk_hash = H("pk_hash" ‖ enc(A) ‖ enc(b))
+5. Derive implicit-rejection seed z ← {0,1}²⁵⁶ via HKDF label "implicit_reject"
+
+**Output**: 
+- Public key: pk = (A, b, pk_hash)
+- Secret key: sk = (s, z)
+
+#### Encapsulation (`Encaps(pk)`)
+
+1. Sample m ← {0,1}^(8μ) uniformly (32 random bytes)
+2. Compute r = H("random" ‖ m ‖ pk_hash)
+3. Deterministically sample from hash-derived seeds:
+   - r_vec ← D_small^k (label "r")
+   - e₁ ← D_small^n (label "e1")
+   - e₂ ← D_small^(8μ) (label "e2")
+4. Compute encoded message: m_enc = δ · bits(m) ∈ Z_q^(8μ)
+5. Compute ciphertext:
+   - u = Aᵀr_vec + e₁ ∈ Z_q^n
+   - v = bᵀr_vec + e₂ + m_enc ∈ Z_q^(8μ)
+6. Compute shared secret: K = H("shared" ‖ m ‖ enc(u) ‖ enc(v))
+
+**Output**: (K, ct) where ct = (u, v)
+
+#### Decapsulation (`Decaps(pk, sk, ct)`)
+
+Given ct = (u, v):
+
+1. Compute v_dec = v − sᵀu ∈ Z_q^(8μ), then decode m' = DecBits(v_dec)
+2. Compute r' = H("random" ‖ m' ‖ pk_hash) and re-encrypt to obtain ct' = (u', v')
+3. Let ok = CTEq(enc(ct), enc(ct'))
+4. **Implicit rejection**:
+   ```
+   K = H("shared" ‖ m' ‖ enc(ct))   if ok = 1
+   K = H("fail" ‖ z ‖ enc(ct))      if ok = 0
+   ```
+
+**Output**: K
+
+#### Backend Independence
+
+NumPy and CuPy RNGs are not output-equivalent under the same seed. The FO check requires byte-for-byte equality of ct and ct'. Therefore, encryption-time vectors (r_vec, e₁, e₂) are sampled deterministically from hash-derived seeds (not from backend RNGs), ensuring CPU/GPU interoperability.
+
+### HybridKEM
+
+The hybrid scheme uses KEM-DEM with an AEAD data encapsulation mechanism.
+
+#### Key Derivation
+
+Given KEM shared secret K ∈ {0,1}²⁵⁶, derive the AEAD key:
+```
+k_aead := H("aead-key" ‖ K) ∈ {0,1}²⁵⁶
+```
+
+This domain separation prevents cross-protocol interactions between KEM and DEM hashing.
+
+#### Optional Reversible Mixer
+
+The implementation includes a reversible "mixer" (`SymmetricMixer`) implemented as a Feistel network over 32-bit words. Security is **not** claimed from this mixer; confidentiality and integrity are provided by AEAD. The mixer is deterministic and invertible, so it does not weaken AEAD security.
+
+#### Hybrid Ciphertext Structure
+
+```python
+FullCiphertext = (u, v, nonce, ct, tag)
+```
+
+Where (u, v) is the KEM ciphertext and (nonce, ct, tag) is the AEAD output.
+
+#### Pluggable AEAD
+
+The reference `HybridKEM` instantiates AEAD as AES-GCM (`cryptography.hazmat.primitives.ciphers.aead.AESGCM`). Other AEADs (e.g., XChaCha20-Poly1305) can be substituted without affecting the KEM analysis.
 
 ---
 
 ## Architecture
-
-### System Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Master Seed (32 bytes)                      │
 │                            │                                    │
 │                     ┌──────┴──────┐                             │
-│                     │    HKDF     │  RFC 5869                   │
-│                     │ (HMAC-SHA256)│                            │
+│                     │    HKDF     │  RFC 5869 (HMAC-SHA256)     │
 │                     └──────┬──────┘                             │
 │                            │                                    │
-│              ┌─────────────┼─────────────┐                      │
-│              │             │             │                      │
-│              ▼             ▼             ▼                      │
-│         LWE Keys     APN Params    Stream Keys                  │
-│         (A, s, e)    (κ, σ_eff)    (session)                   │
-│              │             │             │                      │
-│              └─────────────┴─────────────┘                      │
-│                            │                                    │
-│                            ▼                                    │
-│              ┌─────────────────────────────┐                    │
-│              │       Meteor-NC KEM         │                    │
-│              │   (IND-CCA2 via FO)         │                    │
-│              └─────────────────────────────┘                    │
-│                            │                                    │
-│              ┌─────────────┴─────────────┐                      │
-│              │                           │                      │
-│              ▼                           ▼                      │
-│        Single KEM               Batch KEM (GPU)                 │
-│        (CPU/GPU)               (CUDA Kernels)                   │
-│                                          │                      │
-│                            ┌─────────────┴─────────────┐        │
-│                            │                           │        │
-│                            ▼                           ▼        │
-│                    Stream DEM                  P2P Protocol     │
-│                 (XChaCha20-Poly1305)         (Web 4.0 Ready)   │
+│         ┌──────────────────┼──────────────────┐                 │
+│         │                  │                  │                 │
+│         ▼                  ▼                  ▼                 │
+│    Matrix A           Secrets (s,e)      Rejection z           │
+│   (seeded RNG)        (CBD sampling)     (implicit)            │
+│         │                  │                  │                 │
+│         └────────┬─────────┘                  │                 │
+│                  ▼                            │                 │
+│         ┌────────────────┐                    │                 │
+│         │  pk = (A,b,h)  │                    │                 │
+│         │  sk = (s,z)    │◄───────────────────┘                 │
+│         └────────┬───────┘                                      │
+│                  │                                              │
+│         ┌────────┴────────┐                                     │
+│         │                 │                                     │
+│         ▼                 ▼                                     │
+│   ┌──────────┐     ┌──────────┐                                 │
+│   │  Encaps  │     │  Decaps  │                                 │
+│   │ (m→K,ct) │     │(ct→K/K_f)│  ← Implicit Rejection           │
+│   └────┬─────┘     └────┬─────┘                                 │
+│        │                │                                       │
+│        └───────┬────────┘                                       │
+│                ▼                                                │
+│        ┌───────────────┐                                        │
+│        │   HybridKEM   │                                        │
+│        │  (KEM + AEAD) │                                        │
+│        └───────┬───────┘                                        │
+│                │                                                │
+│     ┌──────────┴──────────┐                                     │
+│     │                     │                                     │
+│     ▼                     ▼                                     │
+│ ┌─────────┐         ┌──────────┐                                │
+│ │  Batch  │         │ Stream   │                                │
+│ │   KEM   │         │   DEM    │                                │
+│ │  (GPU)  │         │ (chunks) │                                │
+│ └─────────┘         └──────────┘                                │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Module Structure
+---
+
+## Module Structure
 
 ```
 meteor_nc/
 ├── cryptography/
-│   ├── core.py          # LWE-KEM + Hybrid KEM + APN
-│   ├── batch.py         # GPU batch operations (CUDA)
-│   ├── stream.py        # StreamDEM (XChaCha20-Poly1305)
-│   ├── practical.py     # String/file encryption API
-│   ├── common.py        # HKDF, CBD, constants
+│   ├── core.py          # LWEKEM, HybridKEM, SymmetricMixer
+│   ├── common.py        # HKDF, CBD, constants (Q_DEFAULT, etc.)
+│   ├── batch.py         # BatchLWEKEM (GPU parallel)
+│   ├── stream.py        # StreamDEM (chunked AEAD)
+│   ├── practical.py     # High-level string/file API
 │   └── kernels/         # Custom CUDA kernels
-│       ├── cbd.cu       # Centered Binomial Distribution
-│       ├── matrix.cu    # Matrix operations
-│       └── blake3.cu    # BLAKE3 hashing
 ├── protocols/
 │   ├── basic.py         # MeteorNode, P2P messaging
-│   ├── advanced.py      # Network simulation, testing
-│   └── web4.py          # libp2p, DHT, PubSub, IPFS
+│   ├── advanced.py      # Network simulation
+│   └── web4.py          # libp2p, DHT, PubSub integration
 ├── auth/
 │   └── core.py          # Device-bound authentication
 └── tests/
-    ├── test_core.py     # KEM correctness tests
+    ├── test_core.py     # KEM correctness & security tests
     ├── test_batch.py    # Batch operation tests
     └── test_stream.py   # Stream DEM tests
 ```
@@ -111,30 +221,28 @@ meteor_nc/
 ### Requirements
 
 - Python 3.8+
-- NumPy
+- NumPy ≥ 1.20.0
+- SciPy ≥ 1.7.0
+- cryptography ≥ 3.4.0 (for AEAD)
 - CuPy (optional, for GPU acceleration)
-- cryptography (for XChaCha20-Poly1305)
 
 ### Basic Installation
 
 ```bash
-pip install numpy cryptography
+pip install .
 ```
 
-### GPU Support (Recommended)
+### With GPU Support
 
 ```bash
-pip install cupy-cuda12x  # For CUDA 12.x
-# or
-pip install cupy-cuda11x  # For CUDA 11.x
+pip install ".[gpu]"        # CUDA 12.x
+pip install ".[gpu-cuda11]" # CUDA 11.x
 ```
 
-### Development Installation
+### Development
 
 ```bash
-git clone <anonymous-repository-url>
-cd meteor-nc
-pip install -e .
+pip install -e ".[dev]"
 ```
 
 ---
@@ -146,7 +254,7 @@ pip install -e .
 ```python
 from meteor_nc.cryptography import LWEKEM
 
-# Key generation (NIST Level 1)
+# Key generation (Level-128: n=256)
 alice = LWEKEM(n=256)
 alice.key_gen()
 
@@ -162,18 +270,36 @@ K_dec = alice.decaps(ct)
 assert K == K_dec  # Shared secret established
 ```
 
+### Hybrid Encryption
+
+```python
+from meteor_nc.cryptography import HybridKEM
+
+# Setup
+kem = HybridKEM(n=256)
+kem.key_gen()
+
+# Encrypt with optional AAD
+plaintext = b"Quantum-resistant message"
+aad = b"authenticated metadata"
+ciphertext = kem.encrypt(plaintext, aad=aad)
+
+# Decrypt
+recovered = kem.decrypt(ciphertext, aad=aad)
+assert plaintext == recovered
+```
+
 ### Seed-Based Key Derivation
 
 ```python
 from meteor_nc.cryptography import create_kdf_meteor
 
-# Generate from master seed (32 bytes → full keys)
+# Generate from 32-byte master seed
 kdf = create_kdf_meteor(security_level=256)
 kdf.key_gen()
 
-# Export seed for storage (only 32 bytes!)
-seed = kdf.export_seed()
-print(f"Seed: {seed.hex()}")
+# Export seed for compact storage
+seed = kdf.export_seed()  # Only 32 bytes!
 
 # Restore from seed
 kdf_restored = create_kdf_meteor(security_level=256, seed=seed)
@@ -184,62 +310,30 @@ kdf_restored.key_gen()
 
 ```python
 from meteor_nc.cryptography.batch import BatchLWEKEM
-import cupy as cp
 
-# Initialize batch KEM
+# Initialize
 kem = BatchLWEKEM(n=256, device_id=0)
 kem.key_gen()
 
-# Batch encapsulation (100,000 keys in parallel)
+# Batch encapsulation (100,000 parallel)
 K_batch, ct_batch, _ = kem.encaps_batch(100000)
-cp.cuda.Stream.null.synchronize()
-
-print(f"Generated {len(K_batch)} shared secrets")
-```
-
-### P2P Protocol
-
-```python
-from meteor_nc.protocols import MeteorNode
-
-# Create nodes
-alice = MeteorNode("Alice", security_level=256)
-bob = MeteorNode("Bob", security_level=256)
-
-# Exchange MeteorIDs (32 bytes each)
-alice.add_peer("Bob", bob.get_meteor_id())
-bob.add_peer("Alice", alice.get_meteor_id())
-
-# Send encrypted message
-message = b"Hello, quantum-resistant world!"
-encrypted = alice.send("Bob", message)
-
-# Receive and decrypt
-decrypted = bob.receive(encrypted)
-assert message == decrypted
 ```
 
 ### Streaming Encryption
 
 ```python
 from meteor_nc.cryptography.stream import StreamDEM
-import secrets
 
-# Establish session keys (from KEM)
-session_key = secrets.token_bytes(32)
+# Establish session (from KEM shared secret)
+session_key = K  # From KEM
 stream_id = secrets.token_bytes(16)
 
-# Create stream encryptors
 enc = StreamDEM(session_key=session_key, stream_id=stream_id)
 dec = StreamDEM(session_key=session_key, stream_id=stream_id)
 
-# Encrypt chunks
-chunk1 = enc.encrypt_chunk(b"First chunk")
-chunk2 = enc.encrypt_chunk(b"Second chunk")
-
-# Decrypt chunks (order-sensitive)
-plain1 = dec.decrypt_chunk(chunk1)
-plain2 = dec.decrypt_chunk(chunk2)
+# Encrypt/decrypt chunks
+chunk = enc.encrypt_chunk(b"Video frame data")
+plaintext = dec.decrypt_chunk(chunk)
 ```
 
 ---
@@ -248,152 +342,90 @@ plain2 = dec.decrypt_chunk(chunk2)
 
 ### Batch KEM Throughput (RTX 4090)
 
-| Operation | n=256 | n=512 | n=1024 |
-|-----------|-------|-------|--------|
-| **Encapsulation** | 4.2M ops/sec | 1.1M ops/sec | 280K ops/sec |
-| **Key Generation** | 850K ops/sec | 220K ops/sec | 55K ops/sec |
+| Level | n | Encaps (ops/sec) | KeyGen (ops/sec) |
+|-------|-----|------------------|------------------|
+| 128 | 256 | 4.2M | 850K |
+| 192 | 512 | 1.1M | 220K |
+| 256 | 1024 | 280K | 55K |
 
-### Single Operation Latency
+### Single Operation Latency (n=256)
 
-| Operation | CPU (n=256) | GPU (n=256) |
-|-----------|-------------|-------------|
-| Key Generation | 12.5 ms | 0.8 ms |
-| Encapsulation | 8.2 ms | 0.3 ms |
-| Decapsulation | 15.1 ms | 0.5 ms |
-
-### Memory Usage
-
-| Security Level | Key Memory | Batch (100K) Memory |
-|----------------|------------|---------------------|
-| n=256 | ~520 KB | ~6.5 GB |
-| n=512 | ~2.1 MB | ~26 GB |
-| n=1024 | ~8.4 MB | ~104 GB |
+| Operation | CPU | GPU |
+|-----------|-----|-----|
+| KeyGen | 12.5 ms | 0.8 ms |
+| Encaps | 8.2 ms | 0.3 ms |
+| Decaps | 15.1 ms | 0.5 ms |
 
 ---
 
 ## Testing
 
-### Run All Tests
-
 ```bash
-# Core KEM tests
-python -m tests.test_core
+# All tests
+python -m pytest tests/ -v
 
-# Batch operation tests
-python -m tests.test_batch
-
-# Stream DEM tests
-python -m tests.test_stream
+# Individual suites
+python -m tests.test_core    # KEM correctness
+python -m tests.test_batch   # Batch operations
+python -m tests.test_stream  # Stream DEM
 ```
 
 ### Test Categories
 
-1. **Correctness Tests** (A1-A2)
-   - Key generation determinism
-   - Encapsulation/decapsulation roundtrip
-   - Multi-level security (n=256, 512, 1024)
-
-2. **Security Tests** (A3, B, E)
-   - IND-CPA verification
-   - IND-CCA2 (implicit rejection)
-   - AEAD integrity
-   - K_fail uniformity
-
-3. **Reproducibility Tests** (A4)
-   - Seed determinism
-   - Cross-platform consistency
-
-4. **Performance Tests** (A5, B6)
-   - Throughput benchmarks
-   - Latency measurements
-
-### Example Test Output
-
-```
-[A1.1] Determinism Test
-    Same seed → same keys: PASS ✓
-    Different seed → different keys: PASS ✓
-
-[A2.1] LWE-KEM Roundtrip
-    n=256: PASS ✓ (1000 iterations)
-    n=512: PASS ✓ (1000 iterations)
-    n=1024: PASS ✓ (1000 iterations)
-
-[B6] Batch Performance (n=256)
-    batch_size=1000: 3,847,291 ops/sec
-    batch_size=10000: 4,128,459 ops/sec
-    batch_size=100000: 4,215,832 ops/sec
-```
+| Category | Tests | Description |
+|----------|-------|-------------|
+| A1-A2 | Correctness | KeyGen determinism, Encaps/Decaps roundtrip |
+| A3, B | Security | IND-CPA, IND-CCA2 (implicit rejection), AEAD |
+| A4 | Reproducibility | Seed determinism, cross-platform |
+| A5, B6 | Performance | Throughput, latency benchmarks |
+| E | Extended | K_fail uniformity, negative tests |
 
 ---
 
 ## Security Considerations
 
-### Adaptive Precision Noise (APN)
+### IND-CCA2 via Fujisaki-Okamoto
 
-The system employs APN (Algorithm 5 in the paper) to achieve IND-CPA security:
+The implementation achieves IND-CCA2 security through:
 
-```
-σ_eff = max(σ_0, ||C|| · ε · κ / √n)
+1. **Deterministic re-encryption**: Hash-derived randomness ensures ct' reconstruction
+2. **Implicit rejection**: Invalid ciphertexts produce pseudorandom K_fail = H("fail" ‖ z ‖ ct)
+3. **Constant-time comparison**: CTEq prevents timing side-channels
 
-where:
-  σ_0    = Base noise (1e-10)
-  ||C||  = Ciphertext norm
-  ε      = Machine epsilon (2.22e-16 for FP64)
-  κ      = Safety factor (default: 10000)
-  n      = Dimension
-```
+### Domain Separation
 
-### Fujisaki-Okamoto Transform
-
-IND-CCA2 security is achieved via implicit rejection:
-
-```python
-# Decapsulation with implicit rejection
-K' = H(m', ct)  # Re-derive key
-if ct' != ct:   # Implicit check
-    return K_fail = PRF(sk, ct)  # Pseudorandom rejection
-else:
-    return K'
-```
+All hash operations use distinct domain labels:
+- `"pk_hash"`: Public key commitment
+- `"random"`: Encryption randomness derivation
+- `"shared"`: Valid shared secret
+- `"fail"`: Implicit rejection key
+- `"aead-key"`: KEM→DEM key derivation
 
 ### Side-Channel Resistance
 
 - Constant-time CBD sampling
 - Implicit rejection (no branching on secret data)
-- APN prevents precision-based attacks
+- Backend-independent re-encryption
 
 ---
 
 ## Limitations
 
-1. **GPU Memory**: Large batch sizes at high security levels (n=1024) require significant VRAM
-2. **CPU Performance**: Single-threaded CPU operations are slower than optimized libraries like liboqs
-3. **Ciphertext Size**: Larger than lattice-based schemes like Kyber/ML-KEM
-
----
-
-## Directory Structure
-
-```
-.
-├── README.md              # This file
-├── meteor_nc/             # Main library
-└── tests/                 # Test suite
-```
+1. **Ciphertext size**: Larger than ML-KEM/Kyber for equivalent security
+2. **GPU memory**: Large batches at n=1024 require significant VRAM
+3. **Single-threaded CPU**: Slower than optimized C implementations
 
 ---
 
 ## License
 
-This software is provided for academic review purposes. See LICENSE file for details.
+MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
 ## References
 
-- [NIST Post-Quantum Cryptography](https://csrc.nist.gov/projects/post-quantum-cryptography)
-- [LWE Problem](https://en.wikipedia.org/wiki/Learning_with_errors)
-- [Fujisaki-Okamoto Transform](https://eprint.iacr.org/2017/604)
-- [RFC 5869 - HKDF](https://tools.ietf.org/html/rfc5869)
-- [XChaCha20-Poly1305](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-xchacha)
+- Learning With Errors: Regev (2005), Peikert (2016)
+- Fujisaki-Okamoto Transform: [ePrint 2017/604](https://eprint.iacr.org/2017/604)
+- HKDF: [RFC 5869](https://tools.ietf.org/html/rfc5869)
+- AEAD: [RFC 5116](https://tools.ietf.org/html/rfc5116)
