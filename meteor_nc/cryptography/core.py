@@ -31,6 +31,7 @@ from .common import (
     LWESecretKey,
     LWECiphertext,
     FullCiphertext,
+    cbd_vector_from_seed,
 )
 
 if GPU_AVAILABLE:
@@ -304,36 +305,38 @@ class LWEKEM:
         bits = (xp.abs(v_centered) > threshold).astype(xp.int64)
         return self._bits_to_bytes(self._to_numpy(bits).astype(np.uint8))
     
-    def _encrypt_internal(self, m_encoded: Any, rbytes: bytes) -> Tuple[Any, Any]:
-        """Internal LWE encryption with explicit randomness."""
-        if self.pk is None:
-            raise ValueError("Public key not initialized")
+    def _encrypt_internal(self, m_bits: Any, rbytes: bytes) -> Tuple[Any, Any]:
+        """
+        Internal encryption with explicit randomness.
+        Uses deterministic CBD from seed for CPU/GPU compatibility.
+        """
+        xp = self.xp
         
-        A, b = self.pk.A, self.pk.b
+        # Deterministic CBD generation from seed (CPU/GPU compatible)
+        seed_r  = _sha256(b"r",  rbytes)
+        seed_e1 = _sha256(b"e1", rbytes)
+        seed_e2 = _sha256(b"e2", rbytes)
         
-        seed_r = int.from_bytes(_sha256(b"r", rbytes)[:8], "big")
-        seed_e1 = int.from_bytes(_sha256(b"e1", rbytes)[:8], "big")
-        seed_e2 = int.from_bytes(_sha256(b"e2", rbytes)[:8], "big")
+        # Generate CBD vectors deterministically (always NumPy first)
+        r_np  = cbd_vector_from_seed(seed_r,  self.n, eta=2)
+        e1_np = cbd_vector_from_seed(seed_e1, self.n, eta=2)
+        e2_np = cbd_vector_from_seed(seed_e2, MSG_BITS, eta=2)
         
+        # Convert to GPU if needed
         if self.gpu:
-            cp.random.seed(seed_r & 0xFFFFFFFF)
-            r = self._cbd.sample_vector(self.k)
-            cp.random.seed(seed_e1 & 0xFFFFFFFF)
-            e1 = self._cbd.sample_vector(self.n)
-            cp.random.seed(seed_e2 & 0xFFFFFFFF)
-            e2 = self._cbd.sample_vector(MSG_BITS)
+            r  = xp.asarray(r_np)
+            e1 = xp.asarray(e1_np)
+            e2 = xp.asarray(e2_np)
         else:
-            cbd_cpu = CenteredBinomial(self.eta, np)
-            rng_r = np.random.RandomState(seed_r & 0xFFFFFFFF)
-            rng_e1 = np.random.RandomState(seed_e1 & 0xFFFFFFFF)
-            rng_e2 = np.random.RandomState(seed_e2 & 0xFFFFFFFF)
-            r = cbd_cpu.sample_vector(self.k, rng=rng_r)
-            e1 = cbd_cpu.sample_vector(self.n, rng=rng_e1)
-            e2 = cbd_cpu.sample_vector(MSG_BITS, rng=rng_e2)
+            r  = r_np
+            e1 = e1_np
+            e2 = e2_np
         
-        u = self._mod_q(A.T @ r + e1)
-        b_dot_r = b @ r
-        v = self._mod_q(b_dot_r + e2 + m_encoded)
+        # u = A^T r + e1
+        u = (self.pk.A.T @ r + e1) % self.q
+        
+        # v = b^T r + e2 + delta * m
+        v = (self.pk.b @ r + e2 + self.delta * m_bits) % self.q
         
         return u, v
     
