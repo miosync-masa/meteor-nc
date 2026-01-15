@@ -6,6 +6,7 @@ WEB4.0 Protocol Ready!
 - Post-Quantum Key Encapsulation (LWE-KEM)
 - High-Speed Streaming Encryption (XChaCha20-Poly1305)
 - P2P Communication Protocol
+- Device-Bound Authentication
 """
 
 __version__ = "2.0.0"
@@ -78,6 +79,19 @@ try:
 except ImportError:
     ADVANCED_AVAILABLE = False
 
+# Authentication (Device-Bound)
+try:
+    from .auth.core import (
+        MeteorAuth,
+        MeteorAuthServer,
+        UserRecord,
+        verify_device_binding,
+        generate_recovery_codes,
+    )
+    AUTH_AVAILABLE = True
+except ImportError:
+    AUTH_AVAILABLE = False
+
 __all__ = [
     # Version
     "__version__",
@@ -115,6 +129,13 @@ __all__ = [
     "SessionManager",
     "run_comprehensive_tests",
     
+    # Authentication
+    "MeteorAuth",
+    "MeteorAuthServer",
+    "UserRecord",
+    "verify_device_binding",
+    "generate_recovery_codes",
+    
     # Constants
     "Q_DEFAULT",
     "MSG_BYTES",
@@ -129,4 +150,5 @@ __all__ = [
     "PRACTICAL_AVAILABLE",
     "PROTOCOL_AVAILABLE",
     "ADVANCED_AVAILABLE",
+    "AUTH_AVAILABLE",
 ]
