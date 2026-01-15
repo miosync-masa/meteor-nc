@@ -308,25 +308,17 @@ class LWEKEM:
         return self._bits_to_bytes(self._to_numpy(bits).astype(np.uint8))
     
     def _encrypt_internal(self, m_bits: Any, rbytes: bytes) -> Tuple[Any, Any]:
-        """
-        Internal encryption with deterministic randomness.
-        CPU/GPU compatible via seed-based generation.
-        """
         xp = self.xp
         
-        # Derive deterministic seeds
         seed_r  = _sha256(b"r",  rbytes)
         seed_e1 = _sha256(b"e1", rbytes)
         seed_e2 = _sha256(b"e2", rbytes)
         
-        # Generate r uniformly in [0, q) - deterministic
-        r_np = uniform_vector_from_seed(seed_r, self.n, self.q)
-        
-        # Generate e1, e2 in [-2, 2] - deterministic
+        # 全て小さいエラーベクトル [-2, 2]！
+        r_np  = small_error_from_seed(seed_r,  self.n)      # ← ここ修正！
         e1_np = small_error_from_seed(seed_e1, self.n)
         e2_np = small_error_from_seed(seed_e2, MSG_BITS)
         
-        # Convert to GPU if needed
         if self.gpu:
             r  = xp.asarray(r_np)
             e1 = xp.asarray(e1_np)
@@ -334,10 +326,7 @@ class LWEKEM:
         else:
             r, e1, e2 = r_np, e1_np, e2_np
         
-        # u = A^T r + e1
         u = (self.pk.A.T @ r + e1) % self.q
-        
-        # v = b^T r + e2 + delta * m
         v = (self.pk.b @ r + e2 + self.delta * m_bits) % self.q
         
         return u, v
