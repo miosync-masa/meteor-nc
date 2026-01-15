@@ -8,9 +8,24 @@ from .meteor_protocol import (
     MeteorProtocol,
 )
 
+from .advanced import (
+    MeteorNetwork,
+    LatencySimulator,
+    LatencyProfile,
+    SessionManager,
+    run_comprehensive_tests,
+)
+
 __all__ = [
+    # Basic Protocol
     "MeteorNode",
     "MeteorPeer", 
     "MeteorMessage",
     "MeteorProtocol",
+    # Advanced Testing
+    "MeteorNetwork",
+    "LatencySimulator",
+    "LatencyProfile",
+    "SessionManager",
+    "run_comprehensive_tests",
 ]
