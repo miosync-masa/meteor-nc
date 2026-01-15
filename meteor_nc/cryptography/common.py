@@ -77,21 +77,20 @@ def prg_sha256(seed: bytes, out_len: int, domain: bytes = b"prg") -> bytes:
     return bytes(out[:out_len])
 
 
-def cbd_vector_from_seed(seed: bytes, n: int, eta: int = 2) -> np.ndarray:
-    """
-    Deterministic centered binomial sample in [-eta, eta]^n from seed.
-    Uses 2*eta bits per coefficient.
-    
-    This ensures CPU/GPU produce identical results for FO re-encryption.
-    """
-    nbits = n * 2 * eta
-    nbytes = (nbits + 7) // 8
-    buf = prg_sha256(seed, nbytes, domain=b"cbd")
-    bits = np.unpackbits(np.frombuffer(buf, dtype=np.uint8))[:nbits].astype(np.int8)
-    bits = bits.reshape(n, 2 * eta)
-    a = bits[:, :eta].sum(axis=1)
-    b = bits[:, eta:].sum(axis=1)
-    return (a - b).astype(np.int64)
+def uniform_vector_from_seed(seed: bytes, n: int, q: int) -> np.ndarray:
+    """Deterministic uniform sampling in [0, q)^n from seed."""
+    nbytes = n * 8
+    buf = prg_sha256(seed, nbytes, domain=b"uniform")
+    arr = np.frombuffer(buf, dtype=np.uint64).copy()
+    return (arr % q).astype(np.int64)
+
+
+def small_error_from_seed(seed: bytes, n: int) -> np.ndarray:
+    """Deterministic error sampling in [-2, 2]^n from seed."""
+    nbytes = n
+    buf = prg_sha256(seed, nbytes, domain=b"error")
+    arr = np.frombuffer(buf, dtype=np.uint8).copy()
+    return ((arr % 5) - 2).astype(np.int64)
     
 # =============================================================================
 # HKDF (RFC 5869)
