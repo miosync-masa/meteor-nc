@@ -77,14 +77,6 @@ def prg_sha256(seed: bytes, out_len: int, domain: bytes = b"prg") -> bytes:
     return bytes(out[:out_len])
 
 
-def uniform_vector_from_seed(seed: bytes, n: int, q: int) -> np.ndarray:
-    """Deterministic uniform sampling in [0, q)^n from seed."""
-    nbytes = n * 8
-    buf = prg_sha256(seed, nbytes, domain=b"uniform")
-    arr = np.frombuffer(buf, dtype=np.uint64).copy()
-    return (arr % q).astype(np.int64)
-
-
 def small_error_from_seed(seed: bytes, n: int) -> np.ndarray:
     """Deterministic error sampling in [-2, 2]^n from seed."""
     nbytes = n
