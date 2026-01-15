@@ -140,9 +140,7 @@ def test_s1_2_chunk_sequence() -> Dict:
 
 
 def test_s1_3_seq_management() -> Dict:
-    """
-    S1.3: Sequence number management
-    """
+    """S1.3: Sequence number management"""
     print("\n[S1.3] Sequence Number Management")
     print("-" * 50)
     
@@ -159,15 +157,15 @@ def test_s1_3_seq_management() -> Dict:
     
     # Test 1: Auto-increment seq
     try:
-        enc = StreamDEM(session_key=session_key, stream_id=stream_id)
+        enc = StreamDEM(session_key=session_key, stream_id=stream_id, gpu=False)
         
         chunks = []
         for i in range(5):
             chunk = enc.encrypt_chunk(f"message {i}".encode())
             chunks.append(chunk)
         
-        # Verify seq incremented
-        seqs = [c.seq for c in chunks]
+        # Verify seq incremented - chunk.header.seq !!!
+        seqs = [c.header.seq for c in chunks]
         if seqs == list(range(5)):
             results['pass'] += 1
             results['tests'].append(("Auto-increment seq", f"PASS ({seqs})"))
@@ -180,17 +178,18 @@ def test_s1_3_seq_management() -> Dict:
     
     # Test 2: Custom start_seq (if supported)
     try:
-        enc2 = StreamDEM(session_key=session_key, stream_id=stream_id, start_seq=100)
+        enc2 = StreamDEM(session_key=session_key, stream_id=stream_id, gpu=False, start_seq=100)
         chunk = enc2.encrypt_chunk(b"test")
         
-        if chunk.seq == 100:
+        # chunk.header.seq !!!
+        if chunk.header.seq == 100:
             results['pass'] += 1
             results['tests'].append(("Custom start_seq", "PASS"))
         else:
             results['fail'] += 1
-            results['tests'].append(("Custom start_seq", f"FAIL (seq={chunk.seq})"))
+            results['tests'].append(("Custom start_seq", f"FAIL (seq={chunk.header.seq})"))
     except TypeError:
-        # start_seq not supported
+        # start_seq not supported in StreamDEM.__init__
         results['tests'].append(("Custom start_seq", "SKIPPED (not supported)"))
     except Exception as e:
         results['fail'] += 1
@@ -204,7 +203,6 @@ def test_s1_3_seq_management() -> Dict:
     print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
     
     return results
-
 
 # =============================================================================
 # S2. Robustness Tests (Streaming scenarios)
@@ -269,11 +267,8 @@ def test_s2_1_chunk_loss() -> Dict:
     
     return results
 
-
 def test_s2_2_reorder() -> Dict:
-    """
-    S2.2: Out-of-order chunks
-    """
+    """S2.2: Out-of-order chunks"""
     print("\n[S2.2] Out-of-Order Handling")
     print("-" * 50)
     
@@ -288,7 +283,7 @@ def test_s2_2_reorder() -> Dict:
     session_key = secrets.token_bytes(32)
     stream_id = secrets.token_bytes(16)
     
-    enc = StreamDEM(session_key=session_key, stream_id=stream_id)
+    enc = StreamDEM(session_key=session_key, stream_id=stream_id, gpu=False)
     
     # Encrypt 5 chunks
     chunks = []
@@ -302,20 +297,20 @@ def test_s2_2_reorder() -> Dict:
     reordered = [chunks[0], chunks[2], chunks[1], chunks[4], chunks[3]]
     
     # Decrypt in reordered sequence
-    dec = StreamDEM(session_key=session_key, stream_id=stream_id)
+    dec = StreamDEM(session_key=session_key, stream_id=stream_id, gpu=False)
     
     recovered = []
     for ct in reordered:
         try:
             pt = dec.decrypt_chunk(ct)
-            recovered.append((ct.seq, pt))
+            recovered.append((ct.header.seq, pt))  # ← header.seq
         except Exception as e:
-            recovered.append((ct.seq, f"ERROR: {e}"))
+            recovered.append((ct.header.seq, f"ERROR: {e}"))  # ← header.seq
     
     # All should decrypt (nonce is per-chunk)
     success = all(isinstance(r[1], bytes) for r in recovered)
     
-    # Verify content is correct (just reordered)
+    # Verify content is correct
     seq_to_pt = {r[0]: r[1] for r in recovered if isinstance(r[1], bytes)}
     content_correct = all(seq_to_pt.get(i) == plaintexts[i] for i in range(5))
     
@@ -329,7 +324,6 @@ def test_s2_2_reorder() -> Dict:
     print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
     
     return results
-
 
 def test_s2_3_replay() -> Dict:
     """
@@ -379,9 +373,7 @@ def test_s2_3_replay() -> Dict:
 # =============================================================================
 
 def test_s3_1_tamper_detection() -> Dict:
-    """
-    S3.1: Tamper detection (ciphertext, tag, header)
-    """
+    """S3.1: Tamper detection (ciphertext, tag, header)"""
     print("\n[S3.1] Tamper Detection")
     print("-" * 50)
     
@@ -389,15 +381,15 @@ def test_s3_1_tamper_detection() -> Dict:
         print("  SKIPPED: cryptography not available")
         return {'passed': True, 'skipped': True}
     
-    from meteor_nc.cryptography.stream import StreamDEM, EncryptedChunk
+    from meteor_nc.cryptography.stream import StreamDEM, EncryptedChunk, StreamHeader
     
     results = {'tests': [], 'pass': 0, 'fail': 0}
     
     session_key = secrets.token_bytes(32)
     stream_id = secrets.token_bytes(16)
     
-    enc = StreamDEM(session_key=session_key, stream_id=stream_id)
-    dec = StreamDEM(session_key=session_key, stream_id=stream_id)
+    enc = StreamDEM(session_key=session_key, stream_id=stream_id, gpu=False)
+    dec = StreamDEM(session_key=session_key, stream_id=stream_id, gpu=False)
     
     plaintext = b"sensitive data"
     chunk = enc.encrypt_chunk(plaintext)
@@ -407,11 +399,9 @@ def test_s3_1_tamper_detection() -> Dict:
         ct_bad = bytearray(chunk.ciphertext)
         ct_bad[0] ^= 1
         chunk_bad = EncryptedChunk(
+            header=chunk.header,
             ciphertext=bytes(ct_bad),
             tag=chunk.tag,
-            nonce=chunk.nonce,
-            seq=chunk.seq,
-            flags=chunk.flags
         )
         dec.decrypt_chunk(chunk_bad)
         results['fail'] += 1
@@ -425,11 +415,9 @@ def test_s3_1_tamper_detection() -> Dict:
         tag_bad = bytearray(chunk.tag)
         tag_bad[0] ^= 1
         chunk_bad = EncryptedChunk(
+            header=chunk.header,
             ciphertext=chunk.ciphertext,
             tag=bytes(tag_bad),
-            nonce=chunk.nonce,
-            seq=chunk.seq,
-            flags=chunk.flags
         )
         dec.decrypt_chunk(chunk_bad)
         results['fail'] += 1
@@ -438,39 +426,45 @@ def test_s3_1_tamper_detection() -> Dict:
         results['pass'] += 1
         results['tests'].append(("Tag tamper", "REJECTED ✓"))
     
-    # Test 3: Nonce tamper
+    # Test 3: Header seq tamper (affects AAD)
     try:
-        nonce_bad = bytearray(chunk.nonce)
-        nonce_bad[0] ^= 1
+        header_bad = StreamHeader(
+            stream_id=chunk.header.stream_id,
+            seq=chunk.header.seq + 1,  # Wrong seq
+            chunk_len=chunk.header.chunk_len,
+            flags=chunk.header.flags,
+        )
         chunk_bad = EncryptedChunk(
+            header=header_bad,
             ciphertext=chunk.ciphertext,
             tag=chunk.tag,
-            nonce=bytes(nonce_bad),
-            seq=chunk.seq,
-            flags=chunk.flags
         )
         dec.decrypt_chunk(chunk_bad)
         results['fail'] += 1
-        results['tests'].append(("Nonce tamper", "NOT REJECTED ✗"))
+        results['tests'].append(("Header seq tamper", "NOT REJECTED ✗"))
     except Exception:
         results['pass'] += 1
-        results['tests'].append(("Nonce tamper", "REJECTED ✓"))
+        results['tests'].append(("Header seq tamper", "REJECTED ✓"))
     
-    # Test 4: Seq tamper (if used in AAD)
+    # Test 4: Header chunk_len tamper
     try:
+        header_bad = StreamHeader(
+            stream_id=chunk.header.stream_id,
+            seq=chunk.header.seq,
+            chunk_len=chunk.header.chunk_len + 1,  # Wrong len
+            flags=chunk.header.flags,
+        )
         chunk_bad = EncryptedChunk(
+            header=header_bad,
             ciphertext=chunk.ciphertext,
             tag=chunk.tag,
-            nonce=chunk.nonce,
-            seq=chunk.seq + 1,  # Wrong seq
-            flags=chunk.flags
         )
         dec.decrypt_chunk(chunk_bad)
         results['fail'] += 1
-        results['tests'].append(("Seq tamper", "NOT REJECTED ✗"))
+        results['tests'].append(("Header len tamper", "NOT REJECTED ✗"))
     except Exception:
         results['pass'] += 1
-        results['tests'].append(("Seq tamper", "REJECTED ✓"))
+        results['tests'].append(("Header len tamper", "REJECTED ✓"))
     
     results['passed'] = results['fail'] == 0
     
@@ -480,7 +474,6 @@ def test_s3_1_tamper_detection() -> Dict:
     print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
     
     return results
-
 
 def test_s3_2_kem_integration() -> Dict:
     """
