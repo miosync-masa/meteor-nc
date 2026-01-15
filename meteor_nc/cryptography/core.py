@@ -32,7 +32,6 @@ from .common import (
     LWECiphertext,
     FullCiphertext,
     prg_sha256,
-    uniform_vector_from_seed,
     small_error_from_seed,
 )
 
