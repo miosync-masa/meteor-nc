@@ -12,6 +12,7 @@ from .common import (
     GPU_AVAILABLE,
     CRYPTO_AVAILABLE,
     _sha256,
+    prg_sha256,
     cbd_vector_from_seed,
 )
 
