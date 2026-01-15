@@ -2,13 +2,11 @@
 """
 Meteor-NC: Post-Quantum Hybrid Cryptosystem
 WEB4.0 Protocol Ready!
-
 - Post-Quantum Key Encapsulation (LWE-KEM)
 - High-Speed Streaming Encryption (XChaCha20-Poly1305)
 - P2P Communication Protocol
 - Device-Bound Authentication
 """
-
 __version__ = "2.0.0"
 
 # Core (CPU/GPU optional)
@@ -21,7 +19,6 @@ from .cryptography.common import (
     GPU_AVAILABLE,
     CRYPTO_AVAILABLE,
 )
-
 from .cryptography.core import (
     LWEKEM,
     HybridKEM,
@@ -34,6 +31,13 @@ try:
     BATCH_AVAILABLE = True
 except ImportError:
     BATCH_AVAILABLE = False
+
+# ↓ 追加: Batch Multi-Level (n=256/512/1024)
+try:
+    from .cryptography.kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
+    BATCH_MULTILEVEL_AVAILABLE = BATCH_V2_AVAILABLE and BLAKE3_V2_AVAILABLE
+except ImportError:
+    BATCH_MULTILEVEL_AVAILABLE = False
 
 # Stream DEM (XChaCha20-Poly1305)
 try:
@@ -146,6 +150,7 @@ __all__ = [
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
     "BATCH_AVAILABLE",
+    "BATCH_MULTILEVEL_AVAILABLE",  # ← 追加
     "STREAM_AVAILABLE",
     "PRACTICAL_AVAILABLE",
     "PROTOCOL_AVAILABLE",
