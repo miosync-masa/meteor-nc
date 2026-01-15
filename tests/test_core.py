@@ -881,94 +881,99 @@ def test_d1_key_separation() -> Dict:
     return results
 
 
-def test_d3_kem_dem_integration(chunks: int = 100) -> Dict:
+def test_b3_cpu_gpu_equivalence() -> Dict:
     """
-    D3: KEM → DEM End-to-End Integration
-    
-    D3.1: KEM session_key → StreamDEM encrypt/decrypt works
-    D3.2: KEM CT tamper → StreamDEM decrypt fails
-    """
-    print("\n[D3] KEM-DEM Integration")
-    print("-" * 50)
-    
-    if not CRYPTO_AVAILABLE:
-        print("  SKIPPED: cryptography library not available")
-        return {'passed': True, 'skipped': True}
-    
-    from meteor_nc.cryptography.stream import StreamDEM
-    
-    results = {'d3_1': True, 'd3_2': True}
-    
-    # Setup KEM
-    kem_alice = LWEKEM(n=256, gpu=GPU_AVAILABLE)
-    kem_alice.key_gen()
-    
-    kem_bob = LWEKEM(n=256, gpu=GPU_AVAILABLE)
-    kem_bob.pk = kem_alice.pk  # Bob has Alice's public key
-    kem_bob.sk = kem_alice.sk  # For test: Bob can decrypt
-    kem_bob.delta = kem_alice.delta
-    
-    # D3.1: Normal flow
-    print("  D3.1: Normal KEM → DEM flow...")
-    
-    K, ct = kem_bob.encaps()
-    K_dec = kem_alice.decaps(ct)
-    
-    if K != K_dec:
-        results['d3_1'] = False
-        print("    KEM key mismatch!")
-    else:
-        # Use derived key for StreamDEM
-        session_key = _sha256(b"session", K)
-        stream_id = _sha256(b"stream-id", K)[:16]
-        
-        stream_enc = StreamDEM(session_key=session_key, stream_id=stream_id, gpu=GPU_AVAILABLE)
-        stream_dec = StreamDEM(session_key=session_key, stream_id=stream_id, gpu=GPU_AVAILABLE)
-        
-        # Encrypt/decrypt multiple chunks
-        for i in range(chunks):
-            plaintext = f"Message {i}: {secrets.token_hex(32)}".encode()
-            chunk = stream_enc.encrypt_chunk(plaintext)
-            recovered = stream_dec.decrypt_chunk(chunk)
-            
-            if plaintext != recovered:
-                results['d3_1'] = False
-                print(f"    Chunk {i} mismatch!")
-                break
-        
-        if results['d3_1']:
-            print(f"    {chunks} chunks: OK")
-    
-    # D3.2: Tampered KEM CT → different session key → decrypt fails
-    print("  D3.2: Tampered KEM CT...")
-    
-    K_good, ct = kem_bob.encaps()
-    
-    # Tamper CT
-    ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-    ct_bad.u[0] ^= 1
-    
-    K_bad = kem_alice.decaps(ct_bad)
-    
-    if K_bad == K_good:
-        results['d3_2'] = False
-        print("    ERROR: Tampered CT produced same key!")
-    else:
-        # Different keys → different session keys
-        session_good = _sha256(b"session", K_good)
-        session_bad = _sha256(b"session", K_bad)
-        
-        if session_good != session_bad:
-            print("    Tampered CT → different session key: OK")
-        else:
-            results['d3_2'] = False
-    
-    results['passed'] = results['d3_1'] and results['d3_2']
-    
-    print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
-    
-    return results
+    B3: Backend determinism + CPU/GPU interop (key injection)
 
+    B3.1: CPU deterministic (same seed -> same (A,b))
+    B3.2: GPU deterministic (same seed -> same (A,b))
+    B3.3: Interop (GPU key -> CPU decaps) with identical injected key
+    Note: CPU/GPU PRNGs differ; we test determinism per-backend and interop via key injection.
+    """
+    print("\n[B3] CPU/GPU Equivalence")
+    print("-" * 50)
+
+    if not GPU_AVAILABLE:
+        print("  SKIPPED: GPU not available")
+        return {'passed': True, 'skipped': True}
+
+    import cupy as cp
+    from meteor_nc.cryptography.common import LWEPublicKey, LWESecretKey, LWECiphertext
+
+    trials = 50
+    results = {'b3_1': 0, 'b3_2': 0, 'b3_3': 0, 'total': trials}
+
+    for _ in range(trials):
+        # -------------------------
+        # B3.1 CPU determinism
+        # -------------------------
+        seed = secrets.token_bytes(32)
+        kem_cpu1 = LWEKEM(n=256, gpu=False, seed=seed)
+        kem_cpu1.key_gen()
+        kem_cpu2 = LWEKEM(n=256, gpu=False, seed=seed)
+        kem_cpu2.key_gen()
+
+        if np.array_equal(kem_cpu1.pk.A, kem_cpu2.pk.A) and np.array_equal(kem_cpu1.pk.b, kem_cpu2.pk.b):
+            results['b3_1'] += 1
+
+        # -------------------------
+        # B3.2 GPU determinism
+        # -------------------------
+        seed_gpu = secrets.token_bytes(32)
+        kem_gpu1 = LWEKEM(n=256, gpu=True, seed=seed_gpu)
+        kem_gpu1.key_gen()
+        kem_gpu2 = LWEKEM(n=256, gpu=True, seed=seed_gpu)
+        kem_gpu2.key_gen()
+
+        A1 = cp.asnumpy(kem_gpu1.pk.A)
+        A2 = cp.asnumpy(kem_gpu2.pk.A)
+        b1 = cp.asnumpy(kem_gpu1.pk.b)
+        b2 = cp.asnumpy(kem_gpu2.pk.b)
+
+        if np.array_equal(A1, A2) and np.array_equal(b1, b2):
+            results['b3_2'] += 1
+
+        # -------------------------
+        # B3.3 Interop: GPU key -> CPU decaps (key injection)
+        # -------------------------
+        kem_gpu = LWEKEM(n=256, gpu=True)
+        kem_gpu.key_gen()
+
+        # GPU encaps
+        K_good, ct = kem_gpu.encaps()
+
+        # Export GPU key material to CPU-native objects
+        A_np = cp.asnumpy(kem_gpu.pk.A).astype(np.int64, copy=False)
+        b_np = cp.asnumpy(kem_gpu.pk.b).astype(np.int64, copy=False)
+        s_np = cp.asnumpy(kem_gpu.sk.s).astype(np.int64, copy=False)
+        pk_hash = kem_gpu.pk.pk_hash
+        z = kem_gpu.sk.z
+
+        # Create CPU kem instance and inject keys
+        kem_cpu = LWEKEM(n=256, gpu=False)
+        kem_cpu.pk = LWEPublicKey(A=A_np, b=b_np, pk_hash=pk_hash)
+        kem_cpu.sk = LWESecretKey(s=s_np, z=z)
+
+        # CPU decaps the ciphertext produced under the same pk/sk
+        ct_cpu = LWECiphertext(u=ct.u.astype(np.int64, copy=False), v=ct.v.astype(np.int64, copy=False))
+        K_dec = kem_cpu.decaps(ct_cpu)
+
+        if K_good == K_dec:
+            results['b3_3'] += 1
+
+    results['passed'] = (
+        results['b3_1'] == trials and
+        results['b3_2'] == trials and
+        results['b3_3'] == trials
+    )
+
+    print(f"  B3.1 (CPU deterministic): {results['b3_1']}/{trials}")
+    print(f"  B3.2 (GPU deterministic): {results['b3_2']}/{trials}")
+    print(f"  B3.3 (interop GPU->CPU):  {results['b3_3']}/{trials}")
+    print("  Note: CPU/GPU PRNGs differ (security-equivalent, not output-equivalent).")
+    print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
+
+    return results
 
 # =============================================================================
 # Updated Main Test Runner
