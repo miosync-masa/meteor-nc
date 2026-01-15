@@ -246,9 +246,9 @@ def test_s2_1_chunk_loss() -> Dict:
     for ct in received:
         try:
             pt = dec.decrypt_chunk(ct)
-            recovered.append((ct.seq, pt))
+            recovered.append((ct.header.seq, pt))
         except Exception as e:
-            recovered.append((ct.seq, f"ERROR: {e}"))
+            recovered.append((ct.header.seq, f"ERROR: {e}"))
     
     # Verify: chunks 0,1,3,4 should decrypt correctly
     expected_seqs = [0, 1, 3, 4]
