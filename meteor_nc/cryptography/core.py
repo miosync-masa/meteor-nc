@@ -31,7 +31,9 @@ from .common import (
     LWESecretKey,
     LWECiphertext,
     FullCiphertext,
-    cbd_vector_from_seed,
+    prg_sha256,
+    uniform_vector_from_seed,
+    small_error_from_seed,
 )
 
 if GPU_AVAILABLE:
@@ -307,20 +309,22 @@ class LWEKEM:
     
     def _encrypt_internal(self, m_bits: Any, rbytes: bytes) -> Tuple[Any, Any]:
         """
-        Internal encryption with explicit randomness.
-        Uses deterministic CBD from seed for CPU/GPU compatibility.
+        Internal encryption with deterministic randomness.
+        CPU/GPU compatible via seed-based generation.
         """
         xp = self.xp
         
-        # Deterministic CBD generation from seed (CPU/GPU compatible)
+        # Derive deterministic seeds
         seed_r  = _sha256(b"r",  rbytes)
         seed_e1 = _sha256(b"e1", rbytes)
         seed_e2 = _sha256(b"e2", rbytes)
         
-        # Generate CBD vectors deterministically (always NumPy first)
-        r_np  = cbd_vector_from_seed(seed_r,  self.n, eta=2)
-        e1_np = cbd_vector_from_seed(seed_e1, self.n, eta=2)
-        e2_np = cbd_vector_from_seed(seed_e2, MSG_BITS, eta=2)
+        # Generate r uniformly in [0, q) - deterministic
+        r_np = uniform_vector_from_seed(seed_r, self.n, self.q)
+        
+        # Generate e1, e2 in [-2, 2] - deterministic
+        e1_np = small_error_from_seed(seed_e1, self.n)
+        e2_np = small_error_from_seed(seed_e2, MSG_BITS)
         
         # Convert to GPU if needed
         if self.gpu:
@@ -328,9 +332,7 @@ class LWEKEM:
             e1 = xp.asarray(e1_np)
             e2 = xp.asarray(e2_np)
         else:
-            r  = r_np
-            e1 = e1_np
-            e2 = e2_np
+            r, e1, e2 = r_np, e1_np, e2_np
         
         # u = A^T r + e1
         u = (self.pk.A.T @ r + e1) % self.q
