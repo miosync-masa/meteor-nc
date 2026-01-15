@@ -67,6 +67,32 @@ def _bytes_from_words_le(words: np.ndarray) -> bytes:
     return words.astype("<u4", copy=False).tobytes()
 
 
+def prg_sha256(seed: bytes, out_len: int, domain: bytes = b"prg") -> bytes:
+    """Deterministic PRG using SHA-256 in counter mode."""
+    out = bytearray()
+    ctr = 0
+    while len(out) < out_len:
+        out.extend(_sha256(domain, seed + struct.pack("<I", ctr)))
+        ctr += 1
+    return bytes(out[:out_len])
+
+
+def cbd_vector_from_seed(seed: bytes, n: int, eta: int = 2) -> np.ndarray:
+    """
+    Deterministic centered binomial sample in [-eta, eta]^n from seed.
+    Uses 2*eta bits per coefficient.
+    
+    This ensures CPU/GPU produce identical results for FO re-encryption.
+    """
+    nbits = n * 2 * eta
+    nbytes = (nbits + 7) // 8
+    buf = prg_sha256(seed, nbytes, domain=b"cbd")
+    bits = np.unpackbits(np.frombuffer(buf, dtype=np.uint8))[:nbits].astype(np.int8)
+    bits = bits.reshape(n, 2 * eta)
+    a = bits[:, :eta].sum(axis=1)
+    b = bits[:, eta:].sum(axis=1)
+    return (a - b).astype(np.int64)
+    
 # =============================================================================
 # HKDF (RFC 5869)
 # =============================================================================
