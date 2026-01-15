@@ -13,7 +13,8 @@ from .common import (
     CRYPTO_AVAILABLE,
     _sha256,
     prg_sha256,
-    cbd_vector_from_seed,
+    uniform_vector_from_seed,
+    small_error_from_seed,
 )
 
 from .core import (
@@ -66,7 +67,8 @@ __all__ = [
     "MSG_BITS",
     "SECURITY_PARAMS",
     "prg_sha256",
-    "cbd_vector_from_seed",
+    "uniform_vector_from_seed",
+    "small_error_from_seed",
     # Flags
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
