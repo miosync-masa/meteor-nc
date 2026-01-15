@@ -27,8 +27,8 @@ from meteor_nc.cryptography.common import (
 from meteor_nc.cryptography.core import (
     LWEKEM, HybridKEM, SymmetricMixer,
     LWECiphertext, FullCiphertext,
+    LWEPublicKey, LWESecretKey,
 )
-
 
 # =============================================================================
 # A1. Correctness Tests
@@ -888,7 +888,6 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
     B3.1: CPU deterministic (same seed -> same (A,b))
     B3.2: GPU deterministic (same seed -> same (A,b))
     B3.3: Interop (GPU key -> CPU decaps) with identical injected key
-    Note: CPU/GPU PRNGs differ; we test determinism per-backend and interop via key injection.
     """
     print("\n[B3] CPU/GPU Equivalence")
     print("-" * 50)
@@ -898,7 +897,7 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
         return {'passed': True, 'skipped': True}
 
     import cupy as cp
-    from meteor_nc.cryptography.common import LWEPublicKey, LWESecretKey, LWECiphertext
+    from meteor_nc.cryptography.core import LWEPublicKey, LWESecretKey, LWECiphertext
 
     trials = 50
     results = {'b3_1': 0, 'b3_2': 0, 'b3_3': 0, 'total': trials}
@@ -913,7 +912,8 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
         kem_cpu2 = LWEKEM(n=256, gpu=False, seed=seed)
         kem_cpu2.key_gen()
 
-        if np.array_equal(kem_cpu1.pk.A, kem_cpu2.pk.A) and np.array_equal(kem_cpu1.pk.b, kem_cpu2.pk.b):
+        if (np.array_equal(kem_cpu1.pk.A, kem_cpu2.pk.A) and 
+            np.array_equal(kem_cpu1.pk.b, kem_cpu2.pk.b)):
             results['b3_1'] += 1
 
         # -------------------------
@@ -934,7 +934,7 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
             results['b3_2'] += 1
 
         # -------------------------
-        # B3.3 Interop: GPU key -> CPU decaps (key injection)
+        # B3.3 Interop: GPU key -> CPU decaps
         # -------------------------
         kem_gpu = LWEKEM(n=256, gpu=True)
         kem_gpu.key_gen()
@@ -942,20 +942,26 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
         # GPU encaps
         K_good, ct = kem_gpu.encaps()
 
-        # Export GPU key material to CPU-native objects
-        A_np = cp.asnumpy(kem_gpu.pk.A).astype(np.int64, copy=False)
-        b_np = cp.asnumpy(kem_gpu.pk.b).astype(np.int64, copy=False)
-        s_np = cp.asnumpy(kem_gpu.sk.s).astype(np.int64, copy=False)
+        # Export GPU key material to NumPy
+        A_np = cp.asnumpy(kem_gpu.pk.A).astype(np.int64)
+        b_np = cp.asnumpy(kem_gpu.pk.b).astype(np.int64)
+        s_np = cp.asnumpy(kem_gpu.sk.s).astype(np.int64)
         pk_hash = kem_gpu.pk.pk_hash
         z = kem_gpu.sk.z
 
-        # Create CPU kem instance and inject keys
+        # Create CPU instance with injected keys
         kem_cpu = LWEKEM(n=256, gpu=False)
         kem_cpu.pk = LWEPublicKey(A=A_np, b=b_np, pk_hash=pk_hash)
         kem_cpu.sk = LWESecretKey(s=s_np, z=z)
+        kem_cpu.q = kem_gpu.q
+        kem_cpu.delta = kem_gpu.delta
 
-        # CPU decaps the ciphertext produced under the same pk/sk
-        ct_cpu = LWECiphertext(u=ct.u.astype(np.int64, copy=False), v=ct.v.astype(np.int64, copy=False))
+        # Convert CT from CuPy to NumPy ← これが重要！
+        u_np = cp.asnumpy(ct.u).astype(np.int64)
+        v_np = cp.asnumpy(ct.v).astype(np.int64)
+        ct_cpu = LWECiphertext(u=u_np, v=v_np)
+
+        # CPU decaps
         K_dec = kem_cpu.decaps(ct_cpu)
 
         if K_good == K_dec:
@@ -970,7 +976,7 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
     print(f"  B3.1 (CPU deterministic): {results['b3_1']}/{trials}")
     print(f"  B3.2 (GPU deterministic): {results['b3_2']}/{trials}")
     print(f"  B3.3 (interop GPU->CPU):  {results['b3_3']}/{trials}")
-    print("  Note: CPU/GPU PRNGs differ (security-equivalent, not output-equivalent).")
+    print("  Note: PRNG output-equivalence not required; interop ensured by key injection.")
     print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
 
     return results
