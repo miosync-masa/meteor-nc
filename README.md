@@ -2,7 +2,7 @@
   
 **A Post-Quantum KEM Stack with 32-Byte Identities for High-Throughput and P2P Systems**
 
-> This repository accompanies the TCHES submission "Meteor-NC: A Lattice-Based Cryptosystem with Non-Commutative Structure"
+> This repository accompanies the TCHES submission "Meteor-NC: A Lattice-Based Cryptosystem "
 
 ---
 
