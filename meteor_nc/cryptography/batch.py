@@ -42,6 +42,12 @@ from .kernels.batch_kernels import (
     pack_bits_gpu,
 )
 
+from .kernels.batch_kernels_v2 import (
+    unpack_to_encoded_v2,
+    pack_bits_v2,
+)
+from .kernels.blake3_kernel_v2 import GPUBlake3V2
+
 # =============================================================================
 # Constants
 # =============================================================================
@@ -50,6 +56,7 @@ Q_BATCH = 2**32  # uint32 overflow = mod 2^32
 N_FIXED = 256    # 128-bit security
 K_FIXED = 256
 ETA_DEFAULT = 2
+SUPPORTED_N = [256, 512, 1024]
 
 
 # =============================================================================
@@ -75,26 +82,31 @@ class BatchLWEKEM:
         eta: int = ETA_DEFAULT,
         device_id: int = 0,
     ):
-        if n != N_FIXED or k != K_FIXED:
-            raise ValueError(f"BatchKEM optimized for n=k={N_FIXED} only")
+        if n not in SUPPORTED_N:
+            raise ValueError(f"BatchKEM supports n={SUPPORTED_N}")
         
         cp.cuda.Device(device_id).use()
         
-        self.n = N_FIXED
-        self.k = K_FIXED
+        self.n = n
+        self.k = k if k is not None else n
         self.q = Q_BATCH
         self.eta = eta
         self.device_id = device_id
+            
+        self.msg_bits = n
+        self.msg_bytes = n // 8
         
         self.delta = 2**31  # q // 2 for encoding
-        
-        # GPU BLAKE3
-        self._blake3 = GPUBlake3(device_id=device_id)
-        
+     
+        if n == 256:
+            self._blake3 = GPUBlake3(device_id=device_id)
+        else:
+            self._blake3 = GPUBlake3V2(device_id=device_id)
+            
         # Keys (initialized by key_gen)
-        self.A: Optional[cp.ndarray] = None   # (k, n) uint32
-        self.b: Optional[cp.ndarray] = None   # (k,) uint32
-        self.s: Optional[cp.ndarray] = None   # (n,) int32
+        self.A: Optional[cp.ndarray] = None
+        self.b: Optional[cp.ndarray] = None
+        self.s: Optional[cp.ndarray] = None
         self.z: Optional[bytes] = None
         self.pk_hash: Optional[bytes] = None
     
@@ -126,57 +138,62 @@ class BatchLWEKEM:
         self.z = hkdf.expand(prk, b"z", 32)
     
     def encaps_batch(self, batch: int, return_ct: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Batch KEM encapsulation.
-        
-        Args:
-            batch: Number of encapsulations
-            return_ct: If False, skip GPU→CPU transfer of U,V (for benchmarking)
-        
-        Returns:
-            K: (batch, 32) shared secrets
-            U: (batch, n) uint32 ciphertext (or None if return_ct=False)
-            V: (batch, MSG_BITS) uint32 ciphertext (or None if return_ct=False)
-        """
         if self.A is None:
             raise ValueError("Keys not initialized")
         
         # 1. Random messages (CPU, cryptographically secure)
-        M_bytes = os.urandom(MSG_BYTES * batch)
-        M_np = np.frombuffer(M_bytes, dtype=np.uint8).reshape(batch, MSG_BYTES)
+        # 旧: M_bytes = os.urandom(MSG_BYTES * batch)
+        # ↓ 新
+        M_bytes = os.urandom(self.msg_bytes * batch)
+        M_np = np.frombuffer(M_bytes, dtype=np.uint8).reshape(batch, self.msg_bytes)
         M_gpu = cp.asarray(M_np)
         
         # 2. Derive FO seeds via GPU BLAKE3
-        seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_gpu, self.pk_hash)
+        # ↓ 修正: n に応じて呼び出し方を変える
+        if self.n == 256:
+            seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_gpu, self.pk_hash)
+        else:
+            seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_gpu, self.pk_hash, self.msg_bytes)
         
         # 3. CBD samples (int32) via custom kernel
-        R = cbd_i32(seeds_r, self.k, self.eta)       # (k, batch) int32
-        E1 = cbd_i32(seeds_e1, self.n, self.eta)     # (n, batch) int32
-        E2 = cbd_i32(seeds_e2, MSG_BITS, self.eta)   # (MSG_BITS, batch) int32
+        R = cbd_i32(seeds_r, self.k, self.eta)
+        E1 = cbd_i32(seeds_e1, self.n, self.eta)
+        # 旧: E2 = cbd_i32(seeds_e2, MSG_BITS, self.eta)
+        # ↓ 新
+        E2 = cbd_i32(seeds_e2, self.msg_bits, self.eta)
         
         # 4. Encode message: M_bits * delta
-        M_encoded = unpack_to_encoded(M_gpu, self.delta) 
+        # ↓ 修正: n に応じてカーネルを選択
+        if self.n == 256:
+            M_encoded = unpack_to_encoded(M_gpu, self.delta)
+        else:
+            M_encoded = unpack_to_encoded_v2(M_gpu, self.delta, self.msg_bits, self.msg_bytes)
         
         # 5. U = A.T @ R + E1 (mod 2^32) via custom kernel
-        U = matmul_AT_R(self.A, R, E1)  # (n, batch) uint32
+        U = matmul_AT_R(self.A, R, E1)
         
         # 6. B_dot_R = b @ R (mod 2^32) via custom kernel
-        B_dot_R = bdot_R(self.b, R)  # (batch,) uint32
+        B_dot_R = bdot_R(self.b, R)
         
         # 7. V = B_dot_R + E2 + M_encoded (mod 2^32)
-        E2_u32 = E2.astype(cp.uint32)  # (MSG_BITS, batch)
-        V = B_dot_R[None, :] + E2_u32 + M_encoded # auto wrap uint32
+        E2_u32 = E2.astype(cp.uint32)
+        V = B_dot_R[None, :] + E2_u32 + M_encoded
         
         # 8. Transpose for output
-        U_t = cp.ascontiguousarray(U.T)  # (batch, n) uint32
-        V_t = cp.ascontiguousarray(V.T)  # (batch, MSG_BITS) uint32
+        U_t = cp.ascontiguousarray(U.T)
+        V_t = cp.ascontiguousarray(V.T)
         
         # 9. ct_hash = BLAKE3(U||V) via GPU
-        ct_hash = self._blake3.hash_u32_concat_batch(U_t, V_t)  # (batch, 32) uint8
+        # ↓ 修正: n, msg_bits を渡す
+        ct_hash = self._blake3.hash_u32_concat_batch(U_t, V_t, self.n, self.msg_bits)
         
         # 10. Derive shared keys via GPU BLAKE3
         ok_mask = cp.ones(batch, dtype=cp.uint8)
-        K_gpu = self._blake3.derive_keys_batch(M_gpu, ct_hash, self.z, ok_mask)
+        # ↓ 修正: n に応じて呼び出し方を変える
+        if self.n == 256:
+            K_gpu = self._blake3.derive_keys_batch(M_gpu, ct_hash, self.z, ok_mask)
+        else:
+            K_gpu = self._blake3.derive_keys_batch(M_gpu, ct_hash, self.z, ok_mask, self.msg_bytes)
         
         # 11. Transfer to CPU
         K = cp.asnumpy(K_gpu)
@@ -194,46 +211,46 @@ class BatchLWEKEM:
         U: np.ndarray,
         V: np.ndarray,
     ) -> np.ndarray:
-        """
-        Batch KEM decapsulation with implicit rejection.
-        
-        Args:
-            U: (batch, n) uint32
-            V: (batch, MSG_BITS) uint32
-            
-        Returns:
-            K: (batch, 32) shared secrets
-        """
         if self.A is None or self.s is None:
             raise ValueError("Keys not initialized")
         
         batch = U.shape[0]
         
         # 1. Transfer to GPU
-        U_gpu = cp.asarray(U, dtype=cp.uint32)  # (batch, n)
-        V_gpu = cp.asarray(V, dtype=cp.uint32)  # (batch, MSG_BITS)
+        U_gpu = cp.asarray(U, dtype=cp.uint32)
+        V_gpu = cp.asarray(V, dtype=cp.uint32)
         
         # 2. S_dot_U = s @ U.T (mod 2^32) via custom kernel
-        S_dot_U = sdot_U(self.s, U_gpu)  # (batch,) uint32
+        S_dot_U = sdot_U(self.s, U_gpu)
         
         # 3. V_dec = V - S_dot_U (mod 2^32)
-        V_dec = V_gpu - S_dot_U[:, None]  # auto wrap uint32
+        V_dec = V_gpu - S_dot_U[:, None]
         
         # 4. Decode message bits
         V_signed = V_dec.view(cp.int32)
         threshold = np.int32(1 << 30)
         M_bits = ((V_signed > threshold) | (V_signed < -threshold)).astype(cp.uint8)
         
-        # 5. Pack bits to bytes (CPU side)
-        M_recovered = pack_bits_gpu(M_bits) 
+        # 5. Pack bits to bytes
+        # ↓ 修正: n に応じてカーネルを選択
+        if self.n == 256:
+            M_recovered = pack_bits_gpu(M_bits)
+        else:
+            M_recovered = pack_bits_v2(M_bits, self.msg_bits, self.msg_bytes)
         
         # 6. Re-derive FO seeds
-        seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_recovered, self.pk_hash)
+        # ↓ 修正: n に応じて呼び出し方を変える
+        if self.n == 256:
+            seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_recovered, self.pk_hash)
+        else:
+            seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_recovered, self.pk_hash, self.msg_bytes)
         
         # 7. Re-encrypt
         R2 = cbd_i32(seeds_r, self.k, self.eta)
         E1_2 = cbd_i32(seeds_e1, self.n, self.eta)
-        E2_2 = cbd_i32(seeds_e2, MSG_BITS, self.eta)
+        # 旧: E2_2 = cbd_i32(seeds_e2, MSG_BITS, self.eta)
+        # ↓ 新
+        E2_2 = cbd_i32(seeds_e2, self.msg_bits, self.eta)
         
         M_bits_u32 = M_bits.astype(cp.uint32)
         M_encoded = M_bits_u32 * np.uint32(self.delta)
@@ -250,14 +267,18 @@ class BatchLWEKEM:
         V_match = cp.all(V_gpu == V2_t, axis=1)
         ok_mask = (U_match & V_match).astype(cp.uint8)
         
-        # 9. ct_hash = BLAKE3(U||V) via GPU (from INPUT ciphertext)
-        ct_hash = self._blake3.hash_u32_concat_batch(U_gpu, V_gpu)
+        # 9. ct_hash = BLAKE3(U||V) via GPU
+        # ↓ 修正
+        ct_hash = self._blake3.hash_u32_concat_batch(U_gpu, V_gpu, self.n, self.msg_bits)
         
         # 10. Derive keys with implicit rejection
-        K_gpu = self._blake3.derive_keys_batch(M_recovered, ct_hash, self.z, ok_mask)
+        # ↓ 修正
+        if self.n == 256:
+            K_gpu = self._blake3.derive_keys_batch(M_recovered, ct_hash, self.z, ok_mask)
+        else:
+            K_gpu = self._blake3.derive_keys_batch(M_recovered, ct_hash, self.z, ok_mask, self.msg_bytes)
         
         return cp.asnumpy(K_gpu)
-
 
 # =============================================================================
 # Test Suite
