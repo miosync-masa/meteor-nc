@@ -1,3 +1,4 @@
+# meteor_nc/protocols/advanced.py
 """
 Meteor-Protocol: Advanced Testing & Validation Suite
 
@@ -7,26 +8,7 @@ Comprehensive testing framework for Meteor-Protocol including:
 - KDF seed persistence and reconnection validation
 - Λ (Lambda) stability analysis under network stress
 
-Usage:
-    from meteor_nc.protocols.advanced import (
-        MeteorNetwork,
-        LatencySimulator,
-        SessionManager
-    )
-    
-    # Large-scale mesh test
-    network = MeteorNetwork(num_nodes=20)
-    network.create_full_mesh()
-    network.run_broadcast_test()
-    
-    # Latency simulation
-    sim = LatencySimulator(base_latency_ms=50)
-    sim.add_node_pair(alice, bob)
-    sim.simulate_communication(1000)
-    
-    # Session persistence
-    manager = SessionManager()
-    manager.test_reconnection(node, num_cycles=10)
+Updated for meteor_protocol.py v2 API
 """
 
 from __future__ import annotations
@@ -34,11 +16,12 @@ from __future__ import annotations
 import numpy as np
 import time
 import random
+import secrets
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
-from collections import defaultdict
 
-from .basic import MeteorNode, MeteorProtocol, MeteorMessage
+from .meteor_protocol import MeteorNode, MeteorProtocol, MeteorMessage
+from ..cryptography.common import GPU_AVAILABLE
 
 
 # =============================================================================
@@ -55,11 +38,6 @@ class MeteorNetwork:
     - Broadcast testing
     - Λ stability measurement
     
-    Parameters:
-        num_nodes: Number of nodes in network
-        security_level: Crypto security level (128, 256, 512, 1024)
-        topology: 'full_mesh', 'ring', 'star', 'random'
-        
     Example:
         >>> network = MeteorNetwork(num_nodes=20)
         >>> network.create_full_mesh()
@@ -67,14 +45,15 @@ class MeteorNetwork:
         >>> print(f"Λ stability: {stats['lambda_stability']}")
     """
     
-    def __init__(self,
-                 num_nodes: int = 10,
-                 security_level: int = 256,
-                 topology: str = 'full_mesh'):
+    def __init__(
+        self,
+        num_nodes: int = 10,
+        gpu: bool = True,
+        topology: str = 'full_mesh',
+    ):
         """Initialize large-scale network."""
-        
         self.num_nodes = num_nodes
-        self.security_level = security_level
+        self.gpu = gpu and GPU_AVAILABLE
         self.topology = topology
         
         # Create nodes
@@ -86,7 +65,7 @@ class MeteorNetwork:
         
         for i in range(num_nodes):
             name = f"Node_{i:02d}"
-            node = MeteorNode(name=name, security_level=security_level)
+            node = MeteorNode(name=name, gpu=self.gpu)
             self.nodes[name] = node
             self.node_names.append(name)
         
@@ -98,13 +77,11 @@ class MeteorNetwork:
             'total_connections': 0,
             'total_messages': 0,
             'total_bytes': 0,
-            'lambda_measurements': []
         }
     
     def create_full_mesh(self):
         """
         Create full mesh topology.
-        
         Every node connects to every other node.
         Connections: n(n-1)/2
         """
@@ -114,15 +91,15 @@ class MeteorNetwork:
         connections = 0
         for i in range(self.num_nodes):
             for j in range(i + 1, self.num_nodes):
-                node1 = self.node_names[i]
-                node2 = self.node_names[j]
+                node1_name = self.node_names[i]
+                node2_name = self.node_names[j]
                 
-                # Exchange IDs
-                n1 = self.nodes[node1]
-                n2 = self.nodes[node2]
+                n1 = self.nodes[node1_name]
+                n2 = self.nodes[node2_name]
                 
-                n1.add_peer(node2, n2.get_meteor_id())
-                n2.add_peer(node1, n1.get_meteor_id())
+                # Exchange IDs and public keys
+                n1.add_peer(node2_name, n2.get_meteor_id(), n2.get_public_key())
+                n2.add_peer(node1_name, n1.get_meteor_id(), n1.get_public_key())
                 
                 connections += 1
         
@@ -131,21 +108,20 @@ class MeteorNetwork:
         
         print(f"[✓] Full mesh created: {connections} connections")
         print(f"    Time: {mesh_time:.2f}s")
-        print(f"    ID exchange: {connections * 64} bytes total")
     
     def create_ring_topology(self):
         """Create ring topology (each node connects to next)."""
         print(f"\n[MeteorNetwork] Creating ring topology...")
         
         for i in range(self.num_nodes):
-            node1 = self.node_names[i]
-            node2 = self.node_names[(i + 1) % self.num_nodes]
+            node1_name = self.node_names[i]
+            node2_name = self.node_names[(i + 1) % self.num_nodes]
             
-            n1 = self.nodes[node1]
-            n2 = self.nodes[node2]
+            n1 = self.nodes[node1_name]
+            n2 = self.nodes[node2_name]
             
-            n1.add_peer(node2, n2.get_meteor_id())
-            n2.add_peer(node1, n1.get_meteor_id())
+            n1.add_peer(node2_name, n2.get_meteor_id(), n2.get_public_key())
+            n2.add_peer(node1_name, n1.get_meteor_id(), n1.get_public_key())
         
         self.stats['total_connections'] = self.num_nodes
         print(f"[✓] Ring topology created: {self.num_nodes} connections")
@@ -160,14 +136,17 @@ class MeteorNetwork:
             if name != hub:
                 node = self.nodes[name]
                 
-                hub_node.add_peer(name, node.get_meteor_id())
-                node.add_peer(hub, hub_node.get_meteor_id())
+                hub_node.add_peer(name, node.get_meteor_id(), node.get_public_key())
+                node.add_peer(hub, hub_node.get_meteor_id(), hub_node.get_public_key())
         
         self.stats['total_connections'] = self.num_nodes - 1
         print(f"[✓] Star topology created: {self.num_nodes - 1} connections")
     
-    def run_broadcast_test(self, sender: str = "Node_00",
-                          message_size: int = 100) -> Dict:
+    def run_broadcast_test(
+        self,
+        sender: str = "Node_00",
+        message_size: int = 100,
+    ) -> Dict:
         """
         Run broadcast test from one node to all others.
         
@@ -176,15 +155,15 @@ class MeteorNetwork:
             message_size: Message size in bytes
             
         Returns:
-            dict: Test statistics including Λ stability
+            dict: Test statistics
         """
         print(f"\n[MeteorNetwork] Running broadcast test...")
         print(f"  Sender: {sender}")
-        print(f"  Recipients: {self.num_nodes - 1}")
+        print(f"  Recipients: {len(self.nodes[sender].peers)}")
         print(f"  Message size: {message_size} bytes")
         
         sender_node = self.nodes[sender]
-        message = b"X" * message_size
+        message = secrets.token_bytes(message_size)
         
         # Send to all peers
         start = time.time()
@@ -202,10 +181,12 @@ class MeteorNetwork:
         
         for peer_name, encrypted in messages_sent:
             peer_node = self.nodes[peer_name]
-            decrypted = peer_node.receive(encrypted)
-            
-            if decrypted == message:
-                messages_received += 1
+            try:
+                decrypted = peer_node.receive(encrypted)
+                if decrypted == message:
+                    messages_received += 1
+            except Exception as e:
+                print(f"    Error receiving at {peer_name}: {e}")
         
         receive_time = time.time() - start
         
@@ -215,7 +196,7 @@ class MeteorNetwork:
         
         results = {
             'sender': sender,
-            'recipients': self.num_nodes - 1,
+            'recipients': len(sender_node.peers),
             'messages_sent': len(messages_sent),
             'messages_received': messages_received,
             'success_rate': messages_received / len(messages_sent) if messages_sent else 0,
@@ -223,7 +204,7 @@ class MeteorNetwork:
             'receive_time_ms': receive_time * 1000,
             'total_time_ms': total_time * 1000,
             'throughput_msg_per_sec': throughput,
-            'message_size_bytes': message_size
+            'message_size_bytes': message_size,
         }
         
         print(f"\n[Broadcast Results]")
@@ -242,12 +223,6 @@ class MeteorNetwork:
         - Encryption/decryption consistency
         - Error rates
         - Performance stability
-        
-        Args:
-            num_iterations: Number of test iterations
-            
-        Returns:
-            dict: Λ stability metrics
         """
         print(f"\n[MeteorNetwork] Measuring Λ stability...")
         print(f"  Iterations: {num_iterations}")
@@ -269,7 +244,7 @@ class MeteorNetwork:
             
             # Random message
             message_size = random.randint(10, 200)
-            message = np.random.bytes(message_size)
+            message = secrets.token_bytes(message_size)
             
             # Send and measure
             start = time.time()
@@ -280,19 +255,15 @@ class MeteorNetwork:
             decrypted = recipient_node.receive(encrypted)
             dec_time = time.time() - start
             
-            # Measure error
-            error = np.linalg.norm(
-                np.frombuffer(message, dtype=np.uint8).astype(float) - 
-                np.frombuffer(decrypted, dtype=np.uint8).astype(float)
-            )
+            # Measure error (should be 0 for correct decryption)
+            error = 0 if message == decrypted else 1
             
             errors.append(error)
             encryption_times.append(enc_time)
             decryption_times.append(dec_time)
         
         # Analyze stability
-        error_mean = np.mean(errors)
-        error_std = np.std(errors)
+        error_rate = np.mean(errors)
         
         enc_time_mean = np.mean(encryption_times) * 1000
         enc_time_std = np.std(encryption_times) * 1000
@@ -301,23 +272,21 @@ class MeteorNetwork:
         dec_time_std = np.std(decryption_times) * 1000
         
         # Λ stability score (lower is better)
-        lambda_stability = error_std + (enc_time_std + dec_time_std) / 1000
+        lambda_stability = error_rate + (enc_time_std + dec_time_std) / 1000
         
         results = {
             'iterations': num_iterations,
-            'error_mean': error_mean,
-            'error_std': error_std,
+            'error_rate': error_rate,
             'encryption_time_mean_ms': enc_time_mean,
             'encryption_time_std_ms': enc_time_std,
             'decryption_time_mean_ms': dec_time_mean,
             'decryption_time_std_ms': dec_time_std,
             'lambda_stability_score': lambda_stability,
-            'is_stable': lambda_stability < 0.1
+            'is_stable': error_rate == 0 and lambda_stability < 0.1,
         }
         
         print(f"\n[Λ Stability Analysis]")
-        print(f"  Error mean: {error_mean:.2e}")
-        print(f"  Error std: {error_std:.2e}")
+        print(f"  Error rate: {error_rate*100:.1f}%")
         print(f"  Encryption time: {enc_time_mean:.2f} ± {enc_time_std:.2f} ms")
         print(f"  Decryption time: {dec_time_mean:.2f} ± {dec_time_std:.2f} ms")
         print(f"  Λ stability score: {lambda_stability:.4f}")
@@ -343,13 +312,8 @@ class MeteorNetwork:
             'total_connections': self.stats['total_connections'],
             'total_messages': total_messages,
             'total_bytes': total_bytes,
-            'avg_peers_per_node': sum(len(n.peers) for n in self.nodes.values()) / self.num_nodes
+            'avg_peers_per_node': sum(len(n.peers) for n in self.nodes.values()) / self.num_nodes,
         }
-    
-    def cleanup(self):
-        """Cleanup all nodes."""
-        for node in self.nodes.values():
-            node.cleanup()
 
 
 # =============================================================================
@@ -374,31 +338,26 @@ class LatencySimulator:
     - Packet loss simulation
     - Resynchronization testing
     
-    Parameters:
-        base_latency_ms: Base latency in milliseconds
-        jitter_ms: Latency variation (±)
-        packet_loss_rate: Packet loss probability (0-1)
-        
     Example:
         >>> sim = LatencySimulator(base_latency_ms=50, jitter_ms=20)
         >>> sim.add_node_pair(alice, bob)
         >>> results = sim.simulate_communication(num_messages=1000)
     """
     
-    def __init__(self,
-                 base_latency_ms: float = 50.0,
-                 jitter_ms: float = 20.0,
-                 packet_loss_rate: float = 0.01):
+    def __init__(
+        self,
+        base_latency_ms: float = 50.0,
+        jitter_ms: float = 20.0,
+        packet_loss_rate: float = 0.01,
+    ):
         """Initialize latency simulator."""
-        
         self.profile = LatencyProfile(
             base_latency_ms=base_latency_ms,
             jitter_ms=jitter_ms,
-            packet_loss_rate=packet_loss_rate
+            packet_loss_rate=packet_loss_rate,
         )
         
         self.node_pairs: List[Tuple[MeteorNode, MeteorNode]] = []
-        self.message_queue: List[Tuple[float, MeteorMessage, MeteorNode]] = []
         
         print(f"\n[LatencySimulator] Initialized")
         print(f"  Base latency: {base_latency_ms}ms")
@@ -409,9 +368,9 @@ class LatencySimulator:
         """Add node pair for simulation."""
         self.node_pairs.append((node1, node2))
         
-        # Connect nodes
-        node1.add_peer(node2.name, node2.get_meteor_id())
-        node2.add_peer(node1.name, node1.get_meteor_id())
+        # Connect nodes (exchange IDs and public keys)
+        node1.add_peer(node2.name, node2.get_meteor_id(), node2.get_public_key())
+        node2.add_peer(node1.name, node1.get_meteor_id(), node1.get_public_key())
     
     def _simulate_latency(self) -> float:
         """Generate latency sample."""
@@ -423,9 +382,11 @@ class LatencySimulator:
         """Determine if packet should be dropped."""
         return random.random() < self.profile.packet_loss_rate
     
-    def simulate_communication(self,
-                              num_messages: int = 100,
-                              message_size: int = 100) -> Dict:
+    def simulate_communication(
+        self,
+        num_messages: int = 100,
+        message_size: int = 100,
+    ) -> Dict:
         """
         Simulate communication with latency.
         
@@ -455,7 +416,7 @@ class LatencySimulator:
         
         for i in range(num_messages):
             # Create message
-            message = f"Message #{i}".encode('utf-8').ljust(message_size, b'\x00')
+            message = secrets.token_bytes(message_size)
             
             # Send
             try:
@@ -477,7 +438,7 @@ class LatencySimulator:
                 messages_received += 1
                 
                 # Measure error
-                error = sum(a != b for a, b in zip(message, decrypted))
+                error = 0 if message == decrypted else 1
                 errors.append(error)
                 
             except Exception as e:
@@ -490,7 +451,7 @@ class LatencySimulator:
         success_rate = messages_received / messages_sent if messages_sent > 0 else 0
         avg_latency = np.mean(latencies) if latencies else 0
         latency_std = np.std(latencies) if latencies else 0
-        avg_error = np.mean(errors) if errors else 0
+        error_rate = np.mean(errors) if errors else 0
         
         # Resynchronization score
         resync_score = 1.0 - (latency_std / (avg_latency + 1e-6))
@@ -503,10 +464,10 @@ class LatencySimulator:
             'success_rate': success_rate,
             'avg_latency_ms': avg_latency,
             'latency_std_ms': latency_std,
-            'avg_error': avg_error,
+            'error_rate': error_rate,
             'resynchronization_score': resync_score,
             'total_time_s': total_time,
-            'effective_throughput': messages_received / total_time if total_time > 0 else 0
+            'effective_throughput': messages_received / total_time if total_time > 0 else 0,
         }
         
         print(f"\n[Latency Simulation Results]")
@@ -534,8 +495,7 @@ class SessionManager:
     
     Example:
         >>> manager = SessionManager()
-        >>> results = manager.test_reconnection(node, num_cycles=10)
-        >>> print(f"ID consistency: {results['id_consistency']}")
+        >>> results = manager.test_reconnection(seed, num_cycles=10)
     """
     
     def __init__(self):
@@ -543,38 +503,44 @@ class SessionManager:
         print(f"\n[SessionManager] Initialized")
         self.sessions: Dict[str, Dict] = {}
     
-    def test_reconnection(self,
-                         original_node: MeteorNode,
-                         num_cycles: int = 10) -> Dict:
+    def test_reconnection(
+        self,
+        original_seed: bytes,
+        original_name: str = "TestNode",
+        num_cycles: int = 10,
+        gpu: bool = True,
+    ) -> Dict:
         """
         Test reconnection with KDF seed.
         
         Process:
-        1. Save seed from original node
-        2. Destroy node
-        3. Recreate from seed
-        4. Verify MeteorID matches
-        5. Test communication
+        1. Create node from seed
+        2. Record MeteorID
+        3. Destroy node
+        4. Recreate from same seed
+        5. Verify MeteorID matches
+        6. Test communication
         
         Args:
-            original_node: Node to test
+            original_seed: 32-byte seed
+            original_name: Node name
             num_cycles: Number of disconnect/reconnect cycles
+            gpu: Use GPU acceleration
             
         Returns:
             dict: Reconnection test results
         """
         print(f"\n[SessionManager] Testing reconnection...")
-        print(f"  Original node: {original_node.name}")
+        print(f"  Seed: {original_seed.hex()[:32]}...")
         print(f"  Cycles: {num_cycles}")
         
-        # Save original seed and ID
-        original_seed = original_node.crypto.export_seed()
-        original_id = original_node.get_meteor_id()
-        
+        # Create first node to get reference ID
+        ref_node = MeteorNode(name=original_name, seed=original_seed, gpu=gpu)
+        original_id = ref_node.get_meteor_id()
         print(f"  Original MeteorID: {original_id.hex()[:32]}...")
         
-        # Create peer for testing
-        peer = MeteorNode("TestPeer", security_level=original_node.security_level)
+        # Create persistent peer for testing
+        peer = MeteorNode("TestPeer", gpu=gpu)
         
         id_matches = []
         communication_successes = []
@@ -583,17 +549,14 @@ class SessionManager:
         for cycle in range(num_cycles):
             print(f"\n  Cycle {cycle + 1}/{num_cycles}:")
             
-            # Simulate disconnection
-            print(f"    [1] Simulating disconnection...")
-            
             # Reconnect using seed
-            print(f"    [2] Reconnecting from seed...")
+            print(f"    [1] Reconnecting from seed...")
             start = time.time()
             
             new_node = MeteorNode(
-                name=original_node.name,
-                security_level=original_node.security_level,
-                seed=original_seed
+                name=original_name,
+                seed=original_seed,
+                gpu=gpu,
             )
             
             reconnect_time = time.time() - start
@@ -604,15 +567,14 @@ class SessionManager:
             id_match = (new_id == original_id)
             id_matches.append(id_match)
             
-            print(f"    [3] ID verification: {'✓ MATCH' if id_match else '✗ MISMATCH'}")
-            print(f"        New MeteorID: {new_id.hex()[:32]}...")
+            print(f"    [2] ID verification: {'✓ MATCH' if id_match else '✗ MISMATCH'}")
             
             # Test communication
-            print(f"    [4] Testing communication...")
+            print(f"    [3] Testing communication...")
             
             # Setup connection
-            new_node.add_peer(peer.name, peer.get_meteor_id())
-            peer.add_peer(new_node.name, new_node.get_meteor_id())
+            new_node.add_peer(peer.name, peer.get_meteor_id(), peer.get_public_key())
+            peer.add_peer(new_node.name, new_node.get_meteor_id(), new_node.get_public_key())
             
             # Send message
             try:
@@ -629,9 +591,6 @@ class SessionManager:
                 print(f"        Communication: ✗ FAILED ({e})")
                 communication_successes.append(False)
             
-            # Cleanup
-            new_node.cleanup()
-            
             print(f"    Reconnect time: {reconnect_time*1000:.2f}ms")
         
         # Calculate results
@@ -647,7 +606,7 @@ class SessionManager:
             'communication_success_rate': comm_success_rate,
             'avg_reconnect_time_ms': avg_reconnect_time,
             'all_ids_matched': all(id_matches),
-            'all_communications_succeeded': all(communication_successes)
+            'all_communications_succeeded': all(communication_successes),
         }
         
         print(f"\n[Reconnection Test Results]")
@@ -656,9 +615,6 @@ class SessionManager:
         print(f"  Avg reconnect time: {avg_reconnect_time:.2f}ms")
         print(f"  Status: {'✅ PERFECT' if results['all_ids_matched'] and results['all_communications_succeeded'] else '⚠️ ISSUES DETECTED'}")
         
-        # Cleanup
-        peer.cleanup()
-        
         return results
 
 
@@ -666,14 +622,16 @@ class SessionManager:
 # Comprehensive Test Suite
 # =============================================================================
 
-def run_comprehensive_tests(num_nodes: int = 10, 
-                           security_level: int = 256) -> Dict:
+def run_comprehensive_tests(
+    num_nodes: int = 10,
+    gpu: bool = True,
+) -> Dict:
     """
     Run all advanced tests.
     
     Args:
         num_nodes: Number of nodes for network test
-        security_level: Crypto security level
+        gpu: Use GPU acceleration
         
     Returns:
         dict: All test results
@@ -681,6 +639,7 @@ def run_comprehensive_tests(num_nodes: int = 10,
     print("=" * 70)
     print("Meteor-Protocol: Advanced Validation Suite")
     print("=" * 70)
+    print(f"GPU Available: {GPU_AVAILABLE}")
     
     results = {}
     
@@ -689,7 +648,7 @@ def run_comprehensive_tests(num_nodes: int = 10,
     print(f"TEST 1: Large-Scale Mesh Network (n={num_nodes})")
     print("=" * 70)
     
-    network = MeteorNetwork(num_nodes=num_nodes, security_level=security_level)
+    network = MeteorNetwork(num_nodes=num_nodes, gpu=gpu)
     network.create_full_mesh()
     
     broadcast_results = network.run_broadcast_test(message_size=100)
@@ -699,49 +658,46 @@ def run_comprehensive_tests(num_nodes: int = 10,
     results['network'] = {
         'broadcast': broadcast_results,
         'lambda': lambda_results,
-        'stats': network_stats
+        'stats': network_stats,
     }
-    
-    network.cleanup()
     
     # Test 2: Variable latency simulation
     print("\n" + "=" * 70)
     print("TEST 2: Variable Latency Simulation")
     print("=" * 70)
     
-    alice = MeteorNode("Alice", security_level=security_level)
-    bob = MeteorNode("Bob", security_level=security_level)
+    alice = MeteorNode("Alice", gpu=gpu)
+    bob = MeteorNode("Bob", gpu=gpu)
     
     sim = LatencySimulator(
         base_latency_ms=50,
         jitter_ms=30,
-        packet_loss_rate=0.02
+        packet_loss_rate=0.02,
     )
     sim.add_node_pair(alice, bob)
     
     latency_results = sim.simulate_communication(
         num_messages=50,
-        message_size=100
+        message_size=100,
     )
     
     results['latency'] = latency_results
-    
-    alice.cleanup()
-    bob.cleanup()
     
     # Test 3: Session persistence
     print("\n" + "=" * 70)
     print("TEST 3: KDF Seed Reconnection")
     print("=" * 70)
     
-    test_node = MeteorNode("PersistenceTest", security_level=security_level)
+    test_seed = secrets.token_bytes(32)
     
     manager = SessionManager()
-    reconnect_results = manager.test_reconnection(test_node, num_cycles=5)
+    reconnect_results = manager.test_reconnection(
+        original_seed=test_seed,
+        num_cycles=5,
+        gpu=gpu,
+    )
     
     results['reconnection'] = reconnect_results
-    
-    test_node.cleanup()
     
     # Final summary
     print("\n" + "=" * 70)
@@ -767,6 +723,8 @@ def run_comprehensive_tests(num_nodes: int = 10,
         reconnect_results['all_ids_matched']
     )
     
+    results['all_passed'] = all_passed
+    
     print("\n" + "=" * 70)
     print(f"{'✅ ALL TESTS PASSED' if all_passed else '⚠️ SOME TESTS FAILED'}")
     print("=" * 70)
@@ -774,10 +732,13 @@ def run_comprehensive_tests(num_nodes: int = 10,
     return results
 
 
+# =============================================================================
 # Export
+# =============================================================================
+
 __all__ = [
     'MeteorNetwork',
-    'LatencySimulator', 
+    'LatencySimulator',
     'LatencyProfile',
     'SessionManager',
     'run_comprehensive_tests',
