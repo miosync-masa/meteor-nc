@@ -1,3 +1,4 @@
+# meteor_nc/auth/core.py
 """
 Meteor-Auth: Device-Bound Quantum-Resistant Authentication
 
@@ -7,60 +8,11 @@ device binding with post-quantum cryptography.
 Features:
     - Device-bound keys (2FA: Knowledge + Possession)
     - Passwordless authentication via QR code
-    - Quantum-resistant (Meteor-NC, 2^8128+ security)
+    - Quantum-resistant (Meteor-NC LWE-KEM)
     - Zero server trust (no password storage)
     - Full P2P integration
-    - APN (Adaptive Precision Noise) support
 
-Architecture:
-    ┌─────────────────────────────────────────────────────────────┐
-    │                     User Seed (32 bytes)                    │
-    │                 "What you know" (Knowledge)                 │
-    │                            │                                │
-    │                            ▼                                │
-    │              ┌─────────────────────────────┐                │
-    │              │   Device Fingerprint        │                │
-    │              │   "What you have"           │                │
-    │              │   (Possession)              │                │
-    │              └─────────────────────────────┘                │
-    │                            │                                │
-    │                            ▼                                │
-    │              ┌─────────────────────────────┐                │
-    │              │   Device-Bound Seed         │                │
-    │              │   HKDF(seed || fingerprint) │                │
-    │              └─────────────────────────────┘                │
-    │                            │                                │
-    │              ┌─────────────┴─────────────┐                  │
-    │              │                           │                  │
-    │              ▼                           ▼                  │
-    │     Meteor-NC Keys              MeteorID (Public)          │
-    │     (Private/Public)            (32 bytes)                  │
-    │              │                           │                  │
-    │              ▼                           ▼                  │
-    │     Encryption/Decryption       P2P Identity               │
-    │     Challenge-Response          DHT/libp2p                  │
-    └─────────────────────────────────────────────────────────────┘
-
-Security Model:
-    - User seed alone is USELESS (requires device)
-    - Device alone is USELESS (requires seed)
-    - Both factors required for authentication
-    - Server stores only MeteorID (32 bytes), no passwords
-
-Usage:
-    # Client
-    from meteor_nc.auth import MeteorAuth
-    
-    auth = MeteorAuth()
-    user_seed = auth.generate_seed()  # Save this!
-    node = auth.login(user_seed)
-    
-    # Server
-    from meteor_nc.auth import MeteorAuthServer
-    
-    server = MeteorAuthServer()
-    token = server.register(meteor_id)
-    is_valid = server.authenticate(token, response)
+Updated for Meteor-NC v2.0 API
 """
 
 from __future__ import annotations
@@ -73,8 +25,8 @@ import time
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 
-from ..cryptography import MeteorKDF, create_kdf_meteor
-from ..protocols import MeteorNode
+from ..cryptography.common import _sha256, GPU_AVAILABLE
+from ..protocols.meteor_protocol import MeteorNode, MeteorMessage
 
 
 # =============================================================================
@@ -92,37 +44,23 @@ class MeteorAuth:
     The combination creates a device-bound seed that generates
     quantum-resistant keys for authentication.
     
-    Parameters:
-        security_level: 128, 256, 512, 1024, or 2048 bits
-        apn_enabled: Enable Adaptive Precision Noise
-        apn_dynamic: Enable dynamic m calculation
-        gpu: Use GPU acceleration (requires CuPy)
-        
     Example:
-        >>> auth = MeteorAuth(security_level=256)
+        >>> auth = MeteorAuth()
         >>> user_seed = auth.generate_seed()  # Save as QR!
         >>> meteor_id = auth.get_meteor_id(user_seed)  # Public identity
         >>> node = auth.login(user_seed)  # Create P2P node
     """
     
-    def __init__(self,
-                 security_level: int = 256,
-                 apn_enabled: bool = True,
-                 apn_dynamic: bool = True,
-                 gpu: bool = True):
+    def __init__(self, gpu: bool = True, device_id: int = 0):
         """
         Initialize Meteor-Auth client.
         
         Args:
-            security_level: 128, 256, 512, 1024, or 2048 bits
-            apn_enabled: Enable Adaptive Precision Noise
-            apn_dynamic: Enable dynamic m calculation based on κ
-            gpu: Use GPU acceleration (requires CuPy)
+            gpu: Use GPU acceleration
+            device_id: GPU device ID
         """
-        self.security_level = security_level
-        self.apn_enabled = apn_enabled
-        self.apn_dynamic = apn_dynamic
-        self.gpu = gpu
+        self.gpu = gpu and GPU_AVAILABLE
+        self.device_id = device_id
     
     def get_device_fingerprint(self) -> bytes:
         """
@@ -135,11 +73,6 @@ class MeteorAuth:
         
         Returns:
             bytes: 32-byte device fingerprint
-            
-        Note:
-            The fingerprint is deterministic for a given device,
-            ensuring the same user_seed produces different keys
-            on different devices.
         """
         # MAC address (hardware bound)
         mac = uuid.getnode()
@@ -167,9 +100,6 @@ class MeteorAuth:
         - Store in password manager
         - Write on paper (secure location)
         
-        This seed is useless without the device, but should
-        still be kept secret to prevent targeted attacks.
-        
         Returns:
             bytes: 32-byte cryptographically secure random seed
         """
@@ -183,8 +113,6 @@ class MeteorAuth:
         - User seed (Knowledge: what you know)
         - Device fingerprint (Possession: what you have)
         
-        Using HKDF-style derivation with domain separation.
-        
         Args:
             user_seed: 32-byte user seed
             
@@ -197,13 +125,7 @@ class MeteorAuth:
         device_fp = self.get_device_fingerprint()
         
         # Domain separation for security
-        domain = b"METEOR_AUTH_DEVICE_BOUND_v1"
-        
-        # HKDF-style derivation: H(domain || seed || fingerprint)
-        combined = domain + user_seed + device_fp
-        device_bound = hashlib.sha256(combined).digest()
-        
-        return device_bound
+        return _sha256(b"METEOR_AUTH_DEVICE_BOUND_v2", user_seed + device_fp)
     
     def get_meteor_id(self, user_seed: bytes) -> bytes:
         """
@@ -211,32 +133,19 @@ class MeteorAuth:
         
         The MeteorID is derived from the device-bound seed,
         so the same user_seed produces different IDs on different devices.
-        This enables device-bound authentication.
         
         Args:
             user_seed: 32-byte user seed
             
         Returns:
             bytes: 32-byte MeteorID (safe to share publicly)
-            
-        Note:
-            - Same user_seed + different device = different MeteorID
-            - Server can distinguish devices automatically
-            - Safe to use as username/public identifier
         """
         device_seed = self.create_device_bound_seed(user_seed)
-        
-        # Domain separation for MeteorID derivation
-        meteor_id = hashlib.sha256(b"METEOR_ID_v1" + device_seed).digest()
-        
-        return meteor_id
+        return _sha256(b"meteor-id", device_seed)
     
     def login(self, user_seed: bytes, node_name: Optional[str] = None) -> MeteorNode:
         """
         Login and create P2P node with device-bound keys.
-        
-        This performs key expansion using the device-bound seed,
-        creating a fully functional P2P node for encrypted communication.
         
         Args:
             user_seed: 32-byte user seed
@@ -249,16 +158,12 @@ class MeteorAuth:
         auth_seed = self.create_device_bound_seed(user_seed)
         
         # Create node with device-bound keys
-        # create_kdf_meteor handles APN and dynamic m automatically!
         node = MeteorNode(
-            name=node_name or "Client",
-            security_level=self.security_level,
+            name=node_name or "AuthClient",
             seed=auth_seed,
-            gpu=self.gpu
+            gpu=self.gpu,
+            device_id=self.device_id,
         )
-        
-        # Override meteor_id to use our derived ID
-        node.meteor_id = self.get_meteor_id(user_seed)
         
         return node
     
@@ -298,6 +203,7 @@ class MeteorAuth:
 class UserRecord:
     """User record stored by server."""
     meteor_id: bytes
+    public_key: Any  # LWEPublicKey
     token: str
     metadata: Dict[str, Any] = field(default_factory=dict)
     registered_at: float = field(default_factory=time.time)
@@ -309,43 +215,39 @@ class MeteorAuthServer:
     Meteor-Auth Server: Zero-Trust Authentication Server
     
     Features:
-    - Zero password storage (only 32-byte MeteorIDs)
+    - Zero password storage (only MeteorIDs + public keys)
     - Challenge-response authentication
     - Full P2P integration
     - Quantum-resistant verification
     
-    Security Model:
-    - Server stores: MeteorID (32 bytes) + metadata
-    - Server NEVER stores: passwords, seeds, private keys
-    - Authentication: Challenge-response via P2P encryption
-    
-    Parameters:
-        node_name: Server node display name
-        security_level: Crypto security level
-        gpu: Use GPU acceleration (requires CuPy)
-        
     Example:
         >>> server = MeteorAuthServer("AuthServer")
-        >>> token = server.register(meteor_id, {"username": "alice"})
+        >>> token = server.register(meteor_id, public_key, {"username": "alice"})
         >>> challenge = server.create_challenge(token)
         >>> is_valid = server.authenticate(token, encrypted_response)
     """
     
-    def __init__(self,
-                 node_name: str = "AuthServer",
-                 security_level: int = 256,
-                 gpu: bool = True):
+    def __init__(
+        self,
+        node_name: str = "AuthServer",
+        gpu: bool = True,
+        device_id: int = 0,
+    ):
         """
         Initialize authentication server.
         
         Args:
             node_name: Server node name
-            security_level: Crypto security level
-            gpu: Use GPU acceleration (requires CuPy)
+            gpu: Use GPU acceleration
+            device_id: GPU device ID
         """
-        self.node = MeteorNode(name=node_name, security_level=security_level, gpu=gpu)
-        self.security_level = security_level
+        self.node = MeteorNode(
+            name=node_name,
+            gpu=gpu,
+            device_id=device_id,
+        )
         self.gpu = gpu
+        self.device_id = device_id
         
         # User database (token -> UserRecord)
         self.users: Dict[str, UserRecord] = {}
@@ -353,22 +255,30 @@ class MeteorAuthServer:
         # Active challenges (token -> challenge bytes)
         self.challenges: Dict[str, bytes] = {}
     
-    def register(self,
-                 meteor_id: bytes,
-                 metadata: Optional[Dict[str, Any]] = None) -> str:
+    def get_server_id(self) -> bytes:
+        """Get server's MeteorID."""
+        return self.node.get_meteor_id()
+    
+    def get_server_public_key(self):
+        """Get server's public key for client registration."""
+        return self.node.get_public_key()
+    
+    def register(
+        self,
+        meteor_id: bytes,
+        public_key: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """
-        Register user with MeteorID.
+        Register user with MeteorID and public key.
         
         Args:
             meteor_id: 32-byte MeteorID (public identifier)
+            public_key: User's LWEPublicKey
             metadata: Optional user metadata (username, email, etc.)
             
         Returns:
             str: User token (hex string)
-            
-        Note:
-            Server stores only MeteorID and metadata.
-            No passwords, no private keys, no secrets!
         """
         if len(meteor_id) != 32:
             raise ValueError("MeteorID must be 32 bytes")
@@ -381,16 +291,17 @@ class MeteorAuthServer:
         # Create user record
         record = UserRecord(
             meteor_id=meteor_id,
+            public_key=public_key,
             token=token,
-            metadata=metadata or {}
+            metadata=metadata or {},
         )
         self.users[token] = record
         
         # Add as peer for P2P communication
-        self.node.add_peer(token, meteor_id)
+        self.node.add_peer(token, meteor_id, public_key)
         
-        print(f"[{self.node.name}] Registered user: {token[:32]}...")
-        print(f"  MeteorID: {meteor_id.hex()[:32]}...")
+        print(f"[{self.node.name}] Registered user: {token[:16]}...")
+        print(f"  MeteorID: {meteor_id.hex()[:16]}...")
         
         return token
     
@@ -403,10 +314,6 @@ class MeteorAuthServer:
             
         Returns:
             bytes: 32-byte random challenge (plaintext)
-            
-        Note:
-            Client must encrypt this challenge with their key
-            and return it for verification.
         """
         if token not in self.users:
             raise ValueError(f"Unknown token: {token[:16]}...")
@@ -421,7 +328,7 @@ class MeteorAuthServer:
         
         return challenge
     
-    def authenticate(self, token: str, encrypted_response) -> bool:
+    def authenticate(self, token: str, encrypted_response: MeteorMessage) -> bool:
         """
         Authenticate user via challenge-response.
         
@@ -470,27 +377,11 @@ class MeteorAuthServer:
             return False
     
     def get_user(self, token: str) -> Optional[UserRecord]:
-        """
-        Get user record by token.
-        
-        Args:
-            token: User token
-            
-        Returns:
-            UserRecord or None
-        """
+        """Get user record by token."""
         return self.users.get(token)
     
     def get_user_by_meteor_id(self, meteor_id: bytes) -> Optional[UserRecord]:
-        """
-        Get user record by MeteorID.
-        
-        Args:
-            meteor_id: 32-byte MeteorID
-            
-        Returns:
-            UserRecord or None
-        """
+        """Get user record by MeteorID."""
         for record in self.users.values():
             if record.meteor_id == meteor_id:
                 return record
@@ -513,7 +404,8 @@ class MeteorAuthServer:
         del self.users[token]
         
         # Remove from peers
-        self.node.remove_peer(token)
+        if token in self.node.peers:
+            del self.node.peers[token]
         
         # Remove any pending challenges
         self.challenges.pop(token, None)
@@ -522,19 +414,14 @@ class MeteorAuthServer:
         return True
     
     def list_users(self) -> List[Dict[str, Any]]:
-        """
-        List all registered users.
-        
-        Returns:
-            list: User info dictionaries
-        """
+        """List all registered users."""
         return [
             {
                 'token': record.token[:16] + '...',
                 'meteor_id': record.meteor_id.hex()[:16] + '...',
                 'metadata': record.metadata,
                 'registered_at': record.registered_at,
-                'last_auth': record.last_auth
+                'last_auth': record.last_auth,
             }
             for record in self.users.values()
         ]
@@ -564,29 +451,174 @@ def generate_recovery_codes(user_seed: bytes, count: int = 8) -> List[str]:
     """
     Generate recovery codes for backup authentication.
     
-    These codes can be used as one-time authentication tokens
-    if the primary device is lost.
-    
     Args:
         user_seed: 32-byte user seed
         count: Number of recovery codes to generate
         
     Returns:
         list: Recovery code strings
-        
-    Warning:
-        Store these codes securely! Each can only be used once.
     """
     codes = []
     for i in range(count):
         # Derive code from seed + index
-        code_bytes = hashlib.sha256(
-            b"METEOR_RECOVERY_v1" + user_seed + i.to_bytes(4, 'big')
-        ).digest()[:8]
+        code_bytes = _sha256(
+            b"METEOR_RECOVERY_v2",
+            user_seed + i.to_bytes(4, 'big'),
+        )[:8]
         
-        # Format as readable code (e.g., "ABCD-EFGH")
+        # Format as readable code (e.g., "ABCD-EFGH-IJKL-MNOP")
         code_hex = code_bytes.hex().upper()
         code = f"{code_hex[:4]}-{code_hex[4:8]}-{code_hex[8:12]}-{code_hex[12:16]}"
         codes.append(code)
     
     return codes
+
+
+# =============================================================================
+# Test Suite
+# =============================================================================
+
+def run_tests() -> bool:
+    """Execute MeteorAuth tests."""
+    print("=" * 70)
+    print("Meteor-Auth Test Suite")
+    print("=" * 70)
+    
+    results = {}
+    
+    # Test 1: Seed generation
+    print("\n[Test 1] Seed Generation")
+    print("-" * 40)
+    
+    auth = MeteorAuth(gpu=GPU_AVAILABLE)
+    seed1 = auth.generate_seed()
+    seed2 = auth.generate_seed()
+    
+    seed_ok = len(seed1) == 32 and len(seed2) == 32 and seed1 != seed2
+    results["seed_generation"] = seed_ok
+    print(f"  Seed 1: {seed1.hex()[:32]}...")
+    print(f"  Seed 2: {seed2.hex()[:32]}...")
+    print(f"  Result: {'PASS' if seed_ok else 'FAIL'}")
+    
+    # Test 2: Device fingerprint
+    print("\n[Test 2] Device Fingerprint")
+    print("-" * 40)
+    
+    fp1 = auth.get_device_fingerprint()
+    fp2 = auth.get_device_fingerprint()
+    
+    fp_ok = len(fp1) == 32 and fp1 == fp2  # Same device = same fingerprint
+    results["device_fingerprint"] = fp_ok
+    print(f"  Fingerprint: {fp1.hex()[:32]}...")
+    print(f"  Deterministic: {fp1 == fp2}")
+    print(f"  Result: {'PASS' if fp_ok else 'FAIL'}")
+    
+    # Test 3: Device-bound seed
+    print("\n[Test 3] Device-Bound Seed")
+    print("-" * 40)
+    
+    user_seed = auth.generate_seed()
+    bound1 = auth.create_device_bound_seed(user_seed)
+    bound2 = auth.create_device_bound_seed(user_seed)
+    
+    bound_ok = len(bound1) == 32 and bound1 == bound2  # Same seed + device = same bound
+    results["device_bound_seed"] = bound_ok
+    print(f"  User seed: {user_seed.hex()[:32]}...")
+    print(f"  Bound seed: {bound1.hex()[:32]}...")
+    print(f"  Result: {'PASS' if bound_ok else 'FAIL'}")
+    
+    # Test 4: MeteorID derivation
+    print("\n[Test 4] MeteorID Derivation")
+    print("-" * 40)
+    
+    meteor_id1 = auth.get_meteor_id(user_seed)
+    meteor_id2 = auth.get_meteor_id(user_seed)
+    
+    id_ok = len(meteor_id1) == 32 and meteor_id1 == meteor_id2
+    results["meteor_id"] = id_ok
+    print(f"  MeteorID: {meteor_id1.hex()[:32]}...")
+    print(f"  Deterministic: {meteor_id1 == meteor_id2}")
+    print(f"  Result: {'PASS' if id_ok else 'FAIL'}")
+    
+    # Test 5: Login
+    print("\n[Test 5] Login")
+    print("-" * 40)
+    
+    node = auth.login(user_seed, "TestClient")
+    
+    login_ok = node is not None and node.get_meteor_id() is not None
+    results["login"] = login_ok
+    print(f"  Node name: {node.name}")
+    print(f"  Node ID: {node.get_meteor_id().hex()[:32]}...")
+    print(f"  Result: {'PASS' if login_ok else 'FAIL'}")
+    
+    # Test 6: QR export/import
+    print("\n[Test 6] QR Export/Import")
+    print("-" * 40)
+    
+    qr_data = auth.export_qr_data(user_seed)
+    imported = auth.import_qr_data(qr_data)
+    
+    qr_ok = imported == user_seed
+    results["qr_roundtrip"] = qr_ok
+    print(f"  QR data: {qr_data[:32]}...")
+    print(f"  Roundtrip: {qr_ok}")
+    print(f"  Result: {'PASS' if qr_ok else 'FAIL'}")
+    
+    # Test 7: Recovery codes
+    print("\n[Test 7] Recovery Codes")
+    print("-" * 40)
+    
+    codes = generate_recovery_codes(user_seed)
+    
+    codes_ok = len(codes) == 8 and all(len(c) == 19 for c in codes)  # "XXXX-XXXX-XXXX-XXXX"
+    results["recovery_codes"] = codes_ok
+    print(f"  Codes generated: {len(codes)}")
+    for i, code in enumerate(codes[:3]):
+        print(f"    {i+1}. {code}")
+    print(f"    ...")
+    print(f"  Result: {'PASS' if codes_ok else 'FAIL'}")
+    
+    # Test 8: Server registration & auth
+    print("\n[Test 8] Server Registration & Auth")
+    print("-" * 40)
+    
+    server = MeteorAuthServer("TestServer", gpu=GPU_AVAILABLE)
+    client_node = auth.login(user_seed, "Client")
+    
+    # Register
+    token = server.register(
+        client_node.get_meteor_id(),
+        client_node.get_public_key(),
+        {"username": "alice"},
+    )
+    
+    # Setup bidirectional connection
+    client_node.add_peer(
+        "server",
+        server.get_server_id(),
+        server.get_server_public_key(),
+    )
+    
+    # Challenge-response
+    challenge = server.create_challenge(token)
+    response = client_node.send("server", challenge)
+    auth_result = server.authenticate(token, response)
+    
+    server_ok = token is not None and auth_result
+    results["server_auth"] = server_ok
+    print(f"  Token: {token[:32]}...")
+    print(f"  Auth result: {auth_result}")
+    print(f"  Result: {'PASS' if server_ok else 'FAIL'}")
+    
+    # Summary
+    print("\n" + "=" * 70)
+    all_pass = all(results.values())
+    print(f"Result: {'ALL TESTS PASSED' if all_pass else 'SOME TESTS FAILED'}")
+    print("=" * 70)
+    
+    return all_pass
+
+
+if __name__ == "__main__":
+    run_tests()
