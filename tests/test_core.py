@@ -1403,6 +1403,227 @@ def run_all_tests() -> Dict:
         'all_pass': all_pass,
     }
 
+# =============================================================================
+# Multi-Security Level Test Runner
+# =============================================================================
 
+def run_tests_for_level(n: int, level_name: str) -> Dict:
+    """Run core tests for specific security level."""
+    print("\n" + "=" * 70)
+    print(f"SECURITY LEVEL: {level_name} (n={n})")
+    print("=" * 70)
+    
+    results = {}
+    
+    # A1.1: KEM Encaps/Decaps
+    print(f"\n[A1.1] KEM Encaps/Decaps (n={n})")
+    print("-" * 50)
+    kem_results = {'pass': 0, 'fail': 0}
+    
+    for i in range(100):
+        try:
+            kem = LWEKEM(n=n, gpu=GPU_AVAILABLE)
+            kem.key_gen()
+            K, ct = kem.encaps()
+            K2 = kem.decaps(ct)
+            if K == K2:
+                kem_results['pass'] += 1
+            else:
+                kem_results['fail'] += 1
+        except Exception as e:
+            kem_results['fail'] += 1
+    
+    kem_results['passed'] = kem_results['fail'] == 0
+    results['kem_correctness'] = kem_results
+    print(f"  Pass: {kem_results['pass']}, Fail: {kem_results['fail']}")
+    print(f"  Result: {'PASS ✓' if kem_results['passed'] else 'FAIL ✗'}")
+    
+    # A1.2: Implicit Rejection
+    print(f"\n[A1.2] Implicit Rejection (n={n})")
+    print("-" * 50)
+    reject_results = {'pass': 0, 'fail': 0}
+    
+    for i in range(100):
+        try:
+            kem = LWEKEM(n=n, gpu=GPU_AVAILABLE)
+            kem.key_gen()
+            K_good, ct = kem.encaps()
+            
+            ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
+            ct_bad.u[0] ^= 1
+            K_bad = kem.decaps(ct_bad)
+            
+            if K_bad != K_good:
+                reject_results['pass'] += 1
+            else:
+                reject_results['fail'] += 1
+        except Exception as e:
+            reject_results['fail'] += 1
+    
+    reject_results['passed'] = reject_results['fail'] == 0
+    results['implicit_rejection'] = reject_results
+    print(f"  Pass: {reject_results['pass']}, Fail: {reject_results['fail']}")
+    print(f"  Result: {'PASS ✓' if reject_results['passed'] else 'FAIL ✗'}")
+    
+    # A4.1: Seed Determinism
+    print(f"\n[A4.1] Seed Determinism (n={n})")
+    print("-" * 50)
+    seed_results = {'pass': 0, 'fail': 0}
+    
+    for i in range(50):
+        seed = secrets.token_bytes(32)
+        
+        kem1 = LWEKEM(n=n, gpu=GPU_AVAILABLE, seed=seed)
+        kem1.key_gen()
+        kem2 = LWEKEM(n=n, gpu=GPU_AVAILABLE, seed=seed)
+        kem2.key_gen()
+        
+        if GPU_AVAILABLE:
+            import cupy as cp
+            A1 = cp.asnumpy(kem1.pk.A)
+            A2 = cp.asnumpy(kem2.pk.A)
+        else:
+            A1, A2 = kem1.pk.A, kem2.pk.A
+        
+        if np.array_equal(A1, A2):
+            seed_results['pass'] += 1
+        else:
+            seed_results['fail'] += 1
+    
+    seed_results['passed'] = seed_results['fail'] == 0
+    results['seed_determinism'] = seed_results
+    print(f"  Pass: {seed_results['pass']}, Fail: {seed_results['fail']}")
+    print(f"  Result: {'PASS ✓' if seed_results['passed'] else 'FAIL ✗'}")
+    
+    # B1: Implicit Rejection Determinism
+    print(f"\n[B1] Implicit Rejection Determinism (n={n})")
+    print("-" * 50)
+    det_results = {'b1_1': 0, 'b1_2': 0, 'b1_3': 0, 'total': 50}
+    
+    kem = LWEKEM(n=n, gpu=GPU_AVAILABLE)
+    kem.key_gen()
+    
+    for _ in range(50):
+        K_good, ct = kem.encaps()
+        
+        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
+        ct_bad.u[0] ^= 1
+        
+        K_fail_1 = kem.decaps(ct_bad)
+        K_fail_2 = kem.decaps(ct_bad)
+        if K_fail_1 == K_fail_2:
+            det_results['b1_1'] += 1
+        
+        ct_bad2 = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
+        ct_bad2.u[1] ^= 1
+        K_fail_3 = kem.decaps(ct_bad2)
+        if K_fail_1 != K_fail_3:
+            det_results['b1_2'] += 1
+        
+        if K_fail_1 != K_good:
+            det_results['b1_3'] += 1
+    
+    det_results['passed'] = (
+        det_results['b1_1'] == 50 and
+        det_results['b1_2'] == 50 and
+        det_results['b1_3'] == 50
+    )
+    results['fo_determinism'] = det_results
+    print(f"  B1.1 (deterministic): {det_results['b1_1']}/50")
+    print(f"  B1.2 (CT-bound):      {det_results['b1_2']}/50")
+    print(f"  B1.3 (K_fail≠K_good): {det_results['b1_3']}/50")
+    print(f"  Result: {'PASS ✓' if det_results['passed'] else 'FAIL ✗'}")
+    
+    # Performance
+    print(f"\n[A5] Performance (n={n})")
+    print("-" * 50)
+    
+    kem = LWEKEM(n=n, gpu=GPU_AVAILABLE)
+    kem.key_gen()
+    
+    # Warmup
+    for _ in range(10):
+        K, ct = kem.encaps()
+        _ = kem.decaps(ct)
+    
+    iterations = 100
+    
+    start = time.perf_counter()
+    for _ in range(iterations):
+        K, ct = kem.encaps()
+    encaps_time = time.perf_counter() - start
+    
+    start = time.perf_counter()
+    for _ in range(iterations):
+        _ = kem.decaps(ct)
+    decaps_time = time.perf_counter() - start
+    
+    perf_results = {
+        'encaps_ops_sec': iterations / encaps_time,
+        'decaps_ops_sec': iterations / decaps_time,
+        'encaps_ms': (encaps_time / iterations) * 1000,
+        'decaps_ms': (decaps_time / iterations) * 1000,
+        'passed': True,
+    }
+    results['performance'] = perf_results
+    
+    print(f"  Encaps: {perf_results['encaps_ops_sec']:.0f} ops/sec ({perf_results['encaps_ms']:.2f} ms)")
+    print(f"  Decaps: {perf_results['decaps_ops_sec']:.0f} ops/sec ({perf_results['decaps_ms']:.2f} ms)")
+    
+    # Summary for this level
+    all_passed = all(r.get('passed', False) for r in results.values())
+    results['all_passed'] = all_passed
+    
+    return results
+
+
+def run_all_levels() -> Dict:
+    """Run tests for all security levels."""
+    print("=" * 70)
+    print("Meteor-NC Multi-Security Level Test Suite")
+    print("=" * 70)
+    print(f"GPU Available: {GPU_AVAILABLE}")
+    print(f"Crypto Available: {CRYPTO_AVAILABLE}")
+    
+    levels = [
+        (256, "128-bit (NIST Level 1)"),
+        (512, "192-bit (NIST Level 3)"),
+        (1024, "256-bit (NIST Level 5)"),
+    ]
+    
+    all_results = {}
+    
+    for n, level_name in levels:
+        all_results[f"n={n}"] = run_tests_for_level(n, level_name)
+    
+    # Final Summary
+    print("\n" + "=" * 70)
+    print("FINAL SUMMARY - ALL SECURITY LEVELS")
+    print("=" * 70)
+    
+    for level_key, results in all_results.items():
+        status = "✅ PASS" if results['all_passed'] else "❌ FAIL"
+        perf = results.get('performance', {})
+        print(f"  {level_key}: {status}")
+        if perf:
+            print(f"    Encaps: {perf.get('encaps_ms', 0):.2f} ms, Decaps: {perf.get('decaps_ms', 0):.2f} ms")
+    
+    all_levels_pass = all(r['all_passed'] for r in all_results.values())
+    
+    print(f"\n{'=' * 70}")
+    print(f"RESULT: {'✅ ALL LEVELS PASSED' if all_levels_pass else '❌ SOME LEVELS FAILED'}")
+    print(f"{'=' * 70}")
+    
+    return {
+        'results': all_results,
+        'all_levels_pass': all_levels_pass,
+    }
+
+# Update main block
 if __name__ == "__main__":
-    run_all_tests()
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--all-levels":
+        run_all_levels()
+    else:
+        run_all_tests()
