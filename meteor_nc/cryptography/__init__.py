@@ -2,7 +2,6 @@
 """
 Meteor-NC Cryptography Module
 """
-
 from .common import (
     HKDF,
     Q_DEFAULT,
@@ -15,7 +14,6 @@ from .common import (
     prg_sha256,
     small_error_from_seed,
 )
-
 from .core import (
     LWEKEM,
     HybridKEM,
@@ -28,6 +26,13 @@ try:
     BATCH_AVAILABLE = True
 except ImportError:
     BATCH_AVAILABLE = False
+
+# ↓ 追加: Batch v2 (multi-level support)
+try:
+    from .kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
+    BATCH_MULTILEVEL_AVAILABLE = BATCH_V2_AVAILABLE and BLAKE3_V2_AVAILABLE
+except ImportError:
+    BATCH_MULTILEVEL_AVAILABLE = False
 
 # Stream DEM
 try:
@@ -71,6 +76,7 @@ __all__ = [
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
     "BATCH_AVAILABLE",
+    "BATCH_MULTILEVEL_AVAILABLE",  # ← 追加
     "STREAM_AVAILABLE",
     "PRACTICAL_AVAILABLE",
 ]
