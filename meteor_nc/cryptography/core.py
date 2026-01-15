@@ -306,30 +306,32 @@ class LWEKEM:
         bits = (xp.abs(v_centered) > threshold).astype(xp.int64)
         return self._bits_to_bytes(self._to_numpy(bits).astype(np.uint8))
     
-    def _encrypt_internal(self, m_bits: Any, rbytes: bytes) -> Tuple[Any, Any]:
+   
+    def _encrypt_internal(self, m_encoded: Any, rbytes: bytes) -> Tuple[Any, Any]:
+        """Internal encryption with deterministic randomness."""
         xp = self.xp
-        
+    
         seed_r  = _sha256(b"r",  rbytes)
         seed_e1 = _sha256(b"e1", rbytes)
         seed_e2 = _sha256(b"e2", rbytes)
-        
-        # 全て小さいエラーベクトル [-2, 2]！
-        r_np  = small_error_from_seed(seed_r,  self.n)      # ← ここ修正！
+    
+        # r は長さ k、e1 は長さ n、e2 は MSG_BITS
+        r_np  = small_error_from_seed(seed_r,  self.k)      # ← self.k！
         e1_np = small_error_from_seed(seed_e1, self.n)
         e2_np = small_error_from_seed(seed_e2, MSG_BITS)
-        
+    
         if self.gpu:
             r  = xp.asarray(r_np)
             e1 = xp.asarray(e1_np)
             e2 = xp.asarray(e2_np)
         else:
             r, e1, e2 = r_np, e1_np, e2_np
-        
-        u = (self.pk.A.T @ r + e1) % self.q
-        v = (self.pk.b @ r + e2 + self.delta * m_bits) % self.q
-        
-        return u, v
     
+        u = (self.pk.A.T @ r + e1) % self.q
+        v = (self.pk.b @ r + e2 + m_encoded) % self.q   # ← delta なし！
+    
+        return u, v
+   
     def _decrypt_internal(self, u: Any, v: Any) -> Any:
         """Internal LWE decryption."""
         if self.sk is None:
