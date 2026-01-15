@@ -1086,8 +1086,6 @@ def test_e1_kfail_uniformity(iterations: int = 1000) -> Dict:
 def test_e2_negative_comprehensive() -> Dict:
     """
     E2: Comprehensive negative tests
-    
-    Various tampering patterns → all must fail (K_dec != K_good)
     """
     print("\n[E2] Comprehensive Negative Tests")
     print("-" * 50)
@@ -1099,28 +1097,49 @@ def test_e2_negative_comprehensive() -> Dict:
     
     K_good, ct = kem.encaps()
     
-    # Test cases: (description, tamper_function)
-    test_cases = [
-        ("u[0] 1-bit flip", lambda u, v: (u.copy().__setitem__(0, u[0] ^ 1) or u, v)),
-        ("u[128] 1-bit flip", lambda u, v: (np.concatenate([u[:128], [u[128] ^ 1], u[129:]]), v)),
-        ("u[-1] 1-bit flip", lambda u, v: (np.concatenate([u[:-1], [u[-1] ^ 1]]), v)),
-        ("v[0] 1-bit flip", lambda u, v: (u, np.concatenate([[v[0] ^ 1], v[1:]]))),
-        ("v[-1] 1-bit flip", lambda u, v: (u, np.concatenate([v[:-1], [v[-1] ^ 1]]))),
-        ("u[0] = 0", lambda u, v: (np.concatenate([[0], u[1:]]), v)),
-        ("u all +1", lambda u, v: ((u + 1) % Q_DEFAULT, v)),
-        ("v all +1", lambda u, v: (u, (v + 1) % Q_DEFAULT)),
-        ("u,v both flip[0]", lambda u, v: (np.concatenate([[u[0] ^ 1], u[1:]]), np.concatenate([[v[0] ^ 1], v[1:]]))),
-        ("u random replace", lambda u, v: (np.random.randint(0, Q_DEFAULT, size=u.shape, dtype=np.int64), v)),
-    ]
+    # Convert to numpy for manipulation
+    u_orig = np.array(ct.u.get() if GPU_AVAILABLE else ct.u, dtype=np.int64)
+    v_orig = np.array(ct.v.get() if GPU_AVAILABLE else ct.v, dtype=np.int64)
     
-    for desc, tamper_fn in test_cases:
+    # Test cases: (description, u_modifier, v_modifier)
+    test_cases = []
+    
+    # u modifications
+    for pos in [0, 128, -1]:
+        u_mod = u_orig.copy()
+        u_mod[pos] ^= 1
+        test_cases.append((f"u[{pos}] 1-bit flip", u_mod, v_orig.copy()))
+    
+    # v modifications
+    for pos in [0, -1]:
+        v_mod = v_orig.copy()
+        v_mod[pos] ^= 1
+        test_cases.append((f"v[{pos}] 1-bit flip", u_orig.copy(), v_mod))
+    
+    # u[0] = 0
+    u_zero = u_orig.copy()
+    u_zero[0] = 0
+    test_cases.append(("u[0] = 0", u_zero, v_orig.copy()))
+    
+    # u all +1
+    test_cases.append(("u all +1", (u_orig + 1) % Q_DEFAULT, v_orig.copy()))
+    
+    # v all +1
+    test_cases.append(("v all +1", u_orig.copy(), (v_orig + 1) % Q_DEFAULT))
+    
+    # Both flip
+    u_both = u_orig.copy()
+    v_both = v_orig.copy()
+    u_both[0] ^= 1
+    v_both[0] ^= 1
+    test_cases.append(("u,v both flip[0]", u_both, v_both))
+    
+    # u random
+    test_cases.append(("u random replace", np.random.randint(0, Q_DEFAULT, size=u_orig.shape, dtype=np.int64), v_orig.copy()))
+    
+    for desc, u_bad, v_bad in test_cases:
         try:
-            u_orig = ct.u.copy() if hasattr(ct.u, 'copy') else np.array(ct.u)
-            v_orig = ct.v.copy() if hasattr(ct.v, 'copy') else np.array(ct.v)
-            
-            u_bad, v_bad = tamper_fn(u_orig, v_orig)
-            ct_bad = LWECiphertext(u=np.array(u_bad, dtype=np.int64), v=np.array(v_bad, dtype=np.int64))
-            
+            ct_bad = LWECiphertext(u=u_bad, v=v_bad)
             K_bad = kem.decaps(ct_bad)
             
             if K_bad != K_good:
@@ -1130,7 +1149,7 @@ def test_e2_negative_comprehensive() -> Dict:
                 results['fail'] += 1
                 results['tests'].append((desc, "NOT REJECTED ✗"))
         except Exception as e:
-            results['pass'] += 1  # Exception is also rejection
+            results['pass'] += 1
             results['tests'].append((desc, f"EXCEPTION ✓ ({type(e).__name__})"))
     
     results['passed'] = results['fail'] == 0
@@ -1146,9 +1165,6 @@ def test_e2_negative_comprehensive() -> Dict:
 def test_e3_serialization_roundtrip() -> Dict:
     """
     E3: Serialization compatibility
-    
-    FullCiphertext.to_bytes() → from_bytes() → decrypt works
-    Cross-platform: GPU encrypt → serialize → CPU decrypt
     """
     print("\n[E3] Serialization Round-trip")
     print("-" * 50)
@@ -1164,6 +1180,7 @@ def test_e3_serialization_roundtrip() -> Dict:
     try:
         hybrid = HybridKEM(security_level=128, gpu=GPU_AVAILABLE)
         hybrid.key_gen()
+        n = hybrid.kem.n  # Get n for deserialization
         
         plaintext = b"Test message for serialization"
         ct = hybrid.encrypt(plaintext)
@@ -1171,8 +1188,8 @@ def test_e3_serialization_roundtrip() -> Dict:
         # Serialize
         ct_bytes = ct.to_bytes()
         
-        # Deserialize
-        ct_restored = FullCiphertext.from_bytes(ct_bytes)
+        # Deserialize with n
+        ct_restored = FullCiphertext.from_bytes(ct_bytes, n=n)
         
         # Decrypt
         recovered = hybrid.decrypt(ct_restored)
@@ -1190,43 +1207,43 @@ def test_e3_serialization_roundtrip() -> Dict:
     # Test 2: Multiple sizes
     print("  E3.2: Multiple sizes...")
     test_sizes = [0, 1, 16, 100, 1000, 10000]
+    size_pass = True
     for size in test_sizes:
         try:
             plaintext = secrets.token_bytes(size) if size > 0 else b""
             ct = hybrid.encrypt(plaintext)
             ct_bytes = ct.to_bytes()
-            ct_restored = FullCiphertext.from_bytes(ct_bytes)
+            ct_restored = FullCiphertext.from_bytes(ct_bytes, n=n)
             recovered = hybrid.decrypt(ct_restored)
             
-            if plaintext == recovered:
-                results['pass'] += 1
-            else:
-                results['fail'] += 1
+            if plaintext != recovered:
+                size_pass = False
                 results['tests'].append((f"Size {size}", "FAIL"))
         except Exception as e:
-            results['fail'] += 1
+            size_pass = False
             results['tests'].append((f"Size {size}", f"ERROR: {e}"))
     
-    if results['fail'] == 0:
+    if size_pass:
+        results['pass'] += 1
         results['tests'].append((f"All sizes ({test_sizes})", "PASS"))
+    else:
+        results['fail'] += 1
     
-    # Test 3: Cross-platform (GPU → CPU) via serialization
+    # Test 3: Cross-platform (GPU → CPU)
     print("  E3.3: Cross-platform (GPU → CPU)...")
     if GPU_AVAILABLE:
         try:
             import cupy as cp
             
-            # GPU encrypt
             hybrid_gpu = HybridKEM(security_level=128, gpu=True)
             hybrid_gpu.key_gen()
+            n_gpu = hybrid_gpu.kem.n
             
             plaintext = b"Cross-platform test"
             ct_gpu = hybrid_gpu.encrypt(plaintext)
-            
-            # Serialize (converts to numpy/bytes)
             ct_bytes = ct_gpu.to_bytes()
             
-            # Create CPU instance with same keys
+            # CPU instance with same keys
             hybrid_cpu = HybridKEM(security_level=128, gpu=False)
             hybrid_cpu.kem.pk = LWEPublicKey(
                 A=cp.asnumpy(hybrid_gpu.kem.pk.A),
@@ -1239,10 +1256,9 @@ def test_e3_serialization_roundtrip() -> Dict:
             )
             hybrid_cpu.kem.q = hybrid_gpu.kem.q
             hybrid_cpu.kem.delta = hybrid_gpu.kem.delta
-            hybrid_cpu.mixer = hybrid_gpu.mixer  # Mixer is CPU-based
+            hybrid_cpu.mixer = hybrid_gpu.mixer
             
-            # Deserialize and decrypt on CPU
-            ct_cpu = FullCiphertext.from_bytes(ct_bytes)
+            ct_cpu = FullCiphertext.from_bytes(ct_bytes, n=n_gpu)
             recovered = hybrid_cpu.decrypt(ct_cpu)
             
             if plaintext == recovered:
@@ -1255,7 +1271,7 @@ def test_e3_serialization_roundtrip() -> Dict:
             results['fail'] += 1
             results['tests'].append(("GPU→CPU cross-platform", f"ERROR: {e}"))
     else:
-        results['tests'].append(("GPU→CPU cross-platform", "SKIPPED (no GPU)"))
+        results['tests'].append(("GPU→CPU cross-platform", "SKIPPED"))
     
     results['passed'] = results['fail'] == 0
     
