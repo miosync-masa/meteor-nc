@@ -68,6 +68,7 @@ from .common import (
     _bytes_from_words_le,
     prg_sha256,
     small_error_from_seed,
+    _derive_key,
     # HKDF
     HKDF,
     # Data structures
@@ -259,11 +260,31 @@ class LWEKEM:
         eta: int = 2,
         gpu: bool = True,
         device_id: int = 0,
+        seed: Optional[bytes] = None,
     ):
+        """
+        Initialize LWE-KEM.
+        
+        Args:
+            n: Dimension (256, 512, or 1024)
+            k: Number of samples (default: n)
+            q: Modulus (default: 2^32 - 5)
+            eta: Error distribution parameter
+            gpu: Use GPU acceleration
+            device_id: GPU device ID
+            seed: Optional master seed for deterministic key generation.
+                  - None (default): Use true randomness for s (recommended for PKE)
+                  - bytes: Derive s from seed (for auth/reproducibility use cases)
+                  
+                  WARNING: If seed is provided, the same seed will always produce
+                  the same key pair. Only use this for authentication scenarios
+                  where the seed itself is kept secret!
+        """
         self.n = int(n)
         self.k = int(k if k is not None else n)
         self.q = int(q)
         self.eta = int(eta)
+        self.seed = seed  # Store for key_gen
         
         # Dynamic message size based on n
         self.msg_bits = self.n
@@ -347,42 +368,77 @@ class LWEKEM:
         """
         Generate LWE key pair.
         
-        IMPORTANT: Secret key s is generated from TRUE RANDOMNESS,
-        NOT from any seed! This ensures pk_seed leaking doesn't
-        compromise the secret key.
+        Behavior depends on self.seed:
+          - seed=None (default): Use TRUE RANDOMNESS for s (standard PKE)
+          - seed=bytes: Derive all key material from seed (for auth/reproducibility)
+        
+        In both cases, pk_seed leaking does NOT compromise the secret key,
+        because s is either truly random or derived from a separate secret seed.
         
         Returns:
             Tuple of (public_key_bytes, secret_key_bytes) for storage
         """
-        # Generate random pk_seed (this CAN be public!)
-        pk_seed = secrets.token_bytes(32)
+        if self.seed is not None:
+            # Deterministic key generation from master seed
+            # Used for authentication scenarios where reproducibility is needed
+            hkdf = HKDF(salt=_sha256(b"meteor-nc-auth-v2"))
+            prk = hkdf.extract(self.seed)
+            
+            # Derive pk_seed (can be public)
+            pk_seed = hkdf.expand(prk, b"pk_seed", 32)
+            
+            # Derive s from seed (SECRET - but seed is also secret!)
+            s_bytes = hkdf.expand(prk, b"secret_s", self.n * 4)
+            s_raw = np.frombuffer(s_bytes, dtype="<u4").copy()
+            s_np = ((s_raw % (2 * self.eta + 1)).astype(np.int64) - self.eta)
+            
+            # Derive e from seed
+            e_bytes = hkdf.expand(prk, b"error_e", self.k * 4)
+            e_raw = np.frombuffer(e_bytes, dtype="<u4").copy()
+            e_np = ((e_raw % (2 * self.eta + 1)).astype(np.int64) - self.eta)
+            
+            # Derive z from seed
+            z = hkdf.expand(prk, b"implicit_z", 32)
+            
+            if self.gpu:
+                s = cp.asarray(s_np)
+                e = cp.asarray(e_np)
+            else:
+                s = s_np
+                e = e_np
+        else:
+            # Standard PKE: TRUE RANDOMNESS for secret values
+            pk_seed = secrets.token_bytes(32)
+            
+            # Generate s and e from TRUE RANDOMNESS (not from seed!)
+            if self.gpu:
+                s_np = np.array([
+                    secrets.randbelow(2 * self.eta + 1) - self.eta 
+                    for _ in range(self.n)
+                ], dtype=np.int64)
+                e_np = np.array([
+                    secrets.randbelow(2 * self.eta + 1) - self.eta 
+                    for _ in range(self.k)
+                ], dtype=np.int64)
+                s = cp.asarray(s_np)
+                e = cp.asarray(e_np)
+            else:
+                s_np = np.array([
+                    secrets.randbelow(2 * self.eta + 1) - self.eta 
+                    for _ in range(self.n)
+                ], dtype=np.int64)
+                e_np = np.array([
+                    secrets.randbelow(2 * self.eta + 1) - self.eta 
+                    for _ in range(self.k)
+                ], dtype=np.int64)
+                s = s_np
+                e = e_np
+            
+            # Generate implicit rejection seed
+            z = secrets.token_bytes(32)
         
         # Reconstruct A from pk_seed (deterministic)
         A = self._reconstruct_A(pk_seed)
-        
-        # Generate s and e from TRUE RANDOMNESS (not from seed!)
-        if self.gpu:
-            # Use cryptographically secure random for secret values
-            s_np = np.array([
-                secrets.randbelow(2 * self.eta + 1) - self.eta 
-                for _ in range(self.n)
-            ], dtype=np.int64)
-            e_np = np.array([
-                secrets.randbelow(2 * self.eta + 1) - self.eta 
-                for _ in range(self.k)
-            ], dtype=np.int64)
-            s = cp.asarray(s_np)
-            e = cp.asarray(e_np)
-        else:
-            # Use secrets module for cryptographic randomness
-            s = np.array([
-                secrets.randbelow(2 * self.eta + 1) - self.eta 
-                for _ in range(self.n)
-            ], dtype=np.int64)
-            e = np.array([
-                secrets.randbelow(2 * self.eta + 1) - self.eta 
-                for _ in range(self.k)
-            ], dtype=np.int64)
         
         # Compute b = A @ s + e (mod q)
         b = self._mod_q(A @ s + e)
@@ -393,9 +449,6 @@ class LWEKEM:
         b_bytes_for_hash = b_np.astype("<u4").tobytes()
         pk_bytes_for_hash = pk_seed + b_bytes_for_hash
         pk_hash = _sha256(b"pk_hash", pk_bytes_for_hash)
-        
-        # Generate implicit rejection seed
-        z = secrets.token_bytes(32)
         
         # Store keys
         self.pk = LWEPublicKey(
