@@ -37,7 +37,7 @@ KYBER_SOURCE = None
 try:
     import oqs
     # Check if ML-KEM is available
-    available_kems = oqs.get_enabled_KEM_mechanisms()
+    available_kems = oqs.get_enabled_kem_mechanisms()  # lowercase!
     if 'ML-KEM-512' in available_kems or 'Kyber512' in available_kems:
         KYBER_AVAILABLE = True
         KYBER_SOURCE = "liboqs"
