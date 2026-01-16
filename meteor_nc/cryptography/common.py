@@ -3,6 +3,12 @@
 Meteor-NC Common Components
 
 Shared utilities, constants, and data structures for the Meteor-NC cryptosystem.
+
+Wire Format Specification:
+  - Header fields: big-endian (">I", ">II", ">III")
+  - Coefficient arrays (b, u, v): little-endian uint32 ("<u4")
+  - This mixed endianness is intentional: headers follow network byte order,
+    while coefficient arrays use native x86/ARM little-endian for efficiency.
 """
 
 from __future__ import annotations
@@ -45,7 +51,14 @@ def _sha256(*chunks: bytes) -> bytes:
 
 
 def _ct_eq(a: bytes, b: bytes) -> int:
-    """Constant-time byte comparison. Returns 1 if equal, 0 otherwise."""
+    """
+    Constant-time byte comparison. Returns 1 if equal, 0 otherwise.
+    
+    Note: Length check is not constant-time, but in FO transform
+    ct and ct' are always same-length by construction.
+    """
+    if len(a) != len(b):
+        return 0
     return 1 if hmac.compare_digest(a, b) else 0
 
 
@@ -68,7 +81,12 @@ def _bytes_from_words_le(words: np.ndarray) -> bytes:
 
 
 def prg_sha256(seed: bytes, out_len: int, domain: bytes = b"prg") -> bytes:
-    """Deterministic PRG using SHA-256 in counter mode."""
+    """
+    Deterministic PRG using SHA-256 in counter mode.
+    
+    Used for deterministic matrix reconstruction from pk_seed.
+    Cross-platform compatible (no PRNG implementation dependency).
+    """
     out = bytearray()
     ctr = 0
     while len(out) < out_len:
@@ -83,7 +101,8 @@ def small_error_from_seed(seed: bytes, n: int) -> np.ndarray:
     buf = prg_sha256(seed, nbytes, domain=b"error")
     arr = np.frombuffer(buf, dtype=np.uint8).copy()
     return ((arr % 5) - 2).astype(np.int64)
-    
+
+
 # =============================================================================
 # HKDF (RFC 5869)
 # =============================================================================
@@ -113,6 +132,19 @@ class HKDF:
     def derive(self, ikm: bytes, info: bytes = b"", length: int = 32) -> bytes:
         """One-shot derivation: Extract then Expand."""
         return self.expand(self.extract(ikm), info, length)
+
+
+def _derive_key(ikm: bytes, info: bytes, length: int = 32) -> bytes:
+    """
+    HKDF-based key derivation with domain separation.
+    
+    Used for:
+      - Shared secret derivation: K = HKDF(m || ct_wire, "meteor-nc-shared-secret")
+      - AEAD key derivation: aead_key = HKDF(K, "meteor-nc-aead-key")
+      - Implicit rejection: K_fail = HKDF(z || ct_wire, "meteor-nc-implicit-reject")
+    """
+    hkdf = HKDF()
+    return hkdf.derive(ikm, info, length)
 
 
 # =============================================================================
@@ -160,29 +192,126 @@ class CenteredBinomial:
 
 @dataclass
 class LWEPublicKey:
-    """LWE public key: (A, b) where b = As + e (mod q)"""
-    A: Any          # (k, n) matrix
-    b: Any          # (k,) vector
-    pk_hash: bytes  # H(pk) for FO transform
+    """
+    LWE public key.
+    
+    CORRECT KEY STRUCTURE:
+      - pk_seed (32B): Public, used to reconstruct matrix A via SHA-256 PRG
+      - b (k×4B as uint32): Public, computed as A @ s + e mod q during key_gen
+    
+    Wire format sizes:
+      - 12 (header: n, k, q) + 32 (pk_seed) + k*4 (b as uint32) + 32 (pk_hash)
+    
+    Matrix A reconstruction:
+      - Uses SHA-256 in counter mode (deterministic, implementation-independent)
+      - Bias from u32 mod q (q=2^32-5) is negligible (~5/2^32 per element)
+    """
+    pk_seed: bytes      # 32 bytes, for A reconstruction
+    b: np.ndarray       # (k,) vector, int64 internally
+    pk_hash: bytes      # H(pk_seed || b) for FO transform
+    n: int              # dimension
+    k: int              # rows
+    q: int              # modulus
+    
+    def to_bytes(self) -> bytes:
+        """Serialize to wire format."""
+        b_np = np.asarray(self.b).astype(np.int64)
+        b_bytes = b_np.astype("<u4").tobytes()
+        return (
+            struct.pack(">III", self.n, self.k, self.q) +
+            self.pk_seed +
+            b_bytes +
+            self.pk_hash
+        )
+    
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "LWEPublicKey":
+        """Deserialize from wire format with input validation."""
+        if len(data) < 12:
+            raise ValueError(f"LWEPublicKey too short: {len(data)} < 12 bytes")
+        
+        n, k, q = struct.unpack(">III", data[:12])
+        expected_size = 12 + 32 + k * 4 + 32
+        
+        if len(data) < expected_size:
+            raise ValueError(f"LWEPublicKey truncated: {len(data)} < {expected_size}")
+        
+        pk_seed = data[12:44]
+        b_raw = np.frombuffer(data[44:44 + k * 4], dtype="<u4").astype(np.int64).copy()
+        pk_hash = data[44 + k * 4:44 + k * 4 + 32]
+        
+        return cls(pk_seed=pk_seed, b=b_raw, pk_hash=pk_hash, n=n, k=k, q=q)
 
 
 @dataclass
 class LWESecretKey:
     """LWE secret key with implicit rejection component."""
-    s: Any      # (n,) secret vector
-    z: bytes    # implicit rejection seed
+    s: Any      # (n,) secret vector, generated from TRUE RANDOMNESS
+    z: bytes    # implicit rejection seed (32 bytes)
 
 
 @dataclass
 class LWECiphertext:
-    """LWE ciphertext: (u, v)"""
-    u: np.ndarray  # (n,) vector
-    v: np.ndarray  # (MSG_BITS,) vector
+    """
+    LWE ciphertext: (u, v)
+    
+    Wire format (uint32 little-endian):
+      - header: 8 bytes (u_len, v_len as big-endian u32)
+      - u: u_len×4 bytes
+      - v: v_len×4 bytes
+    
+    Internal representation uses int64 for computation headroom.
+    """
+    u: np.ndarray  # (n,) vector, int64 internally
+    v: np.ndarray  # (msg_bits,) vector, int64 internally
+    
+    def to_bytes(self) -> bytes:
+        """Serialize to wire format (uint32 little-endian)."""
+        return (
+            struct.pack(">II", len(self.u), len(self.v)) +
+            self.u.astype("<u4").tobytes() +
+            self.v.astype("<u4").tobytes()
+        )
+    
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "LWECiphertext":
+        """Deserialize from wire format with input validation."""
+        if len(data) < 8:
+            raise ValueError(f"LWECiphertext too short: {len(data)} < 8 bytes")
+        
+        u_len, v_len = struct.unpack(">II", data[:8])
+        expected_size = 8 + u_len * 4 + v_len * 4
+        
+        if len(data) < expected_size:
+            raise ValueError(f"LWECiphertext truncated: {len(data)} < {expected_size}")
+        
+        offset = 8
+        u = np.frombuffer(data[offset:offset + u_len * 4], dtype="<u4").astype(np.int64).copy()
+        offset += u_len * 4
+        
+        v = np.frombuffer(data[offset:offset + v_len * 4], dtype="<u4").astype(np.int64).copy()
+        
+        return cls(u=u, v=v)
+    
+    def wire_size(self) -> int:
+        """Get wire format size in bytes."""
+        return 8 + len(self.u) * 4 + len(self.v) * 4
 
 
 @dataclass
 class FullCiphertext:
-    """Hybrid ciphertext: KEM ciphertext + DEM ciphertext"""
+    """
+    Hybrid ciphertext: KEM ciphertext + DEM ciphertext.
+    
+    Wire format:
+      - kem_ct: LWECiphertext wire format (8B header + u + v as uint32)
+      - nonce: 12 bytes (AEAD nonce)
+      - ct_len: 4 bytes (BE)
+      - ct: DEM ciphertext body
+      - tag: 16 bytes (AEAD tag)
+    
+    Note: KEM portion uses same wire format as LWECiphertext for consistency.
+    """
     u: np.ndarray
     v: np.ndarray
     nonce: bytes
@@ -190,11 +319,13 @@ class FullCiphertext:
     tag: bytes
     
     def to_bytes(self) -> bytes:
-        """Serialize to bytes."""
+        """Serialize to bytes (KEM portion uses LWECiphertext wire format)."""
+        # Use LWECiphertext wire format for consistency
+        kem_ct = LWECiphertext(u=self.u, v=self.v)
+        kem_wire = kem_ct.to_bytes()
+        
         return (
-            struct.pack(">I", len(self.u)) +
-            self.u.astype(np.int64).tobytes() +
-            self.v.astype(np.int64).tobytes() +
+            kem_wire +
             self.nonce +
             struct.pack(">I", len(self.ct)) +
             self.ct +
@@ -202,18 +333,25 @@ class FullCiphertext:
         )
     
     @classmethod
-    def from_bytes(cls, data: bytes, n: int, msg_bits: int = MSG_BITS) -> "FullCiphertext":
-        """Deserialize from bytes."""
-        offset = 0
+    def from_bytes(cls, data: bytes) -> "FullCiphertext":
+        """Deserialize from bytes with input validation."""
+        # Minimum: KEM header (8B) + nonce (12B) + ct_len (4B) + tag (16B) = 40B
+        if len(data) < 40:
+            raise ValueError(f"FullCiphertext too short: {len(data)} < 40 bytes")
         
-        u_len = struct.unpack(">I", data[offset:offset+4])[0]
-        offset += 4
+        # Parse KEM portion using LWECiphertext format
+        u_len, v_len = struct.unpack(">II", data[:8])
+        kem_size = 8 + u_len * 4 + v_len * 4
         
-        u = np.frombuffer(data[offset:offset + u_len*8], dtype=np.int64).copy()
-        offset += u_len * 8
+        if kem_size > len(data):
+            raise ValueError(f"Invalid KEM size: {kem_size} > {len(data)}")
         
-        v = np.frombuffer(data[offset:offset + msg_bits*8], dtype=np.int64).copy()
-        offset += msg_bits * 8
+        kem_ct = LWECiphertext.from_bytes(data[:kem_size])
+        offset = kem_size
+        
+        # Validate remaining length for nonce + ct_len header
+        if offset + 16 > len(data):  # 12 (nonce) + 4 (ct_len)
+            raise ValueError(f"Truncated after KEM: offset {offset}, len {len(data)}")
         
         nonce = data[offset:offset+12]
         offset += 12
@@ -221,12 +359,16 @@ class FullCiphertext:
         ct_len = struct.unpack(">I", data[offset:offset+4])[0]
         offset += 4
         
+        # Validate ct + tag length
+        if offset + ct_len + 16 > len(data):
+            raise ValueError(f"Truncated ciphertext: need {offset + ct_len + 16}, have {len(data)}")
+        
         ct = data[offset:offset+ct_len]
         offset += ct_len
         
         tag = data[offset:offset+16]
         
-        return cls(u=u, v=v, nonce=nonce, ct=ct, tag=tag)
+        return cls(u=kem_ct.u, v=kem_ct.v, nonce=nonce, ct=ct, tag=tag)
 
 
 # =============================================================================
