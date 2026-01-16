@@ -48,14 +48,20 @@ except ImportError:
 
 # Batch v2 (multi-level support)
 try:
-    from .kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
-    BATCH_MULTILEVEL_AVAILABLE = BATCH_V2_AVAILABLE and BLAKE3_V2_AVAILABLE
+    from .batch import BatchLWEKEM, BatchHybridKEM, BatchCiphertext  # ★追加
+    BATCH_AVAILABLE = True
 except ImportError:
-    BATCH_MULTILEVEL_AVAILABLE = False
-
+    BATCH_AVAILABLE = False
+  
 # Stream DEM
 try:
-    from .stream import StreamDEM, EncryptedChunk, StreamHeader
+    from .stream import (
+        StreamDEM, 
+        StreamHybridKEM,      # ★追加
+        StreamCiphertext,     # ★追加
+        EncryptedChunk, 
+        StreamHeader,
+    )
     STREAM_AVAILABLE = True
 except ImportError:
     STREAM_AVAILABLE = False
@@ -74,8 +80,12 @@ __all__ = [
     "SymmetricMixer",
     # Batch
     "BatchLWEKEM",
+    "BatchHybridKEM",
+    "BatchCiphertext",
     # Stream
     "StreamDEM",
+    "StreamHybridKEM",
+    "StreamCiphertext",
     "EncryptedChunk",
     "StreamHeader",
     # Practical
