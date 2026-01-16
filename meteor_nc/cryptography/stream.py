@@ -450,9 +450,9 @@ class StreamHybridKEM:
             raise ValueError("Public key not loaded")
         
         # 1. KEM: Encapsulate to get session key
-        self.kem.load_public_key(self._pk)
-        shared_key, kem_ct_obj = self.kem.encaps()
-        kem_ct = kem_ct_obj.to_bytes()
+        encaps_kem = LWEKEM(n=self.n, q=self.q, eta=self.eta)
+        encaps_kem.load_public_key(self._pk)
+        shared_key, kem_ct_obj = encaps_kem.encaps()
         
         # 2. DEM: Initialize stream
         stream_id = secrets.token_bytes(16)
