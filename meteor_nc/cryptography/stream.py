@@ -36,18 +36,30 @@ from .common import (
     CRYPTO_AVAILABLE,
     _sha256,
     HKDF,
+    LWECiphertext,
 )
 
 # Import LWEKEM from core (CPU version)
 from .core import LWEKEM
 
 # GPU DEM (if available)
+_GPU_CHACHA_OK = False
+GPUChaCha20Poly1305 = None
 if GPU_AVAILABLE:
-    from .kernels.chacha_poly_kernel import GPUChaCha20Poly1305
+    try:
+        from .kernels.chacha_poly_kernel import GPUChaCha20Poly1305
+        _GPU_CHACHA_OK = True
+    except ImportError:
+        pass
 
 # CPU DEM fallback
-if CRYPTO_AVAILABLE:
+ChaCha20Poly1305 = None
+_STREAM_CRYPTO_OK = False
+try:
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    _STREAM_CRYPTO_OK = True
+except ImportError:
+    pass
 
 
 # =============================================================================
@@ -262,11 +274,13 @@ class StreamDEM:
         self.device_id = device_id
         
         # Use GPU if available and requested
-        self.use_gpu = gpu and GPU_AVAILABLE
+        self.use_gpu = gpu and _GPU_CHACHA_OK
         
         if self.use_gpu:
             self._gpu_cipher = GPUChaCha20Poly1305(session_key, device_id=device_id)
-        elif CRYPTO_AVAILABLE:
+            self._cpu_cipher = None
+        elif _STREAM_CRYPTO_OK:
+            self._gpu_cipher = None
             self._cpu_cipher = ChaCha20Poly1305(session_key)
         else:
             raise ImportError("No crypto backend available (need CuPy or cryptography)")
@@ -385,8 +399,8 @@ class StreamHybridKEM:
     def __init__(
         self,
         n: int = 256,
-        q: int = 65537,
-        eta: int = 3,
+        q: int = 4294967291,  # Q_DEFAULT from common.py
+        eta: int = 2,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         gpu: bool = True,
         device_id: int = 0,
@@ -402,39 +416,37 @@ class StreamHybridKEM:
             gpu: Enable GPU acceleration for DEM
             device_id: GPU device ID
         """
-        self.n = n
-        self.q = q
-        self.eta = eta
+        self._n = n
+        self._q = q
+        self._eta = eta
         self.chunk_size = chunk_size
         self.gpu = gpu
         self.device_id = device_id
         
-        # Initialize KEM
-        self.kem = LWEKEM(n=n, q=q, eta=eta)
-        
-        # Keys
-        self._pk: Optional[bytes] = None
-        self._sk: Optional[bytes] = None
+        # Keys (stored as bytes for serialization)
+        self._pk_bytes: Optional[bytes] = None
+        self._sk_bytes: Optional[bytes] = None
     
     def key_gen(self) -> Tuple[bytes, bytes]:
         """Generate key pair."""
-        pk, sk = self.kem.key_gen()
-        self._pk = pk
-        self._sk = sk
+        kem = LWEKEM(n=self._n, q=self._q, eta=self._eta)
+        pk, sk = kem.key_gen()
+        self._pk_bytes = pk
+        self._sk_bytes = sk
         return pk, sk
     
     def load_public_key(self, pk: bytes) -> None:
         """Load public key (for encryption)."""
-        self._pk = pk
+        self._pk_bytes = pk
     
     def load_secret_key(self, sk: bytes) -> None:
         """Load secret key (for decryption)."""
-        self._sk = sk
+        self._sk_bytes = sk
     
     def load_keys(self, pk: bytes, sk: bytes) -> None:
         """Load both keys."""
-        self._pk = pk
-        self._sk = sk
+        self._pk_bytes = pk
+        self._sk_bytes = sk
     
     # =========================================================================
     # Simple Interface (core.py compatible)
@@ -446,13 +458,15 @@ class StreamHybridKEM:
         
         Automatically chunks large data.
         """
-        if self._pk is None:
+        if self._pk_bytes is None:
             raise ValueError("Public key not loaded")
         
-        # 1. KEM: Encapsulate to get session key
-        encaps_kem = LWEKEM(n=self.n, q=self.q, eta=self.eta)
-        encaps_kem.load_public_key(self._pk)
+        # 1. KEM: Create fresh instance for encapsulation
+        #    This avoids resetting any stored sk in the main instance
+        encaps_kem = LWEKEM(n=self._n, q=self._q, eta=self._eta)
+        encaps_kem.load_public_key(self._pk_bytes)
         shared_key, kem_ct_obj = encaps_kem.encaps()
+        kem_ct = kem_ct_obj.to_bytes()
         
         # 2. DEM: Initialize stream
         stream_id = secrets.token_bytes(16)
@@ -485,22 +499,24 @@ class StreamHybridKEM:
         """
         Decrypt stream ciphertext.
         """
-        if self._sk is None:
+        if self._sk_bytes is None:
             raise ValueError("Secret key not loaded")
+        if self._pk_bytes is None:
+            raise ValueError("Public key not loaded (required for decryption)")
         
         if isinstance(ct, bytes):
             ct = StreamCiphertext.from_bytes(ct)
         
-        # 1. KEM: Decapsulate to get session key
-        # Import LWECiphertext for parsing
-        from .core import LWECiphertext
-        kem_ct_obj = LWECiphertext.from_bytes(ct.kem_ciphertext)
+        # 1. KEM: Create fresh instance for decapsulation
+        decaps_kem = LWEKEM(n=self._n, q=self._q, eta=self._eta)
         
-        # Load keys and decaps
-        self.kem.load_secret_key(self._sk)
-        if self._pk is not None:
-            self.kem.load_public_key(self._pk)
-        shared_key = self.kem.decaps(kem_ct_obj)
+        # Load pk first (this resets sk), then load sk
+        decaps_kem.load_public_key(self._pk_bytes)
+        decaps_kem.load_secret_key(self._sk_bytes)
+        
+        # Parse and decapsulate
+        kem_ct_obj = LWECiphertext.from_bytes(ct.kem_ciphertext)
+        shared_key = decaps_kem.decaps(kem_ct_obj)
         
         # 2. DEM: Initialize stream
         if not ct.chunks:
@@ -536,12 +552,13 @@ class StreamHybridKEM:
         First yield is the KEM ciphertext header.
         Subsequent yields are encrypted chunks.
         """
-        if self._pk is None:
+        if self._pk_bytes is None:
             raise ValueError("Public key not loaded")
         
-        # 1. KEM
-        self.kem.load_public_key(self._pk)
-        shared_key, kem_ct_obj = self.kem.encaps()
+        # 1. KEM: Create fresh instance
+        encaps_kem = LWEKEM(n=self._n, q=self._q, eta=self._eta)
+        encaps_kem.load_public_key(self._pk_bytes)
+        shared_key, kem_ct_obj = encaps_kem.encaps()
         kem_ct = kem_ct_obj.to_bytes()
         
         # Yield KEM header
@@ -558,7 +575,6 @@ class StreamHybridKEM:
         
         # 3. Encrypt and yield chunks
         buffer = b""
-        final_sent = False
         
         for data in data_iterator:
             buffer += data
@@ -583,8 +599,10 @@ class StreamHybridKEM:
         
         First input should be the KEM ciphertext header.
         """
-        if self._sk is None:
+        if self._sk_bytes is None:
             raise ValueError("Secret key not loaded")
+        if self._pk_bytes is None:
+            raise ValueError("Public key not loaded")
         
         # 1. Read KEM header
         first_chunk = next(chunk_iterator)
@@ -598,12 +616,12 @@ class StreamHybridKEM:
             raise ValueError("KEM ciphertext truncated")
         
         # 2. Decapsulate
-        from .core import LWECiphertext
+        decaps_kem = LWEKEM(n=self._n, q=self._q, eta=self._eta)
+        decaps_kem.load_public_key(self._pk_bytes)
+        decaps_kem.load_secret_key(self._sk_bytes)
+        
         kem_ct_obj = LWECiphertext.from_bytes(kem_ct)
-        self.kem.load_secret_key(self._sk)
-        if self._pk is not None:
-            self.kem.load_public_key(self._pk)
-        shared_key = self.kem.decaps(kem_ct_obj)
+        shared_key = decaps_kem.decaps(kem_ct_obj)
         
         # Initialize DEM (stream_id will be set from first chunk)
         dem = None
@@ -669,6 +687,8 @@ def run_tests() -> bool:
     print("=" * 70)
     print("Meteor-NC Stream Hybrid KEM")
     print("=" * 70)
+    print(f"GPU ChaCha20: {'Available' if _GPU_CHACHA_OK else 'Not available'}")
+    print(f"CPU Crypto: {'Available' if _STREAM_CRYPTO_OK else 'Not available'}")
     
     results = {}
     
@@ -731,14 +751,17 @@ def run_tests() -> bool:
     
     ct = sender.encrypt(b"Secret stream data")
     
+    # Sender should NOT be able to decrypt (no sk, no pk for decaps)
     try:
         _ = sender.decrypt(ct)
         sender_blocked = False
     except (ValueError, Exception):
         sender_blocked = True
     
-    receiver.load_secret_key(sk)
-    recovered = receiver.decrypt(ct)
+    # Receiver loads both keys and decrypts
+    receiver2 = StreamHybridKEM()
+    receiver2.load_keys(pk, sk)
+    recovered = receiver2.decrypt(ct)
     
     sep_ok = sender_blocked and (recovered == b"Secret stream data")
     results["separation"] = sep_ok
@@ -788,7 +811,7 @@ def run_tests() -> bool:
     print("\n" + "=" * 70)
     all_pass = all(results.values())
     print(f"Result: {'ALL TESTS PASSED ✅' if all_pass else 'SOME TESTS FAILED ❌'}")
-    print(f"GPU acceleration: {'Enabled' if GPU_AVAILABLE else 'Disabled (CPU fallback)'}")
+    print(f"GPU acceleration: {'Enabled' if _GPU_CHACHA_OK else 'Disabled (CPU fallback)'}")
     print("=" * 70)
     
     return all_pass
