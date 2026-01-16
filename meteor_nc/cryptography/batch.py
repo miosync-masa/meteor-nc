@@ -30,6 +30,8 @@ from .common import (
     prg_sha256,
     HKDF,
     GPU_AVAILABLE,
+    CRYPTO_AVAILABLE,
+    LWECiphertext,  # encaps/decaps で使うなら
 )
 
 if not GPU_AVAILABLE:
