@@ -48,6 +48,32 @@ if CRYPTO_AVAILABLE:
 
 
 # =============================================================================
+# HKDF-based Key Derivation (RFC 5869 Compliant)
+# =============================================================================
+
+# Domain-separated salt for Meteor-NC
+_METEOR_SALT = _sha256(b"meteor-nc-v1-hkdf-salt")
+_HKDF_INSTANCE = HKDF(salt=_METEOR_SALT)
+
+
+def _derive_key(ikm: bytes, info: bytes, length: int = 32) -> bytes:
+    """
+    HKDF-based key derivation with proper domain separation.
+    
+    Compliant with RFC 5869 and NIST SP 800-56C.
+    
+    Args:
+        ikm: Input keying material
+        info: Context/application-specific info string
+        length: Desired output length in bytes
+    
+    Returns:
+        Derived key material
+    """
+    return _HKDF_INSTANCE.derive(ikm, info, length)
+
+
+# =============================================================================
 # Symmetric Mixer (Feistel Network)
 # =============================================================================
 
@@ -188,6 +214,9 @@ class LWEKEM:
     
     Provides IND-CCA2 security assuming LWE hardness.
     Uses implicit rejection to prevent timing side-channels.
+    
+    Key derivation uses HKDF (RFC 5869) for proper domain separation
+    and compliance with NIST SP 800-56C.
     
     Supports multiple security levels:
         - n=256:  128-bit security (NIST Level 1)
@@ -366,6 +395,8 @@ class LWEKEM:
         """
         KEM encapsulation.
         
+        Uses HKDF (RFC 5869) for shared secret derivation.
+        
         Args:
             rng: Optional random bytes generator (default: secrets.token_bytes)
         
@@ -387,13 +418,17 @@ class LWEKEM:
         v_np = self._to_numpy(v).astype(np.int64)
         ct_bytes = u_np.tobytes() + v_np.tobytes()
         
-        K = _sha256(b"shared", m, ct_bytes)
+        # HKDF-based shared secret derivation (RFC 5869 compliant)
+        K = _derive_key(m + ct_bytes, b"meteor-nc-shared-secret")
         
         return K, LWECiphertext(u=u_np, v=v_np)
     
     def decaps(self, ct: LWECiphertext) -> bytes:
         """
         KEM decapsulation with implicit rejection.
+        
+        Uses HKDF (RFC 5869) for shared secret derivation.
+        Implicit rejection uses separate domain to prevent oracle attacks.
         
         Returns:
             K: Shared secret (32 bytes)
@@ -420,8 +455,9 @@ class LWEKEM:
         
         ok = _ct_eq(ct_bytes, ct2_bytes)
         
-        K_good = _sha256(b"shared", m_prime, ct_bytes)
-        K_fail = _sha256(b"fail", self.sk.z, ct_bytes)
+        # HKDF-based key derivation with domain separation
+        K_good = _derive_key(m_prime + ct_bytes, b"meteor-nc-shared-secret")
+        K_fail = _derive_key(self.sk.z + ct_bytes, b"meteor-nc-implicit-reject")
         
         return K_good if ok == 1 else K_fail
     
@@ -439,6 +475,7 @@ class HybridKEM:
     Hybrid Key Encapsulation Mechanism.
     
     Combines LWE-KEM with symmetric encryption (mixer + AEAD).
+    All key derivations use HKDF (RFC 5869) for proper domain separation.
     """
     
     def __init__(
@@ -488,12 +525,18 @@ class HybridKEM:
         self.kem.key_gen()
     
     def encrypt(self, plaintext: bytes, aad: Optional[bytes] = None) -> FullCiphertext:
-        """Encrypt plaintext with optional associated data."""
+        """
+        Encrypt plaintext with optional associated data.
+        
+        AEAD key is derived using HKDF for proper domain separation.
+        """
         if not CRYPTO_AVAILABLE:
             raise ImportError("cryptography library required")
         
         K, kem_ct = self.kem.encaps()
-        aead_key = _sha256(b"aead-key", K)
+        
+        # HKDF-based AEAD key derivation (RFC 5869 compliant)
+        aead_key = _derive_key(K, b"meteor-nc-aead-key")
         
         mixed = self.mixer.forward(plaintext)
         
@@ -513,14 +556,19 @@ class HybridKEM:
         )
     
     def decrypt(self, ciphertext: FullCiphertext, aad: Optional[bytes] = None) -> bytes:
-        """Decrypt ciphertext with optional AAD verification."""
+        """
+        Decrypt ciphertext with optional AAD verification.
+        
+        AEAD key is derived using HKDF for proper domain separation.
+        """
         if not CRYPTO_AVAILABLE:
             raise ImportError("cryptography library required")
         
         kem_ct = LWECiphertext(u=ciphertext.u, v=ciphertext.v)
         K = self.kem.decaps(kem_ct)
         
-        aead_key = _sha256(b"aead-key", K)
+        # HKDF-based AEAD key derivation (RFC 5869 compliant)
+        aead_key = _derive_key(K, b"meteor-nc-aead-key")
         
         aesgcm = AESGCM(aead_key)
         ct_with_tag = ciphertext.ct + ciphertext.tag
@@ -624,6 +672,23 @@ def run_tests() -> bool:
     seed_ok = np.array_equal(A1, A2)
     results["determinism"] = seed_ok
     print(f"  Deterministic KeyGen: {'PASS' if seed_ok else 'FAIL'}")
+    
+    # Test 5: HKDF Key Derivation Consistency
+    print("\n[Test 5] HKDF Key Derivation")
+    print("-" * 40)
+    
+    test_ikm = b"test input keying material"
+    test_info = b"test-context"
+    k1 = _derive_key(test_ikm, test_info, 32)
+    k2 = _derive_key(test_ikm, test_info, 32)
+    k3 = _derive_key(test_ikm, b"different-context", 32)
+    
+    hkdf_deterministic = (k1 == k2)
+    hkdf_domain_sep = (k1 != k3)
+    hkdf_ok = hkdf_deterministic and hkdf_domain_sep
+    results["hkdf"] = hkdf_ok
+    print(f"  Deterministic: {'PASS' if hkdf_deterministic else 'FAIL'}")
+    print(f"  Domain Separation: {'PASS' if hkdf_domain_sep else 'FAIL'}")
     
     # Summary
     print("\n" + "=" * 70)
