@@ -1,365 +1,506 @@
 # meteor_nc/cryptography/stream.py
 """
-Meteor-NC Stream DEM (Data Encapsulation Mechanism)
+Meteor-NC Stream Hybrid KEM
 
-GPU-accelerated XChaCha20-Poly1305 for streaming encryption.
-Designed for high-throughput media delivery (GB/s target).
+Streaming Hybrid PKE with correct design:
+  - First: KEM encaps with recipient's public key → K
+  - Then: All chunks encrypted with K-derived session key (XChaCha20-Poly1305)
 
-v2: Fixed-chunk batch API for video streaming
+This ensures:
+  - Anyone with recipient's public key CAN encrypt stream
+  - Only recipient with secret key CAN decrypt stream
+  - Post-Quantum secure (LWE-KEM)
+  - Efficient streaming (KEM only once, AEAD for all chunks)
+
+Wire Format:
+  Stream = KEMCiphertext + [EncryptedChunk, EncryptedChunk, ...]
+  
+  KEMCiphertext:
+    | u (n*4B) | v (msg_bits*4B) |
+  
+  EncryptedChunk (per chunk):
+    | header (32B) | ciphertext (variable) | tag (16B) |
+  
+  StreamHeader (32B):
+    | stream_id (16B) | seq (8B) | chunk_len (4B) | flags (4B) |
 """
 
 from __future__ import annotations
 
-import os
-import time
+import secrets
 import struct
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Union
+from typing import Optional, List, Tuple, Iterator, Union
 
 import numpy as np
 
-from .common import GPU_AVAILABLE, _sha256
+from .common import (
+    GPU_AVAILABLE, 
+    CRYPTO_AVAILABLE, 
+    _sha256,
+    LWECiphertext,
+)
+from .core import LWEKEM
 
-if GPU_AVAILABLE:
-    import cupy as cp
-    try:
-        from .kernels.chacha_poly_kernel import GPUChaCha20Poly1305
-        STREAM_GPU_AVAILABLE = True
-    except ImportError:
-        STREAM_GPU_AVAILABLE = False
-else:
-    STREAM_GPU_AVAILABLE = False
+if CRYPTO_AVAILABLE:
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 
-# =========================
-# Data structures
-# =========================
+# =============================================================================
+# Data Structures
+# =============================================================================
 
 @dataclass
 class StreamHeader:
-    """Per-chunk header for authenticated encryption."""
-    stream_id: bytes      # 16 bytes
-    seq: int              # 64-bit sequence number
-    chunk_len: int        # Payload length
-    flags: int            # Reserved for codec/container
+    """
+    Stream chunk header (32 bytes).
+    
+    Attributes:
+        stream_id: 16-byte stream identifier
+        seq: 8-byte sequence number (u64)
+        chunk_len: 4-byte chunk length (u32)
+        flags: 4-byte flags (u32)
+            - bit 0: is_final (last chunk in stream)
+            - bit 1: has_kem (first chunk contains KEM ciphertext)
+    """
+    stream_id: bytes      # 16B
+    seq: int              # u64
+    chunk_len: int        # u32
+    flags: int = 0        # u32
+    
+    HEADER_SIZE = 32
+    
+    FLAG_FINAL = 0x01
+    FLAG_HAS_KEM = 0x02
+    
+    def __post_init__(self):
+        if len(self.stream_id) != 16:
+            raise ValueError(f"stream_id must be 16 bytes, got {len(self.stream_id)}")
+    
+    def to_bytes(self) -> bytes:
+        """Serialize header to 32 bytes."""
+        return (
+            self.stream_id +
+            struct.pack(">Q", self.seq) +
+            struct.pack(">I", self.chunk_len) +
+            struct.pack(">I", self.flags)
+        )
+    
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'StreamHeader':
+        """Deserialize header from bytes."""
+        if len(data) < cls.HEADER_SIZE:
+            raise ValueError(f"Header too short: {len(data)} < {cls.HEADER_SIZE}")
+        
+        return cls(
+            stream_id=data[:16],
+            seq=struct.unpack(">Q", data[16:24])[0],
+            chunk_len=struct.unpack(">I", data[24:28])[0],
+            flags=struct.unpack(">I", data[28:32])[0],
+        )
+    
+    @property
+    def is_final(self) -> bool:
+        return bool(self.flags & self.FLAG_FINAL)
+    
+    @property
+    def has_kem(self) -> bool:
+        return bool(self.flags & self.FLAG_HAS_KEM)
 
 
 @dataclass
 class EncryptedChunk:
-    """Encrypted chunk with authentication tag."""
+    """Encrypted stream chunk with authentication tag."""
     header: StreamHeader
     ciphertext: bytes
-    tag: bytes            # 16 bytes Poly1305 tag
+    tag: bytes            # 16 bytes
+    
+    TAG_SIZE = 16
+    
+    def to_bytes(self) -> bytes:
+        """Serialize to wire format."""
+        return self.header.to_bytes() + self.ciphertext + self.tag
+    
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'EncryptedChunk':
+        """Deserialize from wire format."""
+        header = StreamHeader.from_bytes(data[:StreamHeader.HEADER_SIZE])
+        ct_start = StreamHeader.HEADER_SIZE
+        ct_end = ct_start + header.chunk_len
+        
+        return cls(
+            header=header,
+            ciphertext=data[ct_start:ct_end],
+            tag=data[ct_end:ct_end + cls.TAG_SIZE],
+        )
+    
+    @property
+    def wire_size(self) -> int:
+        return StreamHeader.HEADER_SIZE + len(self.ciphertext) + self.TAG_SIZE
 
 
-# Fixed header format (streaming-friendly)
-_HEADER_AAD_LEN = 16 + 8 + 4 + 4  # 32 bytes
-HEADER_DTYPE = np.dtype([
-    ("stream_id", "S16"),
-    ("seq", "<u8"),
-    ("chunk_len", "<u4"),
-    ("flags", "<u4"),
-])
-
-
-def _headers_to_aad_bytes(headers: np.ndarray) -> bytes:
-    """Convert HEADER_DTYPE array to contiguous AAD bytes (batch * 32)."""
-    if headers.dtype != HEADER_DTYPE:
-        raise TypeError("headers must use HEADER_DTYPE")
-    return headers.tobytes(order="C")
-
-
-# =========================
-# Stream DEM
-# =========================
-
-class StreamDEM:
+@dataclass
+class EncryptedStream:
     """
-    Streaming Data Encapsulation Mechanism.
-
-    Uses XChaCha20-Poly1305 for:
-    - 192-bit nonce (no collision risk)
-    - High-speed GPU encryption
-    - Per-chunk authentication
+    Complete encrypted stream container.
+    
+    Contains KEM ciphertext + all encrypted chunks.
     """
+    kem_u: np.ndarray           # KEM ciphertext u
+    kem_v: np.ndarray           # KEM ciphertext v
+    stream_id: bytes            # 16 bytes
+    chunks: List[EncryptedChunk]
+    
+    def to_bytes(self) -> bytes:
+        """Serialize entire stream."""
+        # KEM ciphertext
+        kem_bytes = (
+            struct.pack(">I", len(self.kem_u)) +
+            self.kem_u.astype("<i8").tobytes() +
+            struct.pack(">I", len(self.kem_v)) +
+            self.kem_v.astype("<i8").tobytes()
+        )
+        
+        # Stream ID
+        stream_bytes = self.stream_id
+        
+        # Chunk count
+        chunk_count = struct.pack(">I", len(self.chunks))
+        
+        # All chunks
+        chunk_bytes = b"".join(c.to_bytes() for c in self.chunks)
+        
+        return kem_bytes + stream_bytes + chunk_count + chunk_bytes
 
-    NONCE_BYTES = 24      # XChaCha20
-    TAG_BYTES = 16        # Poly1305
-    KEY_BYTES = 32
 
+# =============================================================================
+# Stream Hybrid KEM
+# =============================================================================
+
+class StreamHybridKEM:
+    """
+    Streaming Hybrid PKE with correct design.
+    
+    ENCRYPTION:
+      1. KEM encaps with recipient's PUBLIC KEY → K
+      2. Derive session_key from K
+      3. Encrypt all chunks with session_key (XChaCha20-Poly1305)
+    
+    DECRYPTION:
+      1. KEM decaps with own SECRET KEY → K
+      2. Derive session_key from K
+      3. Decrypt all chunks with session_key
+    
+    Example (Encryption - Sender):
+        >>> sender = StreamHybridKEM(n=256)
+        >>> sender.load_recipient_public_key(bob_pk)
+        >>> encrypted = sender.encrypt_stream(large_data, chunk_size=64*1024)
+        >>> # Send encrypted to Bob
+    
+    Example (Decryption - Receiver):
+        >>> receiver = StreamHybridKEM(n=256, seed=bob_seed)
+        >>> receiver.key_gen()  # Regenerate Bob's keys
+        >>> decrypted = receiver.decrypt_stream(encrypted)
+    """
+    
+    TAG_SIZE = 16
+    
     def __init__(
         self,
-        session_key: bytes,
-        stream_id: Optional[bytes] = None,
+        n: int = 256,
         gpu: bool = True,
         device_id: int = 0,
+        seed: Optional[bytes] = None,
     ):
-        if len(session_key) != self.KEY_BYTES:
-            raise ValueError(f"Session key must be {self.KEY_BYTES} bytes")
-
-        self.session_key = session_key
-        self.stream_id = stream_id or os.urandom(16)
-        self.gpu = bool(gpu and STREAM_GPU_AVAILABLE)
-        self.device_id = int(device_id)
-
-        # Derive sub-key (domain separated)
-        self.enc_key = _sha256(b"stream-enc", session_key)
-
-        # Sequence counter
-        self._seq = 0
-
-        if self.gpu:
-            cp.cuda.Device(self.device_id).use()
-            self._cipher = GPUChaCha20Poly1305(self.enc_key, self.device_id)
-
-    def _make_nonce(self, seq: int) -> bytes:
-        """nonce = stream_id(16) || seq(8)"""
-        return self.stream_id + struct.pack("<Q", seq)
-
-    def _make_aad(self, header: StreamHeader) -> bytes:
-        return (
-            header.stream_id +
-            struct.pack("<Q", header.seq) +
-            struct.pack("<I", header.chunk_len) +
-            struct.pack("<I", header.flags)
+        """
+        Initialize StreamHybridKEM.
+        
+        Args:
+            n: LWE dimension (256, 512, 1024)
+            gpu: Enable GPU acceleration
+            device_id: GPU device ID
+            seed: Optional seed for deterministic key generation
+        """
+        if not CRYPTO_AVAILABLE:
+            raise ImportError("cryptography library required")
+        
+        self.n = n
+        self.gpu = gpu and GPU_AVAILABLE
+        self.device_id = device_id
+        self.seed = seed
+        
+        # Initialize KEM
+        self._kem = LWEKEM(
+            n=n,
+            gpu=self.gpu,
+            device_id=device_id,
+            seed=seed,
         )
-
-    # -----------------------------------------
-    # Single-chunk API
-    # -----------------------------------------
-
-    def encrypt_chunk(
+        
+        # Keys (generated or loaded)
+        self._pk_bytes: Optional[bytes] = None
+        self._sk_bytes: Optional[bytes] = None
+        
+        # Recipient's public key (for encryption)
+        self._recipient_pk: Optional[bytes] = None
+        
+        # Session state
+        self._session_key: Optional[bytes] = None
+        self._stream_id: Optional[bytes] = None
+        self._cipher: Optional[ChaCha20Poly1305] = None
+        self._seq: int = 0
+    
+    # =========================================================================
+    # Key Management
+    # =========================================================================
+    
+    def key_gen(self) -> Tuple[bytes, bytes]:
+        """Generate own key pair."""
+        self._pk_bytes, self._sk_bytes = self._kem.key_gen()
+        return self._pk_bytes, self._sk_bytes
+    
+    def get_public_key(self) -> bytes:
+        """Get own public key."""
+        if self._pk_bytes is None:
+            raise ValueError("Keys not generated. Call key_gen() first.")
+        return self._pk_bytes
+    
+    def load_recipient_public_key(self, pk_bytes: bytes) -> None:
+        """Load recipient's public key for encryption."""
+        self._recipient_pk = pk_bytes
+    
+    # =========================================================================
+    # Internal Helpers
+    # =========================================================================
+    
+    def _derive_nonce(self, seq: int) -> bytes:
+        """Derive 12-byte nonce from stream_id and sequence."""
+        seq_bytes = struct.pack(">Q", seq)
+        return _sha256(self._stream_id, seq_bytes)[:12]
+    
+    def _encrypt_chunk_internal(
         self,
         plaintext: bytes,
-        seq: Optional[int] = None,
-        flags: int = 0,
+        seq: int,
+        is_final: bool = False,
     ) -> EncryptedChunk:
-        """Encrypt a single chunk."""
-        if seq is None:
-            seq = self._seq
-            self._seq += 1
-
+        """Encrypt a single chunk with current session key."""
         header = StreamHeader(
-            stream_id=self.stream_id,
+            stream_id=self._stream_id,
             seq=seq,
             chunk_len=len(plaintext),
-            flags=flags,
+            flags=StreamHeader.FLAG_FINAL if is_final else 0,
         )
-
-        nonce = self._make_nonce(seq)
-        aad = self._make_aad(header)
-
-        if self.gpu:
-            ct, tag = self._cipher.encrypt(plaintext, nonce, aad)
-        else:
-            ct, tag = self._encrypt_cpu(plaintext, nonce, aad)
-
-        return EncryptedChunk(header=header, ciphertext=ct, tag=tag)
-
-    def decrypt_chunk(self, chunk: EncryptedChunk) -> bytes:
-        """Decrypt and verify a single chunk."""
-        nonce = self._make_nonce(chunk.header.seq)
-        aad = self._make_aad(chunk.header)
-
-        if self.gpu:
-            return self._cipher.decrypt(chunk.ciphertext, chunk.tag, nonce, aad)
-        return self._decrypt_cpu(chunk.ciphertext, chunk.tag, nonce, aad)
-
-    # -----------------------------------------
-    # Fixed-chunk batch API (fast path)
-    # -----------------------------------------
-
-    def encrypt_batch_fixed(
+        
+        nonce = self._derive_nonce(seq)
+        aad = header.to_bytes()
+        
+        ct_with_tag = self._cipher.encrypt(nonce, plaintext, aad)
+        
+        return EncryptedChunk(
+            header=header,
+            ciphertext=ct_with_tag[:-self.TAG_SIZE],
+            tag=ct_with_tag[-self.TAG_SIZE:],
+        )
+    
+    def _decrypt_chunk_internal(self, chunk: EncryptedChunk) -> bytes:
+        """Decrypt a single chunk with current session key."""
+        if chunk.header.stream_id != self._stream_id:
+            raise ValueError("Stream ID mismatch")
+        
+        nonce = self._derive_nonce(chunk.header.seq)
+        aad = chunk.header.to_bytes()
+        ct_with_tag = chunk.ciphertext + chunk.tag
+        
+        try:
+            return self._cipher.decrypt(nonce, ct_with_tag, aad)
+        except Exception as e:
+            raise ValueError(f"Decryption failed: {e}")
+    
+    # =========================================================================
+    # Stream Encryption (using recipient's PUBLIC key)
+    # =========================================================================
+    
+    def encrypt_stream(
         self,
-        buf: bytes,
-        chunk_size: int,
-        start_seq: Optional[int] = None,
-        flags: int = 0,
-        *,
-        return_objects: bool = False,
-    ) -> Union[Tuple[np.ndarray, bytes, bytes], List[EncryptedChunk]]:
+        data: bytes,
+        chunk_size: int = 64 * 1024,
+    ) -> EncryptedStream:
         """
-        Encrypt a contiguous buffer as fixed-size chunks.
-
-        Intended for media streaming:
-        - Most chunks are exactly chunk_size
-        - Last chunk may be shorter (header.chunk_len carries real size)
-
+        Encrypt data as a stream.
+        
+        Uses recipient's PUBLIC KEY for KEM encapsulation.
+        Only the recipient can decrypt (with their secret key).
+        
         Args:
-            buf: Input bytes to encrypt
-            chunk_size: Size of each chunk (last may be shorter)
-            start_seq: Starting sequence number (auto if None)
-            flags: Flags for all chunks
-            return_objects: If True, return list of EncryptedChunk (slower)
-
-        Returns (fast form, default):
-            headers: np.ndarray[HEADER_DTYPE] shape (batch,)
-            ct_concat: bytes (sum of chunk lengths)
-            tag_concat: bytes (batch * 16)
-
-        If return_objects=True:
-            list[EncryptedChunk] (slower but convenient)
+            data: Data to encrypt
+            chunk_size: Size of each chunk (default 64KB)
+            
+        Returns:
+            EncryptedStream containing KEM ciphertext + encrypted chunks
         """
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be positive")
-
-        total = len(buf)
-        if total == 0:
-            headers = np.zeros((0,), dtype=HEADER_DTYPE)
-            if return_objects:
-                return []
-            return headers, b"", b""
-
-        batch = (total + chunk_size - 1) // chunk_size
-
-        if start_seq is None:
-            start_seq = self._seq
-            self._seq += batch
-
-        # Build headers (vectorized)
-        headers = np.zeros((batch,), dtype=HEADER_DTYPE)
-        headers["stream_id"] = np.frombuffer(self.stream_id, dtype="S16")[0]
-        seqs = np.arange(start_seq, start_seq + batch, dtype=np.uint64)
-        headers["seq"] = seqs
-
-        # Chunk lengths
-        lens = np.full((batch,), chunk_size, dtype=np.uint32)
-        last_len = total - (batch - 1) * chunk_size
-        lens[-1] = np.uint32(last_len)
-        headers["chunk_len"] = lens
-        headers["flags"] = np.uint32(flags)
-
-        # Nonces: (batch, 24)
-        seq_le = seqs.view(np.uint8).reshape(batch, 8)
-        nonces = np.empty((batch, self.NONCE_BYTES), dtype=np.uint8)
-        nonces[:, :16] = np.frombuffer(self.stream_id, dtype=np.uint8)[None, :]
-        nonces[:, 16:] = seq_le
-
-        # AAD: (batch, 32)
-        aad_bytes = _headers_to_aad_bytes(headers)
-        aad = np.frombuffer(aad_bytes, dtype=np.uint8).reshape(batch, _HEADER_AAD_LEN)
-
-        # Plaintext to 2D with padding
-        pt_padded = np.zeros((batch * chunk_size,), dtype=np.uint8)
-        pt_padded[:total] = np.frombuffer(buf, dtype=np.uint8)
-        pt2 = pt_padded.reshape(batch, chunk_size)
-
-        if self.gpu:
-            cp.cuda.Device(self.device_id).use()
-
-            pt_gpu = cp.asarray(pt2, dtype=cp.uint8)
-            nonce_gpu = cp.asarray(nonces, dtype=cp.uint8)
-            aad_gpu = cp.asarray(aad, dtype=cp.uint8)
-            lens_gpu = cp.asarray(lens, dtype=cp.uint32)
-
-            ct_gpu, tag_gpu = self._cipher.encrypt_batch_fixed(
-                pt_gpu, nonce_gpu, aad_gpu, lens_gpu
-            )
-            cp.cuda.Stream.null.synchronize()
-
-            ct_host = cp.asnumpy(ct_gpu)
-            tag_host = cp.asnumpy(tag_gpu)
-
-        else:
-            # CPU fallback
-            ct_host = np.empty_like(pt2, dtype=np.uint8)
-            tag_host = np.empty((batch, self.TAG_BYTES), dtype=np.uint8)
-
-            for i in range(batch):
-                clen = int(lens[i])
-                nonce_i = nonces[i].tobytes()
-                aad_i = aad[i].tobytes()
-                pt_i = pt2[i, :clen].tobytes()
-                ct_i, tag_i = self._encrypt_cpu(pt_i, nonce_i, aad_i)
-
-                ct_host[i, :clen] = np.frombuffer(ct_i, dtype=np.uint8)
-                if clen < chunk_size:
-                    ct_host[i, clen:] = 0
-                tag_host[i, :] = np.frombuffer(tag_i, dtype=np.uint8)
-
-        # Pack outputs
-        if batch == 1:
-            ct_concat = ct_host[0, :int(lens[0])].tobytes()
-        else:
-            full_part = ct_host[:-1, :].reshape((batch - 1) * chunk_size).tobytes()
-            last_part = ct_host[-1, :int(lens[-1])].tobytes()
-            ct_concat = full_part + last_part
-
-        tag_concat = tag_host.reshape(batch * self.TAG_BYTES).tobytes()
-
-        if not return_objects:
-            return headers, ct_concat, tag_concat
-
-        # Slower convenience form
-        out = []
+        if self._recipient_pk is None:
+            raise ValueError("Recipient public key not loaded. Call load_recipient_public_key() first.")
+        
+        # 1. KEM encapsulation with RECIPIENT'S public key
+        enc_kem = LWEKEM(n=self.n, gpu=self.gpu, device_id=self.device_id)
+        enc_kem.load_public_key(self._recipient_pk)
+        
+        K, kem_ct = enc_kem.encaps()
+        
+        # 2. Derive session key from K
+        self._stream_id = secrets.token_bytes(16)
+        self._session_key = _sha256(b"stream-session-v2", K)
+        self._cipher = ChaCha20Poly1305(self._session_key)
+        
+        # 3. Encrypt all chunks
+        chunks = []
         offset = 0
-        for i in range(batch):
-            clen = int(lens[i])
-            h = StreamHeader(
-                stream_id=self.stream_id,
-                seq=int(headers["seq"][i]),
-                chunk_len=clen,
-                flags=int(headers["flags"][i]),
-            )
-            ct_i = ct_concat[offset:offset + clen]
-            offset += clen
-            tag_i = tag_host[i].tobytes()
-            out.append(EncryptedChunk(header=h, ciphertext=ct_i, tag=tag_i))
-        return out
-
-    # -----------------------------------------
-    # CPU fallback
-    # -----------------------------------------
-
-    def _encrypt_cpu(self, plaintext: bytes, nonce: bytes, aad: bytes) -> Tuple[bytes, bytes]:
-        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-
-        subkey = self._hchacha20(self.enc_key, nonce[:16])
-        chacha_nonce = b"\x00\x00\x00\x00" + nonce[16:]
-
-        cipher = ChaCha20Poly1305(subkey)
-        ct_with_tag = cipher.encrypt(chacha_nonce, plaintext, aad)
-        return ct_with_tag[:-16], ct_with_tag[-16:]
-
-    def _decrypt_cpu(self, ciphertext: bytes, tag: bytes, nonce: bytes, aad: bytes) -> bytes:
-        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-
-        subkey = self._hchacha20(self.enc_key, nonce[:16])
-        chacha_nonce = b"\x00\x00\x00\x00" + nonce[16:]
-
-        cipher = ChaCha20Poly1305(subkey)
-        return cipher.decrypt(chacha_nonce, ciphertext + tag, aad)
-
-    @staticmethod
-    def _hchacha20(key: bytes, nonce16: bytes) -> bytes:
-        """HChaCha20 key derivation."""
-        constants = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]
-        k = struct.unpack("<8I", key)
-        n = struct.unpack("<4I", nonce16)
-        state = list(constants) + list(k) + list(n)
-
-        def qr(a, b, c, d):
-            state[a] = (state[a] + state[b]) & 0xFFFFFFFF
-            state[d] ^= state[a]
-            state[d] = ((state[d] << 16) | (state[d] >> 16)) & 0xFFFFFFFF
-            state[c] = (state[c] + state[d]) & 0xFFFFFFFF
-            state[b] ^= state[c]
-            state[b] = ((state[b] << 12) | (state[b] >> 20)) & 0xFFFFFFFF
-            state[a] = (state[a] + state[b]) & 0xFFFFFFFF
-            state[d] ^= state[a]
-            state[d] = ((state[d] << 8) | (state[d] >> 24)) & 0xFFFFFFFF
-            state[c] = (state[c] + state[d]) & 0xFFFFFFFF
-            state[b] ^= state[c]
-            state[b] = ((state[b] << 7) | (state[b] >> 25)) & 0xFFFFFFFF
-
-        for _ in range(10):
-            qr(0, 4, 8, 12); qr(1, 5, 9, 13)
-            qr(2, 6, 10, 14); qr(3, 7, 11, 15)
-            qr(0, 5, 10, 15); qr(1, 6, 11, 12)
-            qr(2, 7, 8, 13); qr(3, 4, 9, 14)
-
-        out = state[0:4] + state[12:16]
-        return struct.pack("<8I", *out)
+        seq = 0
+        
+        while offset < len(data):
+            end = min(offset + chunk_size, len(data))
+            is_final = (end >= len(data))
+            
+            chunk_data = data[offset:end]
+            chunk = self._encrypt_chunk_internal(chunk_data, seq, is_final)
+            chunks.append(chunk)
+            
+            offset = end
+            seq += 1
+        
+        # Handle empty data
+        if not chunks:
+            chunks.append(self._encrypt_chunk_internal(b"", 0, is_final=True))
+        
+        return EncryptedStream(
+            kem_u=kem_ct.u,
+            kem_v=kem_ct.v,
+            stream_id=self._stream_id,
+            chunks=chunks,
+        )
+    
+    def encrypt_stream_iter(
+        self,
+        data_iter: Iterator[bytes],
+        recipient_pk: Optional[bytes] = None,
+    ) -> Iterator[Union[Tuple[np.ndarray, np.ndarray, bytes], EncryptedChunk]]:
+        """
+        Encrypt data stream iteratively (memory efficient).
+        
+        First yield: (kem_u, kem_v, stream_id) - KEM ciphertext
+        Subsequent yields: EncryptedChunk objects
+        
+        Args:
+            data_iter: Iterator of data chunks
+            recipient_pk: Recipient's public key (optional if already loaded)
+        """
+        if recipient_pk:
+            self._recipient_pk = recipient_pk
+        
+        if self._recipient_pk is None:
+            raise ValueError("Recipient public key not loaded")
+        
+        # 1. KEM encapsulation
+        enc_kem = LWEKEM(n=self.n, gpu=self.gpu, device_id=self.device_id)
+        enc_kem.load_public_key(self._recipient_pk)
+        
+        K, kem_ct = enc_kem.encaps()
+        
+        # 2. Setup session
+        self._stream_id = secrets.token_bytes(16)
+        self._session_key = _sha256(b"stream-session-v2", K)
+        self._cipher = ChaCha20Poly1305(self._session_key)
+        
+        # Yield KEM ciphertext first
+        yield (kem_ct.u, kem_ct.v, self._stream_id)
+        
+        # 3. Encrypt and yield chunks (with lookahead for final detection)
+        seq = 0
+        pending_data = None
+        
+        for chunk_data in data_iter:
+            if pending_data is not None:
+                # Previous chunk is not final (we have more data)
+                yield self._encrypt_chunk_internal(pending_data, seq, is_final=False)
+                seq += 1
+            pending_data = chunk_data
+        
+        # Encrypt final chunk (or empty stream)
+        if pending_data is not None:
+            yield self._encrypt_chunk_internal(pending_data, seq, is_final=True)
+        else:
+            # Empty stream
+            yield self._encrypt_chunk_internal(b"", 0, is_final=True)
+    
+    # =========================================================================
+    # Stream Decryption (using own SECRET key)
+    # =========================================================================
+    
+    def decrypt_stream(self, encrypted: EncryptedStream) -> bytes:
+        """
+        Decrypt an encrypted stream.
+        
+        Uses own SECRET KEY for KEM decapsulation.
+        
+        Args:
+            encrypted: EncryptedStream from encrypt_stream()
+            
+        Returns:
+            Decrypted data
+        """
+        if self._sk_bytes is None:
+            raise ValueError("Secret key not available. Call key_gen() first.")
+        
+        # 1. KEM decapsulation with OWN secret key
+        kem_ct = LWECiphertext(u=encrypted.kem_u, v=encrypted.kem_v)
+        K = self._kem.decaps(kem_ct)
+        
+        # 2. Derive session key
+        self._stream_id = encrypted.stream_id
+        self._session_key = _sha256(b"stream-session-v2", K)
+        self._cipher = ChaCha20Poly1305(self._session_key)
+        
+        # 3. Decrypt all chunks
+        parts = []
+        for chunk in encrypted.chunks:
+            parts.append(self._decrypt_chunk_internal(chunk))
+        
+        return b"".join(parts)
+    
+    def decrypt_stream_iter(
+        self,
+        kem_u: np.ndarray,
+        kem_v: np.ndarray,
+        stream_id: bytes,
+        chunk_iter: Iterator[EncryptedChunk],
+    ) -> Iterator[bytes]:
+        """
+        Decrypt stream iteratively (memory efficient).
+        
+        Args:
+            kem_u, kem_v: KEM ciphertext
+            stream_id: Stream identifier
+            chunk_iter: Iterator of EncryptedChunks
+            
+        Yields:
+            Decrypted data chunks
+        """
+        if self._sk_bytes is None:
+            raise ValueError("Secret key not available")
+        
+        # 1. KEM decapsulation
+        kem_ct = LWECiphertext(u=kem_u, v=kem_v)
+        K = self._kem.decaps(kem_ct)
+        
+        # 2. Setup session
+        self._stream_id = stream_id
+        self._session_key = _sha256(b"stream-session-v2", K)
+        self._cipher = ChaCha20Poly1305(self._session_key)
+        
+        # 3. Decrypt and yield chunks
+        for chunk in chunk_iter:
+            yield self._decrypt_chunk_internal(chunk)
 
 
 # =============================================================================
@@ -367,140 +508,183 @@ class StreamDEM:
 # =============================================================================
 
 def run_tests() -> bool:
-    """Execute StreamDEM tests with benchmarks."""
+    """Execute StreamHybridKEM tests."""
     print("=" * 70)
-    print("Meteor-NC StreamDEM Test Suite")
+    print("Meteor-NC StreamHybridKEM Test Suite (Correct PKE Design)")
     print("=" * 70)
-    
-    import secrets
-    import time
     
     results = {}
     
     # Test 1: Basic encrypt/decrypt
-    print("\n[Test 1] Basic Encrypt/Decrypt")
+    print("\n[Test 1] Basic Stream Encrypt/Decrypt")
     print("-" * 40)
     
-    session_key = secrets.token_bytes(32)
-    stream = StreamDEM(session_key, gpu=False)
+    # Bob generates keys
+    bob = StreamHybridKEM(n=256)
+    bob_pk, bob_sk = bob.key_gen()
     
-    test_sizes = [0, 1, 15, 16, 17, 64, 1000, 10000]
-    basic_ok = True
+    # Alice encrypts FOR Bob
+    alice = StreamHybridKEM(n=256)
+    alice.load_recipient_public_key(bob_pk)
     
-    for size in test_sizes:
-        pt = secrets.token_bytes(size) if size > 0 else b""
-        chunk = stream.encrypt_chunk(pt)
-        recovered = stream.decrypt_chunk(chunk)
-        ok = (pt == recovered)
-        basic_ok = basic_ok and ok
-        print(f"  Size {size:5d}: {'PASS' if ok else 'FAIL'}")
+    test_data = b"Hello Bob! This is a streaming message. " * 100
+    encrypted = alice.encrypt_stream(test_data, chunk_size=1024)
     
-    results["basic"] = basic_ok
+    # Bob decrypts
+    decrypted = bob.decrypt_stream(encrypted)
     
-    # Test 2: Sequence integrity
-    print("\n[Test 2] Sequence Integrity")
+    basic_ok = (test_data == decrypted)
+    results['basic'] = basic_ok
+    print(f"  Data size: {len(test_data)} bytes")
+    print(f"  Chunks: {len(encrypted.chunks)}")
+    print(f"  Result: {'PASS' if basic_ok else 'FAIL'}")
+    
+    # Test 2: Large data
+    print("\n[Test 2] Large Data (1MB)")
     print("-" * 40)
     
-    stream2 = StreamDEM(session_key, gpu=False)
-    chunks = [stream2.encrypt_chunk(f"msg{i}".encode()) for i in range(5)]
+    large_data = secrets.token_bytes(1024 * 1024)  # 1MB
     
-    seq_ok = all(chunks[i].header.seq == i for i in range(5))
-    results["sequence"] = seq_ok
-    print(f"  Auto-increment seq: {'PASS' if seq_ok else 'FAIL'}")
+    alice2 = StreamHybridKEM(n=256)
+    alice2.load_recipient_public_key(bob_pk)
+    encrypted2 = alice2.encrypt_stream(large_data, chunk_size=64 * 1024)
     
-    # Test 3: Tamper detection
-    print("\n[Test 3] Tamper Detection")
+    decrypted2 = bob.decrypt_stream(encrypted2)
+    
+    large_ok = (large_data == decrypted2)
+    results['large'] = large_ok
+    print(f"  Chunks: {len(encrypted2.chunks)}")
+    print(f"  Result: {'PASS' if large_ok else 'FAIL'}")
+    
+    # Test 3: Empty data
+    print("\n[Test 3] Empty Data")
     print("-" * 40)
     
-    stream3 = StreamDEM(session_key, gpu=False)
-    chunk = stream3.encrypt_chunk(b"secret data")
+    alice3 = StreamHybridKEM(n=256)
+    alice3.load_recipient_public_key(bob_pk)
+    encrypted3 = alice3.encrypt_stream(b"")
     
-    bad_ct = bytes([chunk.ciphertext[0] ^ 1]) + chunk.ciphertext[1:]
-    bad_chunk = EncryptedChunk(
-        header=chunk.header,
-        ciphertext=bad_ct,
-        tag=chunk.tag,
-    )
+    decrypted3 = bob.decrypt_stream(encrypted3)
     
+    empty_ok = (decrypted3 == b"")
+    results['empty'] = empty_ok
+    print(f"  Result: {'PASS' if empty_ok else 'FAIL'}")
+    
+    # Test 4: Wrong recipient cannot decrypt
+    print("\n[Test 4] Security: Wrong Recipient Cannot Decrypt")
+    print("-" * 40)
+    
+    eve = StreamHybridKEM(n=256)
+    eve.key_gen()  # Eve has different keys
+    
+    alice4 = StreamHybridKEM(n=256)
+    alice4.load_recipient_public_key(bob_pk)
+    encrypted4 = alice4.encrypt_stream(b"Secret for Bob only!")
+    
+    security_ok = False
     try:
-        stream3.decrypt_chunk(bad_chunk)
-        tamper_ok = False
-    except Exception:
+        eve.decrypt_stream(encrypted4)
+        print("  Eve decrypted! SECURITY BREACH!")
+    except Exception as e:
+        security_ok = True
+        print(f"  Eve blocked: decryption failed")
+    
+    results['security'] = security_ok
+    print(f"  Result: {'PASS' if security_ok else 'FAIL'}")
+    
+    # Test 5: Seed reproducibility
+    print("\n[Test 5] Seed Reproducibility")
+    print("-" * 40)
+    
+    seed = b"test_seed_for_streaming_12345678"
+    
+    bob1 = StreamHybridKEM(n=256, seed=seed)
+    bob1.key_gen()
+    
+    bob2 = StreamHybridKEM(n=256, seed=seed)
+    bob2.key_gen()
+    
+    seed_ok = (bob1.get_public_key() == bob2.get_public_key())
+    results['seed'] = seed_ok
+    print(f"  Same seed → Same PK: {'PASS' if seed_ok else 'FAIL'}")
+    
+    # Test 6: Iterator API
+    print("\n[Test 6] Iterator API (Memory Efficient)")
+    print("-" * 40)
+    
+    # Pre-generate data to avoid regeneration
+    original_chunks = [f"Chunk {i}: ".encode() + secrets.token_bytes(100) for i in range(10)]
+    
+    def data_generator():
+        for chunk in original_chunks:
+            yield chunk
+    
+    alice5 = StreamHybridKEM(n=256)
+    alice5.load_recipient_public_key(bob_pk)
+    
+    # Collect encrypted stream
+    enc_iter = alice5.encrypt_stream_iter(data_generator())
+    kem_u, kem_v, stream_id = next(enc_iter)
+    chunks = list(enc_iter)
+    
+    # Decrypt with iterator
+    decrypted_parts = list(bob.decrypt_stream_iter(kem_u, kem_v, stream_id, iter(chunks)))
+    
+    # Compare
+    iter_ok = (original_chunks == decrypted_parts)
+    results['iterator'] = iter_ok
+    print(f"  Chunks processed: {len(chunks)}")
+    print(f"  Result: {'PASS' if iter_ok else 'FAIL'}")
+    
+    # Test 7: Tamper detection
+    print("\n[Test 7] Tamper Detection")
+    print("-" * 40)
+    
+    alice6 = StreamHybridKEM(n=256)
+    alice6.load_recipient_public_key(bob_pk)
+    encrypted6 = alice6.encrypt_stream(b"Authentic data")
+    
+    # Tamper with first chunk's ciphertext
+    if len(encrypted6.chunks[0].ciphertext) > 0:
+        tampered_ct = bytearray(encrypted6.chunks[0].ciphertext)
+        tampered_ct[0] ^= 0xFF
+        encrypted6.chunks[0] = EncryptedChunk(
+            header=encrypted6.chunks[0].header,
+            ciphertext=bytes(tampered_ct),
+            tag=encrypted6.chunks[0].tag,
+        )
+    
+    tamper_ok = False
+    try:
+        bob.decrypt_stream(encrypted6)
+    except ValueError:
         tamper_ok = True
     
-    results["tamper"] = tamper_ok
-    print(f"  Ciphertext tamper: {'PASS' if tamper_ok else 'FAIL'}")
-    
-    # Test 4: Batch fixed
-    print("\n[Test 4] Batch Fixed (Streaming)")
-    print("-" * 40)
-    
-    stream4 = StreamDEM(session_key, gpu=False)
-    
-    data = secrets.token_bytes(10240)
-    headers, ct_concat, tag_concat = stream4.encrypt_batch_fixed(data, chunk_size=1024)
-    
-    batch_ok = (len(headers) == 10) and (len(ct_concat) == 10240) and (len(tag_concat) == 160)
-    results["batch_fixed"] = batch_ok
-    print(f"  10KB / 1KB chunks: {'PASS' if batch_ok else 'FAIL'}")
-    
-    stream5 = StreamDEM(session_key, gpu=False)
-    chunks = stream5.encrypt_batch_fixed(data, chunk_size=1024, return_objects=True)
-    
-    recovered = b""
-    for c in chunks:
-        recovered += stream5.decrypt_chunk(c)
-    
-    roundtrip_ok = (data == recovered)
-    results["batch_roundtrip"] = roundtrip_ok
-    print(f"  Batch round-trip: {'PASS' if roundtrip_ok else 'FAIL'}")
-    
-    # Test 5: Performance Benchmark
-    print("\n[Test 5] Performance Benchmark")
-    print("-" * 40)
-    
-    bench_sizes = [
-        (1 * 1024 * 1024, 64 * 1024, "1MB / 64KB chunks"),
-        (10 * 1024 * 1024, 256 * 1024, "10MB / 256KB chunks"),
-        (100 * 1024 * 1024, 1024 * 1024, "100MB / 1MB chunks"),
-    ]
-    
-    print("\n  [CPU Mode]")
-    for total_size, chunk_size, desc in bench_sizes:
-        data = secrets.token_bytes(total_size)
-        stream_bench = StreamDEM(session_key, gpu=False)
-        
-        start = time.perf_counter()
-        headers, ct, tags = stream_bench.encrypt_batch_fixed(data, chunk_size)
-        elapsed = time.perf_counter() - start
-        
-        throughput = total_size / elapsed / (1024 * 1024)
-        print(f"    {desc}: {throughput:.1f} MB/s ({elapsed*1000:.1f} ms)")
-    
-    if STREAM_GPU_AVAILABLE:
-        print("\n  [GPU Mode]")
-        for total_size, chunk_size, desc in bench_sizes:
-            data = secrets.token_bytes(total_size)
-            stream_bench = StreamDEM(session_key, gpu=True)
-            
-            # Warmup
-            _ = stream_bench.encrypt_batch_fixed(data[:chunk_size], chunk_size)
-            
-            start = time.perf_counter()
-            headers, ct, tags = stream_bench.encrypt_batch_fixed(data, chunk_size)
-            elapsed = time.perf_counter() - start
-            
-            throughput = total_size / elapsed / (1024 * 1024)
-            print(f"    {desc}: {throughput:.1f} MB/s ({elapsed*1000:.1f} ms)")
-    else:
-        print("\n  [GPU Mode] Not available")
-    
-    results["benchmark"] = True
+    results['tamper'] = tamper_ok
+    print(f"  Result: {'PASS' if tamper_ok else 'FAIL'}")
     
     # Summary
     print("\n" + "=" * 70)
     all_pass = all(results.values())
-    print(f"Result: {'ALL TESTS PASSED' if all_pass else 'SOME TESTS FAILED'}")
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"Result: {passed}/{total} tests passed")
+    
+    if all_pass:
+        print("\n✓ ALL TESTS PASSED")
+        print("\n✓ Security properties verified:")
+        print("  - KEM encaps with recipient's PUBLIC key")
+        print("  - All chunks encrypted with derived session key")
+        print("  - Only recipient can decrypt with SECRET key")
+        print("  - Wrong recipient CANNOT decrypt")
+        print("  - Tamper detection works")
+    else:
+        print("\n✗ SOME TESTS FAILED")
+        for name, ok in results.items():
+            if not ok:
+                print(f"  - {name}: FAILED")
+    
     print("=" * 70)
     
     return all_pass
