@@ -29,7 +29,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from common import (
+from .common import (
     _sha256,
     prg_sha256,
     HKDF,
