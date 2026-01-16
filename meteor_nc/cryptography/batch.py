@@ -41,8 +41,8 @@ if not GPU_AVAILABLE:
 
 import cupy as cp
 
-from kernels.blake3_kernel import GPUBlake3
-from kernels.batch_kernels import (
+from .kernels.blake3_kernel import GPUBlake3
+from .kernels.batch_kernels import (
     cbd_i32,
     matmul_AT_R,
     bdot_R,
@@ -52,11 +52,11 @@ from kernels.batch_kernels import (
     pack_bits_gpu,
 )
 
-from kernels.batch_kernels_v2 import (
+from .kernels.batch_kernels_v2 import (
     unpack_to_encoded_v2,
     pack_bits_v2,
 )
-from kernels.blake3_kernel_v2 import GPUBlake3V2
+from .kernels.blake3_kernel_v2 import GPUBlake3V2
 
 # =============================================================================
 # Constants
