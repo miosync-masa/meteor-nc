@@ -27,12 +27,12 @@ from .cryptography.core import (
 
 # Batch KEM (GPU required)
 try:
-    from .cryptography.batch import BatchLWEKEM
+    from .cryptography.batch import BatchLWEKEM, BatchHybridKEM, BatchCiphertext
     BATCH_AVAILABLE = True
 except ImportError:
     BATCH_AVAILABLE = False
 
-# ↓ 追加: Batch Multi-Level (n=256/512/1024)
+# Batch Multi-Level (n=256/512/1024)
 try:
     from .cryptography.kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
     BATCH_MULTILEVEL_AVAILABLE = BATCH_V2_AVAILABLE and BLAKE3_V2_AVAILABLE
@@ -41,7 +41,13 @@ except ImportError:
 
 # Stream DEM (XChaCha20-Poly1305)
 try:
-    from .cryptography.stream import StreamDEM, EncryptedChunk, StreamHeader
+    from .cryptography.stream import (
+        StreamDEM,
+        StreamHybridKEM,
+        StreamCiphertext,
+        EncryptedChunk,
+        StreamHeader,
+    )
     STREAM_AVAILABLE = True
 except ImportError:
     STREAM_AVAILABLE = False
@@ -108,9 +114,13 @@ __all__ = [
     
     # Batch KEM
     "BatchLWEKEM",
+    "BatchHybridKEM",
+    "BatchCiphertext",
     
     # Stream DEM
     "StreamDEM",
+    "StreamHybridKEM",
+    "StreamCiphertext",
     "EncryptedChunk",
     "StreamHeader",
     
@@ -150,7 +160,7 @@ __all__ = [
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
     "BATCH_AVAILABLE",
-    "BATCH_MULTILEVEL_AVAILABLE",  # ← 追加
+    "BATCH_MULTILEVEL_AVAILABLE",
     "STREAM_AVAILABLE",
     "PRACTICAL_AVAILABLE",
     "PROTOCOL_AVAILABLE",
