@@ -1,8 +1,19 @@
 # meteor_nc/cryptography/__init__.py
 """
 Meteor-NC Cryptography Module
+
+Correct PKE Design:
+  - Public key (pk_seed + b) allows encryption
+  - Secret key (s) required for decryption
+  - pk_seed leak does NOT compromise secret key
+
+Wire Format:
+  - Header fields: big-endian
+  - Coefficient arrays: little-endian uint32
 """
+
 from .common import (
+    # Constants
     HKDF,
     Q_DEFAULT,
     MSG_BYTES,
@@ -10,10 +21,18 @@ from .common import (
     SECURITY_PARAMS,
     GPU_AVAILABLE,
     CRYPTO_AVAILABLE,
+    # Utilities
     _sha256,
     prg_sha256,
     small_error_from_seed,
+    # Data structures (wire format support)
+    LWEPublicKey,
+    LWESecretKey,
+    LWECiphertext,
+    FullCiphertext,
+    CenteredBinomial,
 )
+
 from .core import (
     LWEKEM,
     HybridKEM,
@@ -27,7 +46,7 @@ try:
 except ImportError:
     BATCH_AVAILABLE = False
 
-# ↓ 追加: Batch v2 (multi-level support)
+# Batch v2 (multi-level support)
 try:
     from .kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
     BATCH_MULTILEVEL_AVAILABLE = BATCH_V2_AVAILABLE and BLAKE3_V2_AVAILABLE
@@ -64,7 +83,13 @@ __all__ = [
     "create_meteor",
     "quick_encrypt",
     "quick_decrypt",
-    # common
+    # Data structures
+    "LWEPublicKey",
+    "LWESecretKey",
+    "LWECiphertext",
+    "FullCiphertext",
+    "CenteredBinomial",
+    # Common
     "HKDF",
     "Q_DEFAULT",
     "MSG_BYTES",
@@ -76,7 +101,7 @@ __all__ = [
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
     "BATCH_AVAILABLE",
-    "BATCH_MULTILEVEL_AVAILABLE",  # ← 追加
+    "BATCH_MULTILEVEL_AVAILABLE",
     "STREAM_AVAILABLE",
     "PRACTICAL_AVAILABLE",
 ]
