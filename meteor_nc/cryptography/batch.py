@@ -190,16 +190,24 @@ class BatchLWEKEM:
         return pk_bytes, sk_bytes
     
     def _export_public_key(self) -> bytes:
-        """Serialize public key to wire format."""
+        """
+        Serialize public key to wire format.
+        
+        Note: q = 2^32 is encoded as 0 (since 2^32 exceeds uint32 range).
+        This is decoded back to 2^32 in load_public_key.
+        """
         if self.pk_seed is None or self.b is None or self.pk_hash is None:
             raise ValueError("Keys not initialized")
         
+        # q = 2^32 exceeds uint32 range, encode as 0
+        q_encoded = 0 if self.q == 2**32 else self.q
+        
         b_bytes = cp.asnumpy(self.b).astype("<u4").tobytes()
         return (
-            struct.pack(">III", self.n, self.k, self.q) +  # header (12B)
-            self.pk_seed +                                   # 32B
-            b_bytes +                                        # k*4B
-            self.pk_hash                                     # 32B
+            struct.pack(">III", self.n, self.k, q_encoded) +  # header (12B)
+            self.pk_seed +                                     # 32B
+            b_bytes +                                          # k*4B
+            self.pk_hash                                       # 32B
         )
     
     def _export_secret_key(self) -> bytes:
@@ -215,14 +223,19 @@ class BatchLWEKEM:
         Load public key from bytes.
         
         This allows ANYONE to encrypt without knowing the secret key!
+        
+        Note: q = 0 in wire format means q = 2^32 (overflow encoding).
         """
         if len(pk_bytes) < 12:
             raise ValueError(f"Public key too short: {len(pk_bytes)} < 12")
         
-        n, k, q = struct.unpack(">III", pk_bytes[:12])
+        n, k, q_encoded = struct.unpack(">III", pk_bytes[:12])
         
-        if n != self.n or k != self.k:
-            raise ValueError(f"Parameter mismatch: expected n={self.n}, k={self.k}, got n={n}, k={k}")
+        # q = 0 means 2^32 (overflow encoding)
+        q = 2**32 if q_encoded == 0 else q_encoded
+        
+        if n != self.n or k != self.k or q != self.q:
+            raise ValueError(f"Parameter mismatch: expected n={self.n}, k={self.k}, q={self.q}, got n={n}, k={k}, q={q}")
         
         expected_size = 12 + 32 + k * 4 + 32
         if len(pk_bytes) < expected_size:
