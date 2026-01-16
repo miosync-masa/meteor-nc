@@ -19,8 +19,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..cryptography.common import GPU_AVAILABLE, _sha256
-from ..cryptography.core import LWEKEM, LWEPublicKey, LWESecretKey, LWECiphertext
+from ..cryptography.common import GPU_AVAILABLE, _sha256, LWECiphertext
+from ..cryptography.core import LWEKEM
 from ..cryptography.stream import StreamDEM, EncryptedChunk, StreamHeader
 
 
@@ -29,7 +29,7 @@ class MeteorPeer:
     """Peer in Meteor-Protocol network."""
     name: str
     meteor_id: bytes          # 32-byte identity
-    public_key: Optional[LWEPublicKey] = None
+    public_key: Optional[bytes] = None  # Serialized public key
     last_seen: Optional[float] = None
     
     def __post_init__(self):
@@ -89,6 +89,10 @@ class MeteorNode:
     - Authenticated encryption (XChaCha20-Poly1305)
     - No session state required
     
+    Key Generation Modes:
+    - seed=None: Random keys (standard use)
+    - seed=bytes: Deterministic keys (for auth/re-login)
+    
     Example:
         >>> alice = MeteorNode("Alice")
         >>> bob = MeteorNode("Bob")
@@ -113,20 +117,20 @@ class MeteorNode:
         self.gpu = gpu and GPU_AVAILABLE
         self.device_id = device_id
         
-        # Master seed (32 bytes)
-        self.seed = seed or secrets.token_bytes(32)
+        # Master seed (32 bytes) - for MeteorID derivation
+        self._master_seed = seed or secrets.token_bytes(32)
         
         # Derive MeteorID from seed
-        self.meteor_id = _sha256(b"meteor-id", self.seed)
+        self.meteor_id = _sha256(b"meteor-id", self._master_seed)
         
-        # Initialize KEM
+        # Initialize KEM with seed (for reproducible keys in auth scenarios)
         self._kem = LWEKEM(
             n=256,
             gpu=self.gpu,
             device_id=device_id,
-            seed=self.seed,
+            seed=self._master_seed,  # Pass seed for deterministic key gen
         )
-        self._kem.key_gen()
+        self._pk_bytes, self._sk_bytes = self._kem.key_gen()
         
         # Peer directory
         self.peers: Dict[str, MeteorPeer] = {}
@@ -149,15 +153,15 @@ class MeteorNode:
         """Get 32-byte MeteorID (for DHT/sharing)."""
         return self.meteor_id
     
-    def get_public_key(self) -> LWEPublicKey:
-        """Get public key for peer registration."""
-        return self._kem.pk
+    def get_public_key(self) -> bytes:
+        """Get serialized public key for peer registration."""
+        return self._pk_bytes
     
     def add_peer(
         self,
         name: str,
         meteor_id: bytes,
-        public_key: LWEPublicKey,
+        public_key: bytes,
     ):
         """Add peer to directory."""
         peer = MeteorPeer(
@@ -191,8 +195,7 @@ class MeteorNode:
         
         # 1. KEM encapsulation with peer's public key
         peer_kem = LWEKEM(n=256, gpu=self.gpu, device_id=self.device_id)
-        peer_kem.pk = peer.public_key
-        peer_kem.delta = peer_kem.q // 2
+        peer_kem.load_public_key(peer.public_key)
         
         K, kem_ct = peer_kem.encaps()
         
@@ -414,8 +417,25 @@ def run_tests() -> bool:
     print(f"  Bob ID:   {bob_id.hex()[:32]}...")
     print(f"  Result: {'PASS' if node_ok else 'FAIL'}")
     
-    # Test 2: Peer exchange
-    print("\n[Test 2] Peer Exchange")
+    # Test 2: Seed reproducibility (for auth)
+    print("\n[Test 2] Seed Reproducibility (Auth Use Case)")
+    print("-" * 40)
+    
+    auth_seed = b"user_auth_seed_1234567890123456"
+    node1 = MeteorNode("Auth1", seed=auth_seed)
+    node2 = MeteorNode("Auth2", seed=auth_seed)
+    
+    seed_ok = (
+        node1.get_meteor_id() == node2.get_meteor_id() and
+        node1.get_public_key() == node2.get_public_key()
+    )
+    results["seed_reproducibility"] = seed_ok
+    print(f"  Same MeteorID: {node1.get_meteor_id() == node2.get_meteor_id()}")
+    print(f"  Same PK: {node1.get_public_key() == node2.get_public_key()}")
+    print(f"  Result: {'PASS' if seed_ok else 'FAIL'}")
+    
+    # Test 3: Peer exchange
+    print("\n[Test 3] Peer Exchange")
     print("-" * 40)
     
     alice.add_peer("Bob", bob.get_meteor_id(), bob.get_public_key())
@@ -425,8 +445,8 @@ def run_tests() -> bool:
     results["peer_exchange"] = peer_ok
     print(f"  Result: {'PASS' if peer_ok else 'FAIL'}")
     
-    # Test 3: Single message
-    print("\n[Test 3] Single Message")
+    # Test 4: Single message
+    print("\n[Test 4] Single Message")
     print("-" * 40)
     
     original = b"Hello Bob! This is a secret message."
@@ -439,8 +459,8 @@ def run_tests() -> bool:
     print(f"  Decrypted: {decrypted}")
     print(f"  Result: {'PASS' if single_ok else 'FAIL'}")
     
-    # Test 4: Bidirectional
-    print("\n[Test 4] Bidirectional Communication")
+    # Test 5: Bidirectional
+    print("\n[Test 5] Bidirectional Communication")
     print("-" * 40)
     
     msg1 = alice.send("Bob", b"Hello Bob!")
@@ -453,8 +473,8 @@ def run_tests() -> bool:
     results["bidirectional"] = bidir_ok
     print(f"  Result: {'PASS' if bidir_ok else 'FAIL'}")
     
-    # Test 5: Protocol simulator
-    print("\n[Test 5] Protocol Simulator")
+    # Test 6: Protocol simulator
+    print("\n[Test 6] Protocol Simulator")
     print("-" * 40)
     
     protocol = MeteorProtocol()
@@ -469,11 +489,11 @@ def run_tests() -> bool:
     results["protocol"] = proto_ok
     print(f"  Result: {'PASS' if proto_ok else 'FAIL'}")
     
-    # Test 6: Performance
-    print("\n[Test 6] Performance Benchmark")
+    # Test 7: Performance
+    print("\n[Test 7] Performance Benchmark")
     print("-" * 40)
     
-    import time
+    import time as time_module
     
     test_sizes = [100, 1000, 10000]
     perf_ok = True
@@ -481,13 +501,13 @@ def run_tests() -> bool:
     for size in test_sizes:
         data = secrets.token_bytes(size)
         
-        start = time.perf_counter()
+        start = time_module.perf_counter()
         msg = alice.send("Bob", data)
-        enc_time = time.perf_counter() - start
+        enc_time = time_module.perf_counter() - start
         
-        start = time.perf_counter()
+        start = time_module.perf_counter()
         dec = bob.receive(msg)
-        dec_time = time.perf_counter() - start
+        dec_time = time_module.perf_counter() - start
         
         ok = data == dec
         perf_ok = perf_ok and ok
