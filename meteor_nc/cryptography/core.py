@@ -53,7 +53,7 @@ import numpy as np
 # Import from common.py
 # =============================================================================
 
-from common import (
+from .common import (
     # Constants
     Q_DEFAULT,
     SECURITY_PARAMS,
