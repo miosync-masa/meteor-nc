@@ -40,367 +40,57 @@ Supports multiple security levels:
   - 256-bit (n=1024): PK ~4.2KB, CT ~8.2KB
 """
 
+
 from __future__ import annotations
 
-import hashlib
-import hmac
 import secrets
 import struct
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 
-
 # =============================================================================
-# GPU Detection
-# =============================================================================
-
-try:
-    import cupy as cp
-    GPU_AVAILABLE = True
-except ImportError:
-    cp = None
-    GPU_AVAILABLE = False
-
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    CRYPTO_AVAILABLE = True
-except ImportError:
-    AESGCM = None
-    CRYPTO_AVAILABLE = False
-
-
-# =============================================================================
-# Constants
+# Import from common.py
 # =============================================================================
 
-Q_DEFAULT: int = 4294967291  # 2^32 - 5 (prime)
-
-SECURITY_PARAMS: Dict[int, Dict[str, int]] = {
-    128: {"n": 256, "k": 256, "eta": 2, "q": Q_DEFAULT},
-    192: {"n": 512, "k": 512, "eta": 2, "q": Q_DEFAULT},
-    256: {"n": 1024, "k": 1024, "eta": 3, "q": Q_DEFAULT},
-}
+from common import (
+    # Constants
+    Q_DEFAULT,
+    SECURITY_PARAMS,
+    GPU_AVAILABLE,
+    CRYPTO_AVAILABLE,
+    cp,
+    AESGCM,
+    # Utilities
+    _sha256,
+    _ct_eq,
+    _words_from_bytes_le,
+    _bytes_from_words_le,
+    prg_sha256,
+    small_error_from_seed,
+    # HKDF
+    HKDF,
+    # Data structures
+    LWEPublicKey,
+    LWESecretKey,
+    LWECiphertext,
+    FullCiphertext,
+    # CBD
+    CenteredBinomial,
+)
 
 
 # =============================================================================
-# Utility Functions
-# =============================================================================
-
-def _sha256(*chunks: bytes) -> bytes:
-    """Compute SHA-256 hash of concatenated inputs."""
-    h = hashlib.sha256()
-    for c in chunks:
-        h.update(c)
-    return h.digest()
-
-
-def _ct_eq(a: bytes, b: bytes) -> int:
-    """
-    Constant-time byte comparison. Returns 1 if equal, 0 otherwise.
-    
-    Note: Length check is not constant-time, but in FO transform
-    ct and ct' are always same-length by construction.
-    """
-    if len(a) != len(b):
-        return 0
-    return 1 if hmac.compare_digest(a, b) else 0
-
-
-def _words_from_bytes_le(data: bytes) -> np.ndarray:
-    """Convert bytes to uint32 array (little-endian), with zero-padding."""
-    pad = (-len(data)) % 4
-    if pad:
-        data = data + b"\x00" * pad
-    return np.frombuffer(data, dtype="<u4").copy()
-
-
-def _bytes_from_words_le(words: np.ndarray) -> bytes:
-    """Convert uint32 array to bytes (little-endian)."""
-    return words.astype("<u4", copy=False).tobytes()
-
-
-def prg_sha256(seed: bytes, out_len: int, domain: bytes = b"prg") -> bytes:
-    """Deterministic PRG using SHA-256 in counter mode."""
-    out = bytearray()
-    ctr = 0
-    while len(out) < out_len:
-        out.extend(_sha256(domain, seed, struct.pack("<I", ctr)))
-        ctr += 1
-    return bytes(out[:out_len])
-
-
-def small_error_from_seed(seed: bytes, n: int) -> np.ndarray:
-    """Deterministic error sampling in [-2, 2]^n from seed."""
-    nbytes = n
-    buf = prg_sha256(seed, nbytes, domain=b"error")
-    arr = np.frombuffer(buf, dtype=np.uint8).copy()
-    return ((arr % 5) - 2).astype(np.int64)
-
-
-# =============================================================================
-# HKDF (RFC 5869)
-# =============================================================================
-
-class HKDF:
-    """HMAC-based Key Derivation Function (RFC 5869)."""
-    
-    HASH_LEN: int = 32
-    
-    def __init__(self, salt: Optional[bytes] = None):
-        self.salt = salt if salt is not None else b"\x00" * self.HASH_LEN
-    
-    def extract(self, ikm: bytes) -> bytes:
-        """HKDF-Extract: PRK = HMAC(salt, IKM)"""
-        return hmac.new(self.salt, ikm, hashlib.sha256).digest()
-    
-    def expand(self, prk: bytes, info: bytes = b"", length: int = 32) -> bytes:
-        """HKDF-Expand: OKM = T(1) || T(2) || ... truncated to length"""
-        n_blocks = (length + self.HASH_LEN - 1) // self.HASH_LEN
-        okm = b""
-        t_prev = b""
-        for i in range(1, n_blocks + 1):
-            t_prev = hmac.new(prk, t_prev + info + bytes([i]), hashlib.sha256).digest()
-            okm += t_prev
-        return okm[:length]
-    
-    def derive(self, ikm: bytes, info: bytes = b"", length: int = 32) -> bytes:
-        """One-shot derivation: Extract then Expand."""
-        return self.expand(self.extract(ikm), info, length)
-
-
 # Domain-separated HKDF for Meteor-NC
+# =============================================================================
+
 _METEOR_SALT = _sha256(b"meteor-nc-v1-hkdf-salt")
 _HKDF_INSTANCE = HKDF(salt=_METEOR_SALT)
 
 
 def _derive_key(ikm: bytes, info: bytes, length: int = 32) -> bytes:
-    """HKDF-based key derivation with proper domain separation."""
+    """HKDF-based key derivation with Meteor-NC domain separation."""
     return _HKDF_INSTANCE.derive(ikm, info, length)
-
-
-# =============================================================================
-# Centered Binomial Distribution
-# =============================================================================
-
-class CenteredBinomial:
-    """Centered binomial distribution sampler."""
-    
-    def __init__(self, eta: int = 2, xp: Any = np):
-        if eta <= 0:
-            raise ValueError("Parameter eta must be positive")
-        self.eta = int(eta)
-        self.xp = xp
-    
-    def sample(self, shape: Tuple[int, ...], rng: Optional[Any] = None) -> Any:
-        """Sample from centered binomial distribution."""
-        xp = self.xp
-        eta = self.eta
-        
-        if rng is None:
-            bits = xp.random.randint(0, 2, size=shape + (2 * eta,), dtype=xp.int8)
-        else:
-            bits = rng.randint(0, 2, size=shape + (2 * eta,)).astype(np.int8)
-        
-        a = bits[..., :eta].sum(axis=-1)
-        b = bits[..., eta:].sum(axis=-1)
-        return (a - b).astype(xp.int64)
-    
-    def sample_vector(self, n: int, rng: Optional[Any] = None) -> Any:
-        """Sample a 1D vector."""
-        return self.sample((n,), rng=rng)
-
-
-# =============================================================================
-# Data Structures (Correct Design!)
-# =============================================================================
-
-@dataclass
-class LWEPublicKey:
-    """
-    LWE public key with compact representation.
-    
-    Structure:
-      - pk_seed: 32 bytes (used to reconstruct matrix A)
-      - b: n-dimensional vector (b = A @ s + e)
-      - pk_hash: H(pk) for FO transform
-      
-    Total public key size: 12 (header) + 32 (pk_seed) + k*4 (b as uint32) + 32 (pk_hash)
-      - n=256:  12 + 32 + 1024 + 32 = 1100 bytes ≈ 1KB
-      - n=512:  12 + 32 + 2048 + 32 = 2124 bytes ≈ 2KB
-      - n=1024: 12 + 32 + 4096 + 32 = 4172 bytes ≈ 4KB
-    
-    Matrix A (n×n) is NOT stored - reconstructed from pk_seed when needed!
-    
-    Note: b is serialized as uint32 (little-endian) since all values are in [0, q)
-    where q < 2^32. This halves the public key size compared to int64.
-    """
-    pk_seed: bytes      # 32 bytes - reconstruct A from this
-    b: np.ndarray       # (k,) vector - CANNOT be derived from seed!
-    pk_hash: bytes      # H(pk) for FO transform
-    n: int              # dimension
-    k: int              # k (= n by default)
-    q: int              # modulus
-    
-    def to_bytes(self) -> bytes:
-        """Serialize public key to bytes (b as uint32 for compactness)."""
-        header = struct.pack(">III", self.n, self.k, self.q)
-        # b values are in [0, q) where q < 2^32, so uint32 is sufficient
-        b_bytes = self.b.astype("<u4").tobytes()
-        return header + self.pk_seed + b_bytes + self.pk_hash
-    
-    @classmethod
-    def from_bytes(cls, data: bytes) -> "LWEPublicKey":
-        """Deserialize public key from bytes."""
-        n, k, q = struct.unpack(">III", data[:12])
-        offset = 12
-        
-        pk_seed = data[offset:offset + 32]
-        offset += 32
-        
-        # b is stored as uint32, convert to int64 for computation
-        b = np.frombuffer(data[offset:offset + k * 4], dtype="<u4").astype(np.int64).copy()
-        offset += k * 4
-        
-        pk_hash = data[offset:offset + 32]
-        
-        return cls(pk_seed=pk_seed, b=b, pk_hash=pk_hash, n=n, k=k, q=q)
-
-
-@dataclass
-class LWESecretKey:
-    """
-    LWE secret key.
-    
-    Structure:
-      - s: Secret vector (n-dimensional)
-      - z: Implicit rejection seed (32 bytes)
-      
-    IMPORTANT: s is generated from TRUE RANDOMNESS, NOT from any seed!
-    """
-    s: np.ndarray   # (n,) secret vector - TRUE RANDOM!
-    z: bytes        # implicit rejection seed
-
-
-@dataclass
-class LWECiphertext:
-    """
-    LWE ciphertext: (u, v)
-    
-    Wire format (uint32 little-endian):
-      - u: n×4 bytes
-      - v: msg_bits×4 bytes
-    
-    Internal representation uses int64 for computation headroom.
-    """
-    u: np.ndarray  # (n,) vector, int64 internally
-    v: np.ndarray  # (msg_bits,) vector, int64 internally
-    
-    def to_bytes(self) -> bytes:
-        """Serialize to wire format (uint32 little-endian)."""
-        return (
-            struct.pack(">II", len(self.u), len(self.v)) +
-            self.u.astype("<u4").tobytes() +
-            self.v.astype("<u4").tobytes()
-        )
-    
-    @classmethod
-    def from_bytes(cls, data: bytes) -> "LWECiphertext":
-        """Deserialize from wire format with input validation."""
-        if len(data) < 8:
-            raise ValueError(f"LWECiphertext too short: {len(data)} < 8 bytes")
-        
-        u_len, v_len = struct.unpack(">II", data[:8])
-        expected_size = 8 + u_len * 4 + v_len * 4
-        
-        if len(data) < expected_size:
-            raise ValueError(f"LWECiphertext truncated: {len(data)} < {expected_size}")
-        
-        offset = 8
-        u = np.frombuffer(data[offset:offset + u_len * 4], dtype="<u4").astype(np.int64).copy()
-        offset += u_len * 4
-        
-        v = np.frombuffer(data[offset:offset + v_len * 4], dtype="<u4").astype(np.int64).copy()
-        
-        return cls(u=u, v=v)
-    
-    def wire_size(self) -> int:
-        """Get wire format size in bytes."""
-        return 8 + len(self.u) * 4 + len(self.v) * 4
-
-
-@dataclass
-class FullCiphertext:
-    """
-    Hybrid ciphertext: KEM ciphertext + DEM ciphertext.
-    
-    Wire format:
-      - kem_ct: LWECiphertext wire format (8B header + u + v as uint32)
-      - nonce: 12 bytes (AEAD nonce)
-      - ct_len: 4 bytes (BE)
-      - ct: DEM ciphertext body
-      - tag: 16 bytes (AEAD tag)
-    
-    Note: KEM portion uses same wire format as LWECiphertext for consistency.
-    """
-    u: np.ndarray
-    v: np.ndarray
-    nonce: bytes
-    ct: bytes
-    tag: bytes
-    
-    def to_bytes(self) -> bytes:
-        """Serialize to bytes (KEM portion uses LWECiphertext wire format)."""
-        # Use LWECiphertext wire format for consistency
-        kem_ct = LWECiphertext(u=self.u, v=self.v)
-        kem_wire = kem_ct.to_bytes()
-        
-        return (
-            kem_wire +
-            self.nonce +
-            struct.pack(">I", len(self.ct)) +
-            self.ct +
-            self.tag
-        )
-    
-    @classmethod
-    def from_bytes(cls, data: bytes) -> "FullCiphertext":
-        """Deserialize from bytes with input validation."""
-        # Minimum: KEM header (8B) + nonce (12B) + ct_len (4B) + tag (16B) = 40B
-        if len(data) < 40:
-            raise ValueError(f"FullCiphertext too short: {len(data)} < 40 bytes")
-        
-        # Parse KEM portion using LWECiphertext format
-        u_len, v_len = struct.unpack(">II", data[:8])
-        kem_size = 8 + u_len * 4 + v_len * 4
-        
-        if kem_size > len(data):
-            raise ValueError(f"Invalid KEM size: {kem_size} > {len(data)}")
-        
-        kem_ct = LWECiphertext.from_bytes(data[:kem_size])
-        offset = kem_size
-        
-        # Validate remaining length for nonce + ct_len header
-        if offset + 16 > len(data):  # 12 (nonce) + 4 (ct_len)
-            raise ValueError(f"Truncated after KEM: offset {offset}, len {len(data)}")
-        
-        nonce = data[offset:offset+12]
-        offset += 12
-        
-        ct_len = struct.unpack(">I", data[offset:offset+4])[0]
-        offset += 4
-        
-        # Validate ct + tag length
-        if offset + ct_len + 16 > len(data):
-            raise ValueError(f"Truncated ciphertext: need {offset + ct_len + 16}, have {len(data)}")
-        
-        ct = data[offset:offset+ct_len]
-        offset += ct_len
-        
-        tag = data[offset:offset+16]
-        
-        return cls(u=kem_ct.u, v=kem_ct.v, nonce=nonce, ct=ct, tag=tag)
 
 
 # =============================================================================
