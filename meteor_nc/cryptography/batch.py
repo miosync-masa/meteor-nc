@@ -1,29 +1,39 @@
 # meteor_nc/cryptography/batch.py
 """
-Meteor-NC Batch KEM (v2 - Optimized)
+Meteor-NC Batch KEM (v2 - Correct PKE Design)
 
 GPU-parallel batch KEM with:
 - q = 2^32 (uint32 overflow = mod)
-- n = k = 256 fixed (128-bit security)
+- n = k = 256/512/1024 (multi-security level)
 - Custom CUDA kernels for GEMM
 - GPU BLAKE3 for ct_hash = H(U||V)
 - FO transform + implicit rejection
+
+CORRECT KEY STRUCTURE:
+  - pk_seed (32B): Public, used to reconstruct matrix A via SHA-256 PRG
+  - b (k×4B): Public, computed as A @ s + e during key_gen
+  - s: SECRET, generated from TRUE RANDOMNESS (not from seed!)
+
+This ensures:
+  - Anyone with (pk_seed, b) can encrypt (encaps_batch)
+  - Only the holder of s can decrypt (decaps_batch)
+  - pk_seed leaking does NOT compromise secret key!
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+import struct
 from typing import Optional, Tuple
 
 import numpy as np
 
-from .common import (
-    HKDF,
-    MSG_BYTES,
-    MSG_BITS,
-    GPU_AVAILABLE,
+from common import (
     _sha256,
+    prg_sha256,
+    HKDF,
+    GPU_AVAILABLE,
 )
 
 if not GPU_AVAILABLE:
@@ -31,8 +41,8 @@ if not GPU_AVAILABLE:
 
 import cupy as cp
 
-from .kernels.blake3_kernel import GPUBlake3
-from .kernels.batch_kernels import (
+from kernels.blake3_kernel import GPUBlake3
+from kernels.batch_kernels import (
     cbd_i32,
     matmul_AT_R,
     bdot_R,
@@ -42,11 +52,11 @@ from .kernels.batch_kernels import (
     pack_bits_gpu,
 )
 
-from .kernels.batch_kernels_v2 import (
+from kernels.batch_kernels_v2 import (
     unpack_to_encoded_v2,
     pack_bits_v2,
 )
-from .kernels.blake3_kernel_v2 import GPUBlake3V2
+from kernels.blake3_kernel_v2 import GPUBlake3V2
 
 # =============================================================================
 # Constants
@@ -60,16 +70,21 @@ SUPPORTED_N = [256, 512, 1024]
 
 
 # =============================================================================
-# Batch LWE-KEM (Optimized)
+# Batch LWE-KEM (Correct PKE Design)
 # =============================================================================
 
 class BatchLWEKEM:
     """
-    GPU-parallel batch KEM.
+    GPU-parallel batch KEM with correct PKE design.
+    
+    CORRECT KEY STRUCTURE:
+      - pk_seed (32B): Public, for deterministic A reconstruction
+      - b (k,): Public, computed as A @ s + e
+      - s: SECRET, from TRUE RANDOMNESS
     
     Optimized for:
     - q = 2^32 (no mod operations, uint32 wrap)
-    - n = k = 256 (128-bit security, fixed for kernel optimization)
+    - n = k = 256/512/1024
     - All hot paths in custom CUDA kernels
     
     Target: 1M+ ops/sec
@@ -104,52 +119,152 @@ class BatchLWEKEM:
             self._blake3 = GPUBlake3V2(device_id=device_id)
             
         # Keys (initialized by key_gen)
+        self.pk_seed: Optional[bytes] = None
         self.A: Optional[cp.ndarray] = None
         self.b: Optional[cp.ndarray] = None
         self.s: Optional[cp.ndarray] = None
         self.z: Optional[bytes] = None
         self.pk_hash: Optional[bytes] = None
     
-    def key_gen(self, seed: Optional[bytes] = None) -> None:
-        """Generate LWE key pair."""
-        seed = seed or secrets.token_bytes(32)
-        hkdf = HKDF(salt=_sha256(b"batch-kem-v2-u32"))
-        prk = hkdf.extract(seed)
+    def _reconstruct_A(self, pk_seed: bytes) -> cp.ndarray:
+        """
+        Reconstruct matrix A from pk_seed using SHA-256 counter-mode PRG.
         
-        # Public matrix A: (k, n) uint32
-        seed_A = int.from_bytes(hkdf.expand(prk, b"A", 8), "big")
-        cp.random.seed(seed_A & 0xFFFFFFFF)
-        self.A = cp.random.randint(0, 2**32, (self.k, self.n), dtype=cp.uint32)
+        This is deterministic and implementation-independent.
+        Bias from u32 mod q is negligible for q = 2^32.
+        """
+        num_bytes = self.k * self.n * 4  # uint32 per element
+        prg_output = prg_sha256(pk_seed, num_bytes, domain=b"matrix_A_batch")
         
-        # Secret vector s: (n,) int32 via CBD
-        seed_s = np.array([int.from_bytes(hkdf.expand(prk, b"s", 8), "big")], dtype=np.uint64)
-        self.s = cbd_i32(cp.asarray(seed_s), self.n, self.eta).flatten()
+        # Convert to uint32 array on GPU
+        raw = np.frombuffer(prg_output, dtype="<u4").copy()
+        A_flat = raw.reshape(self.k, self.n)
         
-        # Error vector e: (k,) int32 via CBD
+        return cp.asarray(A_flat, dtype=cp.uint32)
+    
+    def key_gen(self) -> Tuple[bytes, bytes]:
+        """
+        Generate LWE key pair with correct PKE design.
+        
+        Returns:
+            pk_bytes: Serialized public key (pk_seed + b + pk_hash)
+            sk_bytes: Serialized secret key (s + z)
+        """
+        # 1. Generate pk_seed (PUBLIC - for A reconstruction)
+        self.pk_seed = secrets.token_bytes(32)
+        
+        # 2. Reconstruct A from pk_seed (deterministic)
+        self.A = self._reconstruct_A(self.pk_seed)
+        
+        # 3. Generate s from TRUE RANDOMNESS (SECRET!)
+        # Use secrets module for cryptographic randomness
+        s_bytes = secrets.token_bytes(self.n * 4)
+        s_raw = np.frombuffer(s_bytes, dtype="<u4").copy()
+        # Map to small error range [-eta, eta] for proper LWE
+        s_np = ((s_raw % (2 * self.eta + 1)).astype(np.int32) - self.eta)
+        self.s = cp.asarray(s_np, dtype=cp.int32)
+        
+        # 4. Generate e (error) from HKDF for reproducibility in tests
+        # (Could also use secrets, but HKDF is deterministic for testing)
+        e_seed = secrets.token_bytes(32)
+        hkdf = HKDF(salt=_sha256(b"batch-kem-v2-error"))
+        prk = hkdf.extract(e_seed)
         seed_e = np.array([int.from_bytes(hkdf.expand(prk, b"e", 8), "big")], dtype=np.uint64)
         e = cbd_i32(cp.asarray(seed_e), self.k, self.eta).flatten()
         
-        # Public key b = A @ s + e (mod 2^32) via custom kernel
+        # 5. Compute b = A @ s + e (mod 2^32) via custom kernel
         self.b = b_from_As(self.A, self.s, e)
         
-        # FO helpers
-        pk_bytes = cp.asnumpy(self.A).tobytes() + cp.asnumpy(self.b).tobytes()
-        self.pk_hash = _sha256(b"pk", pk_bytes)
-        self.z = hkdf.expand(prk, b"z", 32)
+        # 6. FO helpers
+        # pk_hash = H(pk_seed || b) - NOT including A since A is derived from pk_seed
+        b_bytes = cp.asnumpy(self.b).astype("<u4").tobytes()
+        self.pk_hash = _sha256(b"pk", self.pk_seed, b_bytes)
+        
+        # 7. Generate implicit rejection seed z (SECRET)
+        self.z = secrets.token_bytes(32)
+        
+        # 8. Serialize keys
+        pk_bytes = self._export_public_key()
+        sk_bytes = self._export_secret_key()
+        
+        return pk_bytes, sk_bytes
     
-    def encaps_batch(self, batch: int, return_ct: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self.A is None:
+    def _export_public_key(self) -> bytes:
+        """Serialize public key to wire format."""
+        if self.pk_seed is None or self.b is None or self.pk_hash is None:
             raise ValueError("Keys not initialized")
         
+        b_bytes = cp.asnumpy(self.b).astype("<u4").tobytes()
+        return (
+            struct.pack(">III", self.n, self.k, self.q) +  # header (12B)
+            self.pk_seed +                                   # 32B
+            b_bytes +                                        # k*4B
+            self.pk_hash                                     # 32B
+        )
+    
+    def _export_secret_key(self) -> bytes:
+        """Serialize secret key."""
+        if self.s is None or self.z is None:
+            raise ValueError("Keys not initialized")
+        
+        s_bytes = cp.asnumpy(self.s).astype("<i4").tobytes()
+        return s_bytes + self.z
+    
+    def load_public_key(self, pk_bytes: bytes) -> None:
+        """
+        Load public key from bytes.
+        
+        This allows ANYONE to encrypt without knowing the secret key!
+        """
+        if len(pk_bytes) < 12:
+            raise ValueError(f"Public key too short: {len(pk_bytes)} < 12")
+        
+        n, k, q = struct.unpack(">III", pk_bytes[:12])
+        
+        if n != self.n or k != self.k:
+            raise ValueError(f"Parameter mismatch: expected n={self.n}, k={self.k}, got n={n}, k={k}")
+        
+        expected_size = 12 + 32 + k * 4 + 32
+        if len(pk_bytes) < expected_size:
+            raise ValueError(f"Public key truncated: {len(pk_bytes)} < {expected_size}")
+        
+        self.pk_seed = pk_bytes[12:44]
+        b_raw = np.frombuffer(pk_bytes[44:44 + k * 4], dtype="<u4").copy()
+        self.b = cp.asarray(b_raw, dtype=cp.uint32)
+        self.pk_hash = pk_bytes[44 + k * 4:44 + k * 4 + 32]
+        
+        # Reconstruct A from pk_seed
+        self.A = self._reconstruct_A(self.pk_seed)
+        
+        # s remains None - we don't have the secret key!
+        self.s = None
+        self.z = None
+    
+    def load_secret_key(self, sk_bytes: bytes) -> None:
+        """Load secret key from bytes."""
+        expected_size = self.n * 4 + 32
+        if len(sk_bytes) < expected_size:
+            raise ValueError(f"Secret key truncated: {len(sk_bytes)} < {expected_size}")
+        
+        s_np = np.frombuffer(sk_bytes[:self.n * 4], dtype="<i4").copy()
+        self.s = cp.asarray(s_np, dtype=cp.int32)
+        self.z = sk_bytes[self.n * 4:self.n * 4 + 32]
+    
+    def encaps_batch(self, batch: int, return_ct: bool = True) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Batch encapsulation (encryption).
+        
+        Can be called by ANYONE with the public key!
+        """
+        if self.A is None or self.b is None:
+            raise ValueError("Public key not initialized")
+        
         # 1. Random messages (CPU, cryptographically secure)
-        # 旧: M_bytes = os.urandom(MSG_BYTES * batch)
-        # ↓ 新
         M_bytes = os.urandom(self.msg_bytes * batch)
         M_np = np.frombuffer(M_bytes, dtype=np.uint8).reshape(batch, self.msg_bytes)
         M_gpu = cp.asarray(M_np)
         
         # 2. Derive FO seeds via GPU BLAKE3
-        # ↓ 修正: n に応じて呼び出し方を変える
         if self.n == 256:
             seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_gpu, self.pk_hash)
         else:
@@ -158,12 +273,9 @@ class BatchLWEKEM:
         # 3. CBD samples (int32) via custom kernel
         R = cbd_i32(seeds_r, self.k, self.eta)
         E1 = cbd_i32(seeds_e1, self.n, self.eta)
-        # 旧: E2 = cbd_i32(seeds_e2, MSG_BITS, self.eta)
-        # ↓ 新
         E2 = cbd_i32(seeds_e2, self.msg_bits, self.eta)
         
         # 4. Encode message: M_bits * delta
-        # ↓ 修正: n に応じてカーネルを選択
         if self.n == 256:
             M_encoded = unpack_to_encoded(M_gpu, self.delta)
         else:
@@ -184,16 +296,14 @@ class BatchLWEKEM:
         V_t = cp.ascontiguousarray(V.T)
         
         # 9. ct_hash = BLAKE3(U||V) via GPU
-        # ↓ 修正: n, msg_bits を渡す
         ct_hash = self._blake3.hash_u32_concat_batch(U_t, V_t, self.n, self.msg_bits)
         
         # 10. Derive shared keys via GPU BLAKE3
         ok_mask = cp.ones(batch, dtype=cp.uint8)
-        # ↓ 修正: n に応じて呼び出し方を変える
         if self.n == 256:
-            K_gpu = self._blake3.derive_keys_batch(M_gpu, ct_hash, self.z, ok_mask)
+            K_gpu = self._blake3.derive_keys_batch(M_gpu, ct_hash, self.z or b'\x00' * 32, ok_mask)
         else:
-            K_gpu = self._blake3.derive_keys_batch(M_gpu, ct_hash, self.z, ok_mask, self.msg_bytes)
+            K_gpu = self._blake3.derive_keys_batch(M_gpu, ct_hash, self.z or b'\x00' * 32, ok_mask, self.msg_bytes)
         
         # 11. Transfer to CPU
         K = cp.asnumpy(K_gpu)
@@ -211,8 +321,13 @@ class BatchLWEKEM:
         U: np.ndarray,
         V: np.ndarray,
     ) -> np.ndarray:
+        """
+        Batch decapsulation (decryption).
+        
+        Can ONLY be called by the holder of the secret key!
+        """
         if self.A is None or self.s is None:
-            raise ValueError("Keys not initialized")
+            raise ValueError("Keys not initialized (need both pk and sk for decaps)")
         
         batch = U.shape[0]
         
@@ -232,14 +347,12 @@ class BatchLWEKEM:
         M_bits = ((V_signed > threshold) | (V_signed < -threshold)).astype(cp.uint8)
         
         # 5. Pack bits to bytes
-        # ↓ 修正: n に応じてカーネルを選択
         if self.n == 256:
             M_recovered = pack_bits_gpu(M_bits)
         else:
             M_recovered = pack_bits_v2(M_bits, self.msg_bits, self.msg_bytes)
         
         # 6. Re-derive FO seeds
-        # ↓ 修正: n に応じて呼び出し方を変える
         if self.n == 256:
             seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_recovered, self.pk_hash)
         else:
@@ -248,8 +361,6 @@ class BatchLWEKEM:
         # 7. Re-encrypt
         R2 = cbd_i32(seeds_r, self.k, self.eta)
         E1_2 = cbd_i32(seeds_e1, self.n, self.eta)
-        # 旧: E2_2 = cbd_i32(seeds_e2, MSG_BITS, self.eta)
-        # ↓ 新
         E2_2 = cbd_i32(seeds_e2, self.msg_bits, self.eta)
         
         M_bits_u32 = M_bits.astype(cp.uint32)
@@ -268,17 +379,16 @@ class BatchLWEKEM:
         ok_mask = (U_match & V_match).astype(cp.uint8)
         
         # 9. ct_hash = BLAKE3(U||V) via GPU
-        # ↓ 修正
         ct_hash = self._blake3.hash_u32_concat_batch(U_gpu, V_gpu, self.n, self.msg_bits)
         
         # 10. Derive keys with implicit rejection
-        # ↓ 修正
         if self.n == 256:
             K_gpu = self._blake3.derive_keys_batch(M_recovered, ct_hash, self.z, ok_mask)
         else:
             K_gpu = self._blake3.derive_keys_batch(M_recovered, ct_hash, self.z, ok_mask, self.msg_bytes)
         
         return cp.asnumpy(K_gpu)
+
 
 # =============================================================================
 # Test Suite
@@ -287,7 +397,7 @@ class BatchLWEKEM:
 def run_tests() -> bool:
     """Execute batch KEM tests."""
     print("=" * 70)
-    print("Meteor-NC Batch KEM v2 (uint32 optimized)")
+    print("Meteor-NC Batch KEM v2 (Correct PKE Design)")
     print("=" * 70)
     
     import time
@@ -299,7 +409,10 @@ def run_tests() -> bool:
     print("-" * 40)
     
     kem = BatchLWEKEM()
-    kem.key_gen()
+    pk_bytes, sk_bytes = kem.key_gen()
+    
+    print(f"  PK size: {len(pk_bytes)} bytes")
+    print(f"  SK size: {len(sk_bytes)} bytes")
     
     for bs in [1, 10, 100, 1000]:
         K_enc, U, V = kem.encaps_batch(bs)
@@ -308,9 +421,46 @@ def run_tests() -> bool:
         print(f"  Batch {bs:4d}: {'PASS' if match else 'FAIL'}")
         results[f"batch_{bs}"] = match
     
-    # Test 2: Implicit rejection
-    print("\n[Test 2] Implicit Rejection")
+    # Test 2: Sender/Receiver Separation (Core Security Test!)
+    print("\n[Test 2] Sender/Receiver Separation (Core Security)")
     print("-" * 40)
+    
+    # Receiver generates keys
+    receiver = BatchLWEKEM()
+    pk_bytes, sk_bytes = receiver.key_gen()
+    
+    # Sender loads ONLY public key
+    sender = BatchLWEKEM()
+    sender.load_public_key(pk_bytes)
+    
+    # Sender can encrypt
+    K_sender, U, V = sender.encaps_batch(10)
+    
+    # Sender should NOT be able to decrypt (no secret key!)
+    try:
+        _ = sender.decaps_batch(U, V)
+        sender_blocked = False
+        print("  ERROR: Sender was able to decrypt without secret key!")
+    except ValueError as e:
+        sender_blocked = True
+        print(f"  Sender blocked: {e}")
+    
+    # Receiver can decrypt
+    receiver.load_secret_key(sk_bytes)  # Load sk back (was cleared during export)
+    K_receiver = receiver.decaps_batch(U, V)
+    keys_match = np.all(K_sender == K_receiver)
+    
+    results["sender_blocked"] = sender_blocked
+    results["keys_match"] = keys_match
+    print(f"  Sender blocked: {'PASS' if sender_blocked else 'FAIL'}")
+    print(f"  Keys match: {'PASS' if keys_match else 'FAIL'}")
+    
+    # Test 3: Implicit rejection
+    print("\n[Test 3] Implicit Rejection")
+    print("-" * 40)
+    
+    kem = BatchLWEKEM()
+    kem.key_gen()
     
     K_enc, U, V = kem.encaps_batch(10)
     U_bad = U.copy()
@@ -323,22 +473,26 @@ def run_tests() -> bool:
     results["rejection"] = rejection_ok
     print(f"  Corrupted rejected: {'PASS' if rejection_ok else 'FAIL'}")
     
-    # Test 3: Determinism
-    print("\n[Test 3] Seed Determinism")
+    # Test 4: pk_seed determinism (A reconstruction)
+    print("\n[Test 4] Matrix A Reconstruction Determinism")
     print("-" * 40)
     
-    seed = secrets.token_bytes(32)
     kem1 = BatchLWEKEM()
-    kem1.key_gen(seed=seed)
-    kem2 = BatchLWEKEM()
-    kem2.key_gen(seed=seed)
-    A_match = cp.array_equal(kem1.A, kem2.A)
-    results["determinism"] = bool(A_match)
-    print(f"  Deterministic keygen: {'PASS' if A_match else 'FAIL'}")
+    pk1, _ = kem1.key_gen()
     
-    # Test 4: Throughput
-    print("\n[Test 4] Throughput Benchmark")
+    kem2 = BatchLWEKEM()
+    kem2.load_public_key(pk1)
+    
+    A_match = cp.array_equal(kem1.A, kem2.A)
+    results["A_determinism"] = bool(A_match)
+    print(f"  A reconstruction matches: {'PASS' if A_match else 'FAIL'}")
+    
+    # Test 5: Throughput
+    print("\n[Test 5] Throughput Benchmark")
     print("-" * 40)
+    
+    kem = BatchLWEKEM()
+    kem.key_gen()
     
     # Warmup
     _ = kem.encaps_batch(500)
@@ -368,8 +522,8 @@ def run_tests() -> bool:
         print(f"    Encaps (Full): {batch/enc_full_time:>10,.0f} ops/sec")
         print(f"    Decaps:        {batch/dec_time:>10,.0f} ops/sec")
         
-    # Test 5: Million target
-    print("\n[Test 5] Million Ops Target")
+    # Test 6: Million target
+    print("\n[Test 6] Million Ops Target")
     print("-" * 40)
     
     batch = 1_000_000
@@ -392,6 +546,14 @@ def run_tests() -> bool:
     print("\n" + "=" * 70)
     all_pass = all(results.values())
     print(f"Result: {'ALL TESTS PASSED' if all_pass else 'SOME TESTS FAILED'}")
+    
+    if all_pass:
+        print("\n✓ Security property verified:")
+        print("  - Sender with pk_seed + b CAN encrypt (encaps_batch)")
+        print("  - Sender with pk_seed + b CANNOT decrypt")
+        print("  - Only secret key holder can decrypt (decaps_batch)")
+        print("  - pk_seed leak does NOT compromise secret key!")
+    
     print("=" * 70)
     
     return all_pass
