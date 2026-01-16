@@ -9,6 +9,8 @@ Categories:
   A3. Security-in-practice
   A4. Reproducibility
   A5. Performance
+
+Updated for Meteor-NC v2.0 (pk_seed-based public key structure)
 """
 
 import secrets
@@ -21,13 +23,12 @@ import sys
 sys.path.insert(0, '/content/meteor-nc')
 
 from meteor_nc.cryptography.common import (
-    Q_DEFAULT, MSG_BYTES, MSG_BITS, _sha256, _ct_eq,
+    Q_DEFAULT, SECURITY_PARAMS, _sha256, _ct_eq,
     GPU_AVAILABLE, CRYPTO_AVAILABLE,
+    LWEPublicKey, LWESecretKey, LWECiphertext, FullCiphertext,
 )
 from meteor_nc.cryptography.core import (
     LWEKEM, HybridKEM, SymmetricMixer,
-    LWECiphertext, FullCiphertext,
-    LWEPublicKey, LWESecretKey,
 )
 
 # =============================================================================
@@ -474,6 +475,11 @@ def test_a3_3_ct_eq_correctness() -> Dict:
 def test_a4_1_seed_determinism() -> Dict:
     """
     A4.1: Seed determinism (same seed → same keys)
+    
+    Updated for pk_seed-based structure:
+    - Same seed → same pk_seed
+    - Same seed → same b vector
+    - Same seed → same pk_hash
     """
     print("\n[A4.1] Seed Determinism")
     print("-" * 50)
@@ -485,23 +491,13 @@ def test_a4_1_seed_determinism() -> Dict:
         
         # Create two instances with same seed
         kem1 = LWEKEM(n=256, gpu=GPU_AVAILABLE, seed=seed)
-        kem1.key_gen()
+        pk1_bytes, sk1_bytes = kem1.key_gen()
         
         kem2 = LWEKEM(n=256, gpu=GPU_AVAILABLE, seed=seed)
-        kem2.key_gen()
+        pk2_bytes, sk2_bytes = kem2.key_gen()
         
-        # Convert to numpy for comparison
-        if GPU_AVAILABLE:
-            import cupy as cp
-            A1 = cp.asnumpy(kem1.pk.A)
-            A2 = cp.asnumpy(kem2.pk.A)
-            b1 = cp.asnumpy(kem1.pk.b)
-            b2 = cp.asnumpy(kem2.pk.b)
-        else:
-            A1, A2 = kem1.pk.A, kem2.pk.A
-            b1, b2 = kem1.pk.b, kem2.pk.b
-        
-        if np.array_equal(A1, A2) and np.array_equal(b1, b2):
+        # Compare serialized keys (most robust check)
+        if pk1_bytes == pk2_bytes and sk1_bytes == sk2_bytes:
             results['pass'] += 1
         else:
             results['fail'] += 1
@@ -752,11 +748,11 @@ def test_b2_cca_reencrypt_check(iterations: int = 100) -> Dict:
 
 def test_b3_cpu_gpu_equivalence() -> Dict:
     """
-    B3: Backend determinism + CPU/GPU interop (key injection)
+    B3: Backend determinism + CPU/GPU interop
 
-    B3.1: CPU deterministic (same seed -> same (A,b))
-    B3.2: GPU deterministic (same seed -> same (A,b))
-    B3.3: Interop (GPU key -> CPU decaps) with identical injected key
+    B3.1: CPU deterministic (same seed -> same pk_bytes)
+    B3.2: GPU deterministic (same seed -> same pk_bytes)
+    B3.3: Interop (GPU encrypt -> CPU decrypt via serialization)
     """
     print("\n[B3] CPU/GPU Equivalence")
     print("-" * 50)
@@ -764,9 +760,6 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
     if not GPU_AVAILABLE:
         print("  SKIPPED: GPU not available")
         return {'passed': True, 'skipped': True}
-
-    import cupy as cp
-    from meteor_nc.cryptography.core import LWEPublicKey, LWESecretKey, LWECiphertext
 
     trials = 50
     results = {'b3_1': 0, 'b3_2': 0, 'b3_3': 0, 'total': trials}
@@ -777,12 +770,12 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
         # -------------------------
         seed = secrets.token_bytes(32)
         kem_cpu1 = LWEKEM(n=256, gpu=False, seed=seed)
-        kem_cpu1.key_gen()
+        pk1_bytes, sk1_bytes = kem_cpu1.key_gen()
+        
         kem_cpu2 = LWEKEM(n=256, gpu=False, seed=seed)
-        kem_cpu2.key_gen()
+        pk2_bytes, sk2_bytes = kem_cpu2.key_gen()
 
-        if (np.array_equal(kem_cpu1.pk.A, kem_cpu2.pk.A) and 
-            np.array_equal(kem_cpu1.pk.b, kem_cpu2.pk.b)):
+        if pk1_bytes == pk2_bytes and sk1_bytes == sk2_bytes:
             results['b3_1'] += 1
 
         # -------------------------
@@ -790,48 +783,32 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
         # -------------------------
         seed_gpu = secrets.token_bytes(32)
         kem_gpu1 = LWEKEM(n=256, gpu=True, seed=seed_gpu)
-        kem_gpu1.key_gen()
+        pk1_gpu, sk1_gpu = kem_gpu1.key_gen()
+        
         kem_gpu2 = LWEKEM(n=256, gpu=True, seed=seed_gpu)
-        kem_gpu2.key_gen()
+        pk2_gpu, sk2_gpu = kem_gpu2.key_gen()
 
-        A1 = cp.asnumpy(kem_gpu1.pk.A)
-        A2 = cp.asnumpy(kem_gpu2.pk.A)
-        b1 = cp.asnumpy(kem_gpu1.pk.b)
-        b2 = cp.asnumpy(kem_gpu2.pk.b)
-
-        if np.array_equal(A1, A2) and np.array_equal(b1, b2):
+        if pk1_gpu == pk2_gpu and sk1_gpu == sk2_gpu:
             results['b3_2'] += 1
 
         # -------------------------
-        # B3.3 Interop: GPU key -> CPU decaps
+        # B3.3 Interop: GPU encrypt -> CPU decrypt via serialization
         # -------------------------
         kem_gpu = LWEKEM(n=256, gpu=True)
-        kem_gpu.key_gen()
+        pk_bytes, sk_bytes = kem_gpu.key_gen()
 
         # GPU encaps
         K_good, ct = kem_gpu.encaps()
+        ct_bytes = ct.to_bytes()
 
-        # Export GPU key material to NumPy
-        A_np = cp.asnumpy(kem_gpu.pk.A).astype(np.int64)
-        b_np = cp.asnumpy(kem_gpu.pk.b).astype(np.int64)
-        s_np = cp.asnumpy(kem_gpu.sk.s).astype(np.int64)
-        pk_hash = kem_gpu.pk.pk_hash
-        z = kem_gpu.sk.z
-
-        # Create CPU instance with injected keys
+        # CPU instance loads serialized keys
         kem_cpu = LWEKEM(n=256, gpu=False)
-        kem_cpu.pk = LWEPublicKey(A=A_np, b=b_np, pk_hash=pk_hash)
-        kem_cpu.sk = LWESecretKey(s=s_np, z=z)
-        kem_cpu.q = kem_gpu.q
-        kem_cpu.delta = kem_gpu.delta
+        kem_cpu.load_public_key(pk_bytes)
+        kem_cpu.load_secret_key(sk_bytes)
 
-        # Convert CT from CuPy to NumPy
-        u_np = cp.asnumpy(ct.u).astype(np.int64)
-        v_np = cp.asnumpy(ct.v).astype(np.int64)
-        ct_cpu = LWECiphertext(u=u_np, v=v_np)
-
-        # CPU decaps
-        K_dec = kem_cpu.decaps(ct_cpu)
+        # Deserialize CT and decaps
+        ct_restored = LWECiphertext.from_bytes(ct_bytes)
+        K_dec = kem_cpu.decaps(ct_restored)
 
         if K_good == K_dec:
             results['b3_3'] += 1
@@ -845,7 +822,6 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
     print(f"  B3.1 (CPU deterministic): {results['b3_1']}/{trials}")
     print(f"  B3.2 (GPU deterministic): {results['b3_2']}/{trials}")
     print(f"  B3.3 (interop GPU->CPU):  {results['b3_3']}/{trials}")
-    print("  Note: PRNG output-equivalence not required; interop ensured by deterministic CBD.")
     print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
 
     return results
@@ -928,21 +904,19 @@ def test_d3_kem_dem_integration(chunks: int = 100) -> Dict:
     
     results = {'d3_1': True, 'd3_2': True}
     
-    # Setup KEM
-    kem_alice = LWEKEM(n=256, gpu=GPU_AVAILABLE)
-    kem_alice.key_gen()
+    # Setup KEM - sender and receiver
+    kem_receiver = LWEKEM(n=256, gpu=GPU_AVAILABLE)
+    pk_bytes, sk_bytes = kem_receiver.key_gen()
     
-    kem_bob = LWEKEM(n=256, gpu=GPU_AVAILABLE)
-    kem_bob.pk = kem_alice.pk
-    kem_bob.sk = kem_alice.sk
-    kem_bob.delta = kem_alice.delta
-    kem_bob.q = kem_alice.q
+    # Sender loads public key
+    kem_sender = LWEKEM(n=256, gpu=GPU_AVAILABLE)
+    kem_sender.load_public_key(pk_bytes)
     
     # D3.1: Normal flow
     print("  D3.1: Normal KEM → DEM flow...")
     
-    K, ct = kem_bob.encaps()
-    K_dec = kem_alice.decaps(ct)
+    K, ct = kem_sender.encaps()
+    K_dec = kem_receiver.decaps(ct)
     
     if K != K_dec:
         results['d3_1'] = False
@@ -972,13 +946,13 @@ def test_d3_kem_dem_integration(chunks: int = 100) -> Dict:
     # D3.2: Tampered KEM CT → different session key → decrypt fails
     print("  D3.2: Tampered KEM CT...")
     
-    K_good, ct = kem_bob.encaps()
+    K_good, ct = kem_sender.encaps()
     
     # Tamper CT
     ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
     ct_bad.u[0] ^= 1
     
-    K_bad = kem_alice.decaps(ct_bad)
+    K_bad = kem_receiver.decaps(ct_bad)
     
     if K_bad == K_good:
         results['d3_2'] = False
@@ -1165,6 +1139,7 @@ def test_e2_negative_comprehensive() -> Dict:
     
     return results
 
+
 def test_e3_serialization_roundtrip() -> Dict:
     """
     E3: Serialization compatibility
@@ -1182,8 +1157,7 @@ def test_e3_serialization_roundtrip() -> Dict:
     print("  E3.1: Basic serialization...")
     try:
         hybrid = HybridKEM(security_level=128, gpu=GPU_AVAILABLE)
-        hybrid.key_gen()
-        n = hybrid.kem.n  # Get n for deserialization
+        pk_bytes, sk_bytes = hybrid.key_gen()
         
         plaintext = b"Test message for serialization"
         ct = hybrid.encrypt(plaintext)
@@ -1191,8 +1165,8 @@ def test_e3_serialization_roundtrip() -> Dict:
         # Serialize
         ct_bytes = ct.to_bytes()
         
-        # Deserialize with n
-        ct_restored = FullCiphertext.from_bytes(ct_bytes, n=n)
+        # Deserialize
+        ct_restored = FullCiphertext.from_bytes(ct_bytes)
         
         # Decrypt
         recovered = hybrid.decrypt(ct_restored)
@@ -1216,7 +1190,7 @@ def test_e3_serialization_roundtrip() -> Dict:
             plaintext = secrets.token_bytes(size) if size > 0 else b""
             ct = hybrid.encrypt(plaintext)
             ct_bytes = ct.to_bytes()
-            ct_restored = FullCiphertext.from_bytes(ct_bytes, n=n)
+            ct_restored = FullCiphertext.from_bytes(ct_bytes)
             recovered = hybrid.decrypt(ct_restored)
             
             if plaintext != recovered:
@@ -1232,36 +1206,22 @@ def test_e3_serialization_roundtrip() -> Dict:
     else:
         results['fail'] += 1
     
-    # Test 3: Cross-platform (GPU → CPU)
+    # Test 3: Cross-platform (GPU → CPU via serialization)
     print("  E3.3: Cross-platform (GPU → CPU)...")
     if GPU_AVAILABLE:
         try:
-            import cupy as cp
-            
             hybrid_gpu = HybridKEM(security_level=128, gpu=True)
-            hybrid_gpu.key_gen()
-            n_gpu = hybrid_gpu.kem.n
+            pk_bytes, sk_bytes = hybrid_gpu.key_gen()
             
             plaintext = b"Cross-platform test"
             ct_gpu = hybrid_gpu.encrypt(plaintext)
             ct_bytes = ct_gpu.to_bytes()
             
-            # CPU instance with same keys
+            # CPU instance loads serialized keys
             hybrid_cpu = HybridKEM(security_level=128, gpu=False)
-            hybrid_cpu.kem.pk = LWEPublicKey(
-                A=cp.asnumpy(hybrid_gpu.kem.pk.A),
-                b=cp.asnumpy(hybrid_gpu.kem.pk.b),
-                pk_hash=hybrid_gpu.kem.pk.pk_hash
-            )
-            hybrid_cpu.kem.sk = LWESecretKey(
-                s=cp.asnumpy(hybrid_gpu.kem.sk.s),
-                z=hybrid_gpu.kem.sk.z
-            )
-            hybrid_cpu.kem.q = hybrid_gpu.kem.q
-            hybrid_cpu.kem.delta = hybrid_gpu.kem.delta
-            hybrid_cpu.mixer = hybrid_gpu.mixer
+            hybrid_cpu.load_keys(pk_bytes, sk_bytes)
             
-            ct_cpu = FullCiphertext.from_bytes(ct_bytes, n=n_gpu)
+            ct_cpu = FullCiphertext.from_bytes(ct_bytes)
             recovered = hybrid_cpu.decrypt(ct_cpu)
             
             if plaintext == recovered:
@@ -1474,18 +1434,12 @@ def run_tests_for_level(n: int, level_name: str) -> Dict:
         seed = secrets.token_bytes(32)
         
         kem1 = LWEKEM(n=n, gpu=GPU_AVAILABLE, seed=seed)
-        kem1.key_gen()
+        pk1_bytes, sk1_bytes = kem1.key_gen()
+        
         kem2 = LWEKEM(n=n, gpu=GPU_AVAILABLE, seed=seed)
-        kem2.key_gen()
+        pk2_bytes, sk2_bytes = kem2.key_gen()
         
-        if GPU_AVAILABLE:
-            import cupy as cp
-            A1 = cp.asnumpy(kem1.pk.A)
-            A2 = cp.asnumpy(kem2.pk.A)
-        else:
-            A1, A2 = kem1.pk.A, kem2.pk.A
-        
-        if np.array_equal(A1, A2):
+        if pk1_bytes == pk2_bytes and sk1_bytes == sk2_bytes:
             seed_results['pass'] += 1
         else:
             seed_results['fail'] += 1
