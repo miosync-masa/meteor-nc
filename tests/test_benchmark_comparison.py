@@ -60,11 +60,15 @@ if not KYBER_AVAILABLE:
     except ImportError:
         pass
 
-# Fallback: Try pqcrypto
+# Fallback: Try pqcrypto (all levels)
 if not KYBER_AVAILABLE:
     try:
         from pqcrypto.kem.kyber512 import generate_keypair as kyber512_keygen
         from pqcrypto.kem.kyber512 import encrypt as kyber512_enc, decrypt as kyber512_dec
+        from pqcrypto.kem.kyber768 import generate_keypair as kyber768_keygen
+        from pqcrypto.kem.kyber768 import encrypt as kyber768_enc, decrypt as kyber768_dec
+        from pqcrypto.kem.kyber1024 import generate_keypair as kyber1024_keygen
+        from pqcrypto.kem.kyber1024 import encrypt as kyber1024_enc, decrypt as kyber1024_dec
         KYBER_AVAILABLE = True
         KYBER_SOURCE = "pqcrypto"
         print("Kyber: Using pqcrypto library")
@@ -164,6 +168,14 @@ def benchmark_meteor_nc(n: int, iterations: int = BENCHMARK_ITERATIONS) -> Dict:
 
 def benchmark_kyber_pqcrypto(level: int, iterations: int = BENCHMARK_ITERATIONS) -> Dict:
     """Benchmark Kyber using pqcrypto library."""
+    # Import at function level to avoid F821 when pqcrypto not installed
+    from pqcrypto.kem.kyber512 import generate_keypair as kyber512_keygen
+    from pqcrypto.kem.kyber512 import encrypt as kyber512_enc, decrypt as kyber512_dec
+    from pqcrypto.kem.kyber768 import generate_keypair as kyber768_keygen
+    from pqcrypto.kem.kyber768 import encrypt as kyber768_enc, decrypt as kyber768_dec
+    from pqcrypto.kem.kyber1024 import generate_keypair as kyber1024_keygen
+    from pqcrypto.kem.kyber1024 import encrypt as kyber1024_enc, decrypt as kyber1024_dec
+    
     results = {
         'level': level,
         'iterations': iterations,
