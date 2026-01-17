@@ -232,55 +232,6 @@ meteor_nc/
     ├── test_batch.py    # Batch tests
     └── test_stream.py   # Stream tests
 ```
-
----
-
-## Installation
-
-```bash
-# Basic (CPU)
-pip install .
-
-# With GPU support (CUDA 12.x)
-pip install ".[gpu]"
-
-# Development
-pip install -e ".[dev]"
-```
-
-### Requirements
-
-- Python ≥ 3.8
-- NumPy ≥ 1.20
-- SciPy ≥ 1.7
-- cryptography ≥ 3.4 (AEAD)
-- CuPy ≥ 12.0 (optional, GPU)
-
----
-
-
----
-
-## Security Considerations
-
-### What We Claim
-
-- **IND-CCA2 security** under LWE assumption (via FO transform)
-- **Implicit rejection** prevents chosen-ciphertext attacks
-- **Domain-separated hashing** isolates key derivation contexts
-
-### What We Do NOT Claim
-
-- Novel hardness assumptions
-- Formal proofs beyond standard LWE reduction
-- Side-channel resistance beyond implicit rejection
-
-### Limitations
-
-1. Ciphertext size larger than ML-KEM for equivalent security
-2. GPU memory constraints for large batches at n=1024
-3. Single-threaded CPU performance slower than optimized C
-
 ---
 
 ## License
