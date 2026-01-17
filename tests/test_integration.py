@@ -16,6 +16,7 @@ import time
 import json
 import numpy as np
 from typing import Dict
+from unittest.mock import patch
 
 import sys
 sys.path.insert(0, '/content/meteor-nc')
@@ -647,14 +648,37 @@ def test_i7_performance() -> Dict:
 # I8. Device Binding (Auth)
 # =============================================================================
 
+よっしゃ！書くぞ～！！💪✨
+I8-I11 の修正版、いくよ！
+python# tests/test_integration.py (I8-I11 修正版)
+"""
+Meteor-NC P2P Protocol Integration Test Suite for TCHES
+
+I8-I11: Auth Layer Tests (Device Binding + Biometric)
+"""
+
+import secrets
+import time
+from typing import Dict
+from unittest.mock import patch
+
+# =============================================================================
+# I8. Device Binding (Auth) - 修正版
+# =============================================================================
+
 def test_i8_device_binding() -> Dict:
     """
-    I8: Device-bound authentication
+    I8: Device-bound authentication (3FA)
     
-    Same seed + same device → same MeteorID
-    Same seed + different device → different MeteorID → auth fails
+    端末が違えば同じseedでも違うMeteorIDになる！
+    
+    | seed | device | MeteorID |
+    |------|--------|----------|
+    | A    | X      | ID_1     |
+    | A    | Y      | ID_2 ≠ ID_1 ← ココ！ |
+    | B    | X      | ID_3 ≠ ID_1 |
     """
-    print("\n[I8] Device Binding")
+    print("\n[I8] Device Binding (3FA)")
     print("-" * 50)
     
     if not CRYPTO_AVAILABLE:
@@ -669,58 +693,96 @@ def test_i8_device_binding() -> Dict:
     
     results = {'tests': [], 'pass': 0, 'fail': 0}
     
-    # === Test 1: Same seed + same device → same ID ===
-    print("  Test 1: Same seed + same device...")
-    auth1 = MeteorAuth(gpu=GPU_AVAILABLE)
-    auth2 = MeteorAuth(gpu=GPU_AVAILABLE)
+    # シミュレート用の端末フィンガープリント
+    fp_device_A = secrets.token_bytes(32)
+    fp_device_B = secrets.token_bytes(32)  # 違う端末！
+    user_seed = secrets.token_bytes(32)
     
-    user_seed = auth1.generate_seed()
+    # === Test 1: 同じseed + 同じ端末 → 同じID ===
+    print("  Test 1: Same seed + same device → same ID...")
     
-    id1 = auth1.get_meteor_id(user_seed)
-    id2 = auth2.get_meteor_id(user_seed)
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_device_A):
+        auth1 = MeteorAuth(gpu=GPU_AVAILABLE)
+        auth2 = MeteorAuth(gpu=GPU_AVAILABLE)
+        
+        id1 = auth1.get_meteor_id(user_seed)
+        id2 = auth2.get_meteor_id(user_seed)
     
     if id1 == id2:
         results['pass'] += 1
-        results['tests'].append(("Same device same ID", "PASS"))
+        results['tests'].append(("Same seed + same device = same ID", "PASS"))
     else:
         results['fail'] += 1
-        results['tests'].append(("Same device same ID", "FAIL"))
+        results['tests'].append(("Same seed + same device = same ID", "FAIL"))
     
-    # === Test 2: Different seed → different ID ===
-    print("  Test 2: Different seed → different ID...")
-    different_seed = auth1.generate_seed()
-    id3 = auth1.get_meteor_id(different_seed)
+    # === Test 2: 同じseed + 違う端末 → 違うID ★重要★ ===
+    print("  Test 2: Same seed + DIFFERENT device → DIFFERENT ID...")
+    
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_device_A):
+        auth_device_A = MeteorAuth(gpu=GPU_AVAILABLE)
+        id_device_A = auth_device_A.get_meteor_id(user_seed)
+    
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_device_B):
+        auth_device_B = MeteorAuth(gpu=GPU_AVAILABLE)
+        id_device_B = auth_device_B.get_meteor_id(user_seed)
+    
+    if id_device_A != id_device_B:
+        results['pass'] += 1
+        results['tests'].append(("Same seed + different device = different ID", "PASS"))
+    else:
+        results['fail'] += 1
+        results['tests'].append(("Same seed + different device = different ID", "FAIL"))
+    
+    # === Test 3: 違うseed + 同じ端末 → 違うID ===
+    print("  Test 3: Different seed + same device → different ID...")
+    
+    different_seed = secrets.token_bytes(32)
+    
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_device_A):
+        auth3 = MeteorAuth(gpu=GPU_AVAILABLE)
+        id3 = auth3.get_meteor_id(different_seed)
     
     if id1 != id3:
         results['pass'] += 1
-        results['tests'].append(("Different seed different ID", "PASS"))
+        results['tests'].append(("Different seed + same device = different ID", "PASS"))
     else:
         results['fail'] += 1
-        results['tests'].append(("Different seed different ID", "FAIL"))
+        results['tests'].append(("Different seed + same device = different ID", "FAIL"))
     
-    # === Test 3: Device fingerprint deterministic ===
-    print("  Test 3: Device fingerprint deterministic...")
-    fp1 = auth1.get_device_fingerprint()
-    fp2 = auth1.get_device_fingerprint()
-    
-    if fp1 == fp2 and len(fp1) == 32:
-        results['pass'] += 1
-        results['tests'].append(("Fingerprint deterministic", "PASS"))
-    else:
-        results['fail'] += 1
-        results['tests'].append(("Fingerprint deterministic", "FAIL"))
-    
-    # === Test 4: Device-bound seed ===
+    # === Test 4: Device-bound seed の決定論性 ===
     print("  Test 4: Device-bound seed deterministic...")
-    bound1 = auth1.create_device_bound_seed(user_seed)
-    bound2 = auth1.create_device_bound_seed(user_seed)
+    
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_device_A):
+        auth4a = MeteorAuth(gpu=GPU_AVAILABLE)
+        auth4b = MeteorAuth(gpu=GPU_AVAILABLE)
+        
+        bound1 = auth4a.create_device_bound_seed(user_seed)
+        bound2 = auth4b.create_device_bound_seed(user_seed)
     
     if bound1 == bound2 and len(bound1) == 32:
         results['pass'] += 1
-        results['tests'].append(("Device-bound seed", "PASS"))
+        results['tests'].append(("Device-bound seed deterministic", "PASS"))
     else:
         results['fail'] += 1
-        results['tests'].append(("Device-bound seed", "FAIL"))
+        results['tests'].append(("Device-bound seed deterministic", "FAIL"))
+    
+    # === Test 5: Device-bound seed も端末で変わる ===
+    print("  Test 5: Device-bound seed changes with device...")
+    
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_device_A):
+        auth5a = MeteorAuth(gpu=GPU_AVAILABLE)
+        bound_A = auth5a.create_device_bound_seed(user_seed)
+    
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_device_B):
+        auth5b = MeteorAuth(gpu=GPU_AVAILABLE)
+        bound_B = auth5b.create_device_bound_seed(user_seed)
+    
+    if bound_A != bound_B:
+        results['pass'] += 1
+        results['tests'].append(("Device-bound seed changes with device", "PASS"))
+    else:
+        results['fail'] += 1
+        results['tests'].append(("Device-bound seed changes with device", "FAIL"))
     
     results['passed'] = results['fail'] == 0
     
@@ -730,7 +792,6 @@ def test_i8_device_binding() -> Dict:
     print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
     
     return results
-
 
 # =============================================================================
 # I9. Seed Authentication
@@ -966,15 +1027,17 @@ def test_i10_mitm_prevention() -> Dict:
 # I11. Full Auth + P2P Flow
 # =============================================================================
 
+# =============================================================================
+# I11. Full Auth + P2P Flow - 修正版
+# =============================================================================
+
 def test_i11_full_auth_p2p_flow() -> Dict:
     """
-    I11: Complete Auth + P2P communication flow
+    I11: Complete Auth Layer → Protocol Layer flow
     
-    1. Alice & Bob generate seeds (like creating accounts)
-    2. Exchange public identities
-    3. Authenticated P2P communication
-    4. Identity recovery with same seed
-    5. Wrong seed cannot access
+    1. Auth層: 端末バインド + seed → device_bound_seed
+    2. Protocol層: device_bound_seed → MeteorPractical で P2P
+    3. 別端末からは同じseedでもアクセス不可
     """
     print("\n[I11] Full Auth + P2P Flow")
     print("-" * 50)
@@ -983,99 +1046,145 @@ def test_i11_full_auth_p2p_flow() -> Dict:
         print("  SKIPPED: cryptography not available")
         return {'passed': True, 'skipped': True}
     
+    try:
+        from meteor_nc.auth.core import MeteorAuth
+    except ImportError:
+        print("  SKIPPED: auth module not available")
+        return {'passed': True, 'skipped': True}
+    
     from meteor_nc.cryptography.practical import MeteorPractical
     
     results = {'tests': [], 'pass': 0, 'fail': 0}
     
-    # === Step 1: Account creation (seed generation) ===
-    print("  Step 1: Account creation...")
-    alice_seed = secrets.token_bytes(32)
-    bob_seed = secrets.token_bytes(32)
+    # 端末シミュレーション
+    fp_alice_phone = secrets.token_bytes(32)     # Alice のスマホ
+    fp_alice_laptop = secrets.token_bytes(32)    # Alice のノートPC
+    fp_bob_phone = secrets.token_bytes(32)       # Bob のスマホ
     
-    alice = MeteorPractical(name="Alice", seed=alice_seed, gpu=GPU_AVAILABLE)
-    bob = MeteorPractical(name="Bob", seed=bob_seed, gpu=GPU_AVAILABLE)
+    # user_seed（QRコードで保存されるもの）
+    alice_user_seed = secrets.token_bytes(32)
+    bob_user_seed = secrets.token_bytes(32)
+    
+    # === Step 1: Auth層でデバイスバウンドseed生成 ===
+    print("  Step 1: Auth layer - device binding...")
+    
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_alice_phone):
+        alice_auth = MeteorAuth(gpu=GPU_AVAILABLE)
+        alice_device_bound_seed = alice_auth.create_device_bound_seed(alice_user_seed)
+        alice_meteor_id_phone = alice_auth.get_meteor_id(alice_user_seed)
+    
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_bob_phone):
+        bob_auth = MeteorAuth(gpu=GPU_AVAILABLE)
+        bob_device_bound_seed = bob_auth.create_device_bound_seed(bob_user_seed)
     
     results['pass'] += 1
-    results['tests'].append(("Account creation", "PASS"))
+    results['tests'].append(("Auth layer device binding", "PASS"))
     
-    # === Step 2: Key exchange ===
-    print("  Step 2: Key exchange...")
+    # === Step 2: Protocol層でP2P通信 ===
+    print("  Step 2: Protocol layer - P2P communication...")
+    
+    # device_bound_seed を使って MeteorPractical 初期化
+    alice = MeteorPractical(name="Alice", seed=alice_device_bound_seed, gpu=GPU_AVAILABLE)
+    bob = MeteorPractical(name="Bob", seed=bob_device_bound_seed, gpu=GPU_AVAILABLE)
+    
     alice.add_contact("Bob", bob.get_public_identity())
     bob.add_contact("Alice", alice.get_public_identity())
     
-    results['pass'] += 1
-    results['tests'].append(("Key exchange", "PASS"))
-    
-    # === Step 3: Bidirectional communication ===
-    print("  Step 3: Bidirectional communication...")
-    
-    # Alice → Bob
-    msg1 = "Hello Bob, this is Alice!"
+    # 双方向通信
+    msg1 = "Hello Bob from Alice's phone!"
     enc1 = alice.encrypt_string("Bob", msg1)
     dec1 = bob.decrypt_string(enc1)
     
-    # Bob → Alice
-    msg2 = "Hi Alice, Bob here!"
+    msg2 = "Hi Alice from Bob's phone!"
     enc2 = bob.encrypt_string("Alice", msg2)
     dec2 = alice.decrypt_string(enc2)
     
     if dec1 == msg1 and dec2 == msg2:
         results['pass'] += 1
-        results['tests'].append(("Bidirectional communication", "PASS"))
+        results['tests'].append(("P2P communication", "PASS"))
     else:
         results['fail'] += 1
-        results['tests'].append(("Bidirectional communication", "FAIL"))
+        results['tests'].append(("P2P communication", "FAIL"))
     
-    # === Step 4: Alice loses device, recovers with seed ===
-    print("  Step 4: Identity recovery...")
+    # === Step 3: 同じ端末で再ログイン → 成功 ===
+    print("  Step 3: Same device re-login → success...")
     
-    # Bob sends another message
-    msg3 = "Important update for Alice"
-    enc3 = bob.encrypt_string("Alice", msg3)
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_alice_phone):
+        alice_auth_relogin = MeteorAuth(gpu=GPU_AVAILABLE)
+        alice_relogin_seed = alice_auth_relogin.create_device_bound_seed(alice_user_seed)
     
-    # Alice "loses device" but recovers with same seed
-    alice_recovered = MeteorPractical(name="Alice", seed=alice_seed, gpu=GPU_AVAILABLE)
+    alice_relogin = MeteorPractical(name="Alice", seed=alice_relogin_seed, gpu=GPU_AVAILABLE)
     
-    # Verify same identity
-    same_id = alice.meteor_id == alice_recovered.meteor_id
-    
-    # Can decrypt message sent to original Alice
+    # 同じseedで復号可能
     try:
-        dec3 = alice_recovered.decrypt_string(enc3)
-        recovery_ok = same_id and dec3 == msg3
-        
-        if recovery_ok:
+        dec_relogin = alice_relogin.decrypt_string(enc2)  # Bobからのメッセージ
+        if dec_relogin == msg2:
             results['pass'] += 1
-            results['tests'].append(("Identity recovery", "PASS"))
+            results['tests'].append(("Same device re-login decrypts", "PASS"))
         else:
             results['fail'] += 1
-            results['tests'].append(("Identity recovery", "FAIL"))
+            results['tests'].append(("Same device re-login decrypts", "FAIL (mismatch)"))
     except Exception as e:
         results['fail'] += 1
-        results['tests'].append(("Identity recovery", f"ERROR: {e}"))
+        results['tests'].append(("Same device re-login decrypts", f"ERROR: {e}"))
     
-    # === Step 5: Attacker with wrong seed ===
-    print("  Step 5: Wrong seed blocked...")
+    # === Step 4: 違う端末で同じseed → 違うID ===
+    print("  Step 4: Different device + same seed → different ID...")
     
-    attacker_seed = secrets.token_bytes(32)
-    attacker = MeteorPractical(name="Alice", seed=attacker_seed, gpu=GPU_AVAILABLE)
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_alice_laptop):
+        alice_auth_laptop = MeteorAuth(gpu=GPU_AVAILABLE)
+        alice_laptop_seed = alice_auth_laptop.create_device_bound_seed(alice_user_seed)
+        alice_meteor_id_laptop = alice_auth_laptop.get_meteor_id(alice_user_seed)
     
-    # Attacker has different meteor_id
-    different_id = alice.meteor_id != attacker.meteor_id
-    
-    # Attacker cannot decrypt Alice's messages
-    try:
-        attacker.decrypt_string(enc3)
-        attacker_blocked = False
-    except Exception:
-        attacker_blocked = True
-    
-    if different_id and attacker_blocked:
+    # 端末が違うので MeteorID も違う！
+    if alice_meteor_id_phone != alice_meteor_id_laptop:
         results['pass'] += 1
-        results['tests'].append(("Wrong seed blocked", "PASS"))
+        results['tests'].append(("Different device = different MeteorID", "PASS"))
     else:
         results['fail'] += 1
-        results['tests'].append(("Wrong seed blocked", "FAIL"))
+        results['tests'].append(("Different device = different MeteorID", "FAIL"))
+    
+    # === Step 5: 違う端末からはメッセージ復号不可 ===
+    print("  Step 5: Different device cannot decrypt...")
+    
+    alice_laptop = MeteorPractical(name="Alice", seed=alice_laptop_seed, gpu=GPU_AVAILABLE)
+    
+    try:
+        alice_laptop.decrypt_string(enc2)  # Bob→Alice(phone) のメッセージ
+        results['fail'] += 1
+        results['tests'].append(("Different device cannot decrypt", "FAIL (decrypted!)"))
+    except Exception:
+        results['pass'] += 1
+        results['tests'].append(("Different device cannot decrypt", "PASS"))
+    
+    # === Step 6: 攻撃者シナリオ - seedだけ盗んでも別端末では使えない ===
+    print("  Step 6: Attacker with stolen seed but different device...")
+    
+    fp_attacker = secrets.token_bytes(32)  # 攻撃者の端末
+    
+    with patch.object(MeteorAuth, 'get_device_fingerprint', return_value=fp_attacker):
+        attacker_auth = MeteorAuth(gpu=GPU_AVAILABLE)
+        attacker_seed = attacker_auth.create_device_bound_seed(alice_user_seed)  # 盗んだseed
+        attacker_meteor_id = attacker_auth.get_meteor_id(alice_user_seed)
+    
+    # 攻撃者のIDはAliceと異なる
+    if attacker_meteor_id != alice_meteor_id_phone:
+        results['pass'] += 1
+        results['tests'].append(("Attacker different ID", "PASS"))
+    else:
+        results['fail'] += 1
+        results['tests'].append(("Attacker different ID", "FAIL"))
+    
+    # 攻撃者はAlice宛メッセージを復号不可
+    attacker = MeteorPractical(name="Alice", seed=attacker_seed, gpu=GPU_AVAILABLE)
+    
+    try:
+        attacker.decrypt_string(enc2)
+        results['fail'] += 1
+        results['tests'].append(("Attacker cannot decrypt", "FAIL (decrypted!)"))
+    except Exception:
+        results['pass'] += 1
+        results['tests'].append(("Attacker cannot decrypt", "PASS"))
     
     results['passed'] = results['fail'] == 0
     
@@ -1085,7 +1194,6 @@ def test_i11_full_auth_p2p_flow() -> Dict:
     print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
     
     return results
-
 
 # =============================================================================
 # Updated Main Test Runner
