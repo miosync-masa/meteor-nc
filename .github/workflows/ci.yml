@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  lint:
+    name: Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install flake8
+        run: pip install flake8
+      
+      - name: Check syntax errors
+        run: |
+          # E999: SyntaxError
+          # F821: undefined name
+          # F401は無視（unused import、GPU optional対応のため）
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+  import-test:
+    name: Import Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install numpy scipy cryptography
+      
+      - name: Test core imports (CPU only)
+        run: |
+          python -c "
+          print('=== Import Test ===')
+          
+          # Core modules (CPU)
+          from meteor_nc.cryptography.common import (
+              HKDF, Q_DEFAULT, GPU_AVAILABLE, CRYPTO_AVAILABLE
+          )
+          print(f'✓ common.py - GPU_AVAILABLE={GPU_AVAILABLE}')
+          
+          from meteor_nc.cryptography.core import LWEKEM, HybridKEM
+          print('✓ core.py')
+          
+          # Main package
+          import meteor_nc
+          print(f'✓ meteor_nc v{meteor_nc.__version__}')
+          
+          # Check flags
+          print(f'  BATCH_AVAILABLE={meteor_nc.BATCH_AVAILABLE}')
+          print(f'  STREAM_AVAILABLE={meteor_nc.STREAM_AVAILABLE}')
+          print(f'  PRACTICAL_AVAILABLE={meteor_nc.PRACTICAL_AVAILABLE}')
+          print(f'  PROTOCOL_AVAILABLE={meteor_nc.PROTOCOL_AVAILABLE}')
+          print(f'  AUTH_AVAILABLE={meteor_nc.AUTH_AVAILABLE}')
+          
+          print('=== All imports OK! ===')
+          "
+      
+      - name: Test CPU-only KEM
+        run: |
+          python -c "
+          from meteor_nc.cryptography.core import LWEKEM
+          
+          # CPU-only test (no GPU)
+          kem = LWEKEM(n=256, gpu=False)
+          pk, sk = kem.key_gen()
+          print(f'✓ KeyGen OK - PK size: {len(pk)} bytes')
+          
+          K1, ct = kem.encaps()
+          print(f'✓ Encaps OK - CT size: {ct.wire_size()} bytes')
+          
+          K2 = kem.decaps(ct)
+          assert K1 == K2, 'Key mismatch!'
+          print('✓ Decaps OK - Keys match!')
+          
+          print('=== CPU KEM Test PASSED ===')
+          "
