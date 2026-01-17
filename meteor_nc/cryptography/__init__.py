@@ -41,25 +41,25 @@ from .core import (
 
 # Batch KEM (GPU required)
 try:
-    from .batch import BatchLWEKEM
+    from .batch import BatchLWEKEM, BatchHybridKEM, BatchCiphertext
     BATCH_AVAILABLE = True
 except ImportError:
     BATCH_AVAILABLE = False
 
-# Batch v2 (multi-level support)
+# Batch Multi-Level (n=256/512/1024)
 try:
-    from .batch import BatchLWEKEM, BatchHybridKEM, BatchCiphertext  # ★追加
-    BATCH_AVAILABLE = True
+    from .kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
+    BATCH_MULTILEVEL_AVAILABLE = BATCH_V2_AVAILABLE and BLAKE3_V2_AVAILABLE
 except ImportError:
-    BATCH_AVAILABLE = False
-  
+    BATCH_MULTILEVEL_AVAILABLE = False
+
 # Stream DEM
 try:
     from .stream import (
-        StreamDEM, 
-        StreamHybridKEM,      # ★追加
-        StreamCiphertext,     # ★追加
-        EncryptedChunk, 
+        StreamDEM,
+        StreamHybridKEM,
+        StreamCiphertext,
+        EncryptedChunk,
         StreamHeader,
     )
     STREAM_AVAILABLE = True
@@ -68,7 +68,7 @@ except ImportError:
 
 # Practical encryption
 try:
-    from .practical import MeteorPractical, create_meteor, quick_encrypt, quick_decrypt
+    from .practical import MeteorPractical, quick_encrypt, quick_decrypt
     PRACTICAL_AVAILABLE = True
 except ImportError:
     PRACTICAL_AVAILABLE = False
@@ -90,7 +90,6 @@ __all__ = [
     "StreamHeader",
     # Practical
     "MeteorPractical",
-    "create_meteor",
     "quick_encrypt",
     "quick_decrypt",
     # Data structures
