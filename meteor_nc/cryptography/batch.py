@@ -13,6 +13,10 @@ Features:
 - core.py compatible interface
 
 Target: 1M+ ops/sec on modern GPUs
+
+Key Generation Security:
+- seed=None (default): TRUE RANDOMNESS for s (standard PKE)
+- seed=bytes: Deterministic derivation (for auth/reproducibility)
 """
 
 from __future__ import annotations
@@ -30,8 +34,6 @@ from .common import (
     prg_sha256,
     HKDF,
     GPU_AVAILABLE,
-    CRYPTO_AVAILABLE,
-    LWECiphertext,  # encaps/decaps で使うなら
 )
 
 if not GPU_AVAILABLE:
@@ -148,6 +150,11 @@ class BatchLWEKEM:
     """
     GPU-parallel batch KEM with correct PKE design.
     
+    CORRECT KEY STRUCTURE:
+      - pk_seed (32B): Public, used to reconstruct matrix A
+      - b (k×4B): Public, computed as A @ s + e mod q during key_gen
+      - s: SECRET, generated from TRUE RANDOMNESS (not from pk_seed!)
+    
     This is the KEM-only component. For hybrid encryption,
     use BatchHybridKEM which combines this with DEM.
     """
@@ -195,38 +202,74 @@ class BatchLWEKEM:
         A_flat = raw.reshape(self.k, self.n)
         return cp.asarray(A_flat, dtype=cp.uint32)
     
-    def key_gen(self) -> Tuple[bytes, bytes]:
-        """Generate LWE key pair."""
-        # 1. pk_seed (PUBLIC)
-        self.pk_seed = secrets.token_bytes(32)
+    def key_gen(self, seed: Optional[bytes] = None) -> Tuple[bytes, bytes]:
+        """
+        Generate LWE key pair.
         
-        # 2. Reconstruct A
+        Args:
+            seed: Optional master seed for deterministic key generation.
+                  - None (default): Use TRUE RANDOMNESS for s (standard PKE)
+                  - bytes: Derive all key material from seed (for auth/reproducibility)
+                  
+                  WARNING: If seed is provided, the same seed will always produce
+                  the same key pair. Only use this for authentication scenarios
+                  where the seed itself is kept secret!
+        
+        Returns:
+            Tuple of (public_key_bytes, secret_key_bytes)
+        """
+        if seed is not None:
+            # Deterministic key generation from master seed
+            hkdf = HKDF(salt=_sha256(b"batch-kem-v2-auth"))
+            prk = hkdf.extract(seed)
+            
+            # Derive pk_seed (can be public)
+            self.pk_seed = hkdf.expand(prk, b"pk_seed", 32)
+            
+            # Derive s from seed (SECRET - but seed is also secret!)
+            s_bytes = hkdf.expand(prk, b"secret_s", self.n * 4)
+            s_raw = np.frombuffer(s_bytes, dtype="<u4").copy()
+            s_np = ((s_raw % (2 * self.eta + 1)).astype(np.int32) - self.eta)
+            self.s = cp.asarray(s_np, dtype=cp.int32)
+            
+            # Derive e seed
+            e_seed = hkdf.expand(prk, b"error_seed", 32)
+            
+            # Derive z
+            self.z = hkdf.expand(prk, b"implicit_z", 32)
+        else:
+            # Standard PKE: TRUE RANDOMNESS for secret values
+            self.pk_seed = secrets.token_bytes(32)
+            
+            # s from TRUE RANDOMNESS (not from seed!)
+            s_bytes = secrets.token_bytes(self.n * 4)
+            s_raw = np.frombuffer(s_bytes, dtype="<u4").copy()
+            s_np = ((s_raw % (2 * self.eta + 1)).astype(np.int32) - self.eta)
+            self.s = cp.asarray(s_np, dtype=cp.int32)
+            
+            # e seed (random)
+            e_seed = secrets.token_bytes(32)
+            
+            # z (implicit rejection seed)
+            self.z = secrets.token_bytes(32)
+        
+        # Reconstruct A from pk_seed
         self.A = self._reconstruct_A(self.pk_seed)
         
-        # 3. s from TRUE RANDOMNESS (SECRET)
-        s_bytes = secrets.token_bytes(self.n * 4)
-        s_raw = np.frombuffer(s_bytes, dtype="<u4").copy()
-        s_np = ((s_raw % (2 * self.eta + 1)).astype(np.int32) - self.eta)
-        self.s = cp.asarray(s_np, dtype=cp.int32)
-        
-        # 4. e (error)
-        e_seed = secrets.token_bytes(32)
-        hkdf = HKDF(salt=_sha256(b"batch-kem-v2-error"))
-        prk = hkdf.extract(e_seed)
-        seed_e = np.array([int.from_bytes(hkdf.expand(prk, b"e", 8), "big")], dtype=np.uint64)
+        # e (error) - derive from e_seed
+        hkdf_e = HKDF(salt=_sha256(b"batch-kem-v2-error"))
+        prk_e = hkdf_e.extract(e_seed)
+        seed_e = np.array([int.from_bytes(hkdf_e.expand(prk_e, b"e", 8), "big")], dtype=np.uint64)
         e = cbd_i32(cp.asarray(seed_e), self.k, self.eta).flatten()
         
-        # 5. b = A @ s + e
+        # b = A @ s + e
         self.b = b_from_As(self.A, self.s, e)
         
-        # 6. pk_hash
+        # pk_hash
         b_bytes = cp.asnumpy(self.b).astype("<u4").tobytes()
         self.pk_hash = _sha256(b"pk", self.pk_seed, b_bytes)
         
-        # 7. z (implicit rejection seed)
-        self.z = secrets.token_bytes(32)
-        
-        # 8. Serialize
+        # Serialize
         pk_bytes = self._export_public_key()
         sk_bytes = self._export_secret_key()
         
@@ -276,7 +319,7 @@ class BatchLWEKEM:
         self.pk_hash = pk_bytes[44 + k * 4:44 + k * 4 + 32]
         
         self.A = self._reconstruct_A(self.pk_seed)
-        self.s = None
+        self.s = None  # Cannot decrypt without secret key!
         self.z = None
     
     def load_secret_key(self, sk_bytes: bytes) -> None:
@@ -445,9 +488,9 @@ class BatchHybridKEM:
         # DEM will be initialized per-key
         self._dem: Optional[GPUChaCha20Poly1305] = None
     
-    def key_gen(self) -> Tuple[bytes, bytes]:
+    def key_gen(self, seed: Optional[bytes] = None) -> Tuple[bytes, bytes]:
         """Generate key pair."""
-        return self.kem.key_gen()
+        return self.kem.key_gen(seed=seed)
     
     def load_public_key(self, pk_bytes: bytes) -> None:
         """Load public key (for encryption only)."""
@@ -728,8 +771,29 @@ def run_tests() -> bool:
     results["tamper"] = tamper_detected
     print(f"  Tamper detected: {'PASS' if tamper_detected else 'FAIL'}")
     
-    # Test 6: KEM Throughput
-    print("\n[Test 6] KEM Throughput (GPU)")
+    # Test 6: Seed Determinism
+    print("\n[Test 6] Seed Determinism")
+    print("-" * 40)
+    
+    seed = secrets.token_bytes(32)
+    
+    kem1 = BatchLWEKEM()
+    kem1.key_gen(seed=seed)
+    
+    kem2 = BatchLWEKEM()
+    kem2.key_gen(seed=seed)
+    
+    A1 = cp.asnumpy(kem1.A)
+    A2 = cp.asnumpy(kem2.A)
+    b1 = cp.asnumpy(kem1.b)
+    b2 = cp.asnumpy(kem2.b)
+    
+    seed_ok = np.array_equal(A1, A2) and np.array_equal(b1, b2)
+    results["seed_determinism"] = seed_ok
+    print(f"  Same seed → same keys: {'PASS' if seed_ok else 'FAIL'}")
+    
+    # Test 7: KEM Throughput
+    print("\n[Test 7] KEM Throughput (GPU)")
     print("-" * 40)
     
     kem = BatchLWEKEM()
@@ -754,8 +818,8 @@ def run_tests() -> bool:
         print(f"    Encaps: {batch/enc_time:>12,.0f} ops/sec")
         print(f"    Decaps: {batch/dec_time:>12,.0f} ops/sec")
     
-    # Test 7: Million Target
-    print("\n[Test 7] Million Ops Target")
+    # Test 8: Million Target
+    print("\n[Test 8] Million Ops Target")
     print("-" * 40)
     
     batch = 1_000_000
