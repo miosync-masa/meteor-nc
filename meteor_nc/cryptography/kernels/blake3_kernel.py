@@ -173,24 +173,25 @@ void blake3_derive_keys_batch(
 
     const unsigned char* m_ptr = messages + tid * 32;
     const unsigned char* ct_ptr = ct_hashes + tid * 32;
-    unsigned char is_ok = ok_mask[tid];
+    
+    // Constant-time: generate mask without branching
+    unsigned int mask = (ok_mask[tid] != 0) * 0xFFFFFFFF;
+    unsigned int nmask = ~mask;
 
     unsigned int m[16];
     
-    if (is_ok) {
-        for (int i = 0; i < 8; i++) {
-            m[i] = ((unsigned int)m_ptr[i*4 + 0])
-                 | ((unsigned int)m_ptr[i*4 + 1] << 8)
-                 | ((unsigned int)m_ptr[i*4 + 2] << 16)
-                 | ((unsigned int)m_ptr[i*4 + 3] << 24);
-        }
-    } else {
-        for (int i = 0; i < 8; i++) {
-            m[i] = ((unsigned int)z[i*4 + 0])
-                 | ((unsigned int)z[i*4 + 1] << 8)
-                 | ((unsigned int)z[i*4 + 2] << 16)
-                 | ((unsigned int)z[i*4 + 3] << 24);
-        }
+    // Always read from BOTH sources, select via bitmask (no branch)
+    for (int i = 0; i < 8; i++) {
+        unsigned int from_msg = ((unsigned int)m_ptr[i*4 + 0])
+                              | ((unsigned int)m_ptr[i*4 + 1] << 8)
+                              | ((unsigned int)m_ptr[i*4 + 2] << 16)
+                              | ((unsigned int)m_ptr[i*4 + 3] << 24);
+        unsigned int from_z   = ((unsigned int)z[i*4 + 0])
+                              | ((unsigned int)z[i*4 + 1] << 8)
+                              | ((unsigned int)z[i*4 + 2] << 16)
+                              | ((unsigned int)z[i*4 + 3] << 24);
+        
+        m[i] = (from_msg & mask) | (from_z & nmask);
     }
     
     for (int i = 0; i < 8; i++) {
