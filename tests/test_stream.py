@@ -327,11 +327,14 @@ def test_s2_2_reorder() -> Dict:
 
 def test_s2_3_replay() -> Dict:
     """
-    S2.3: Replay attack (same chunk twice)
+    S2.3: Replay attack detection
     
-    Note: Same nonce → same plaintext (by design, stateless AEAD)
+    StreamDEM has built-in replay protection.
+    - First decrypt: succeeds
+    - Second decrypt (same chunk): raises ValueError
+    - With check_replay=False: succeeds (for recovery scenarios)
     """
-    print("\n[S2.3] Replay Behavior")
+    print("\n[S2.3] Replay Protection")
     print("-" * 50)
     
     if not CRYPTO_AVAILABLE:
@@ -340,7 +343,7 @@ def test_s2_3_replay() -> Dict:
     
     from meteor_nc.cryptography.stream import StreamDEM
     
-    results = {}
+    results = {'tests': [], 'pass': 0, 'fail': 0}
     
     session_key = secrets.token_bytes(32)
     stream_id = secrets.token_bytes(16)
@@ -351,22 +354,57 @@ def test_s2_3_replay() -> Dict:
     plaintext = b"important message"
     chunk = enc.encrypt_chunk(plaintext)
     
-    # Decrypt twice (replay)
-    pt1 = dec.decrypt_chunk(chunk)
-    pt2 = dec.decrypt_chunk(chunk)
+    # Test 1: First decrypt succeeds
+    try:
+        pt1 = dec.decrypt_chunk(chunk)
+        if pt1 == plaintext:
+            results['pass'] += 1
+            results['tests'].append(("First decrypt", "PASS"))
+        else:
+            results['fail'] += 1
+            results['tests'].append(("First decrypt", "FAIL (wrong plaintext)"))
+    except Exception as e:
+        results['fail'] += 1
+        results['tests'].append(("First decrypt", f"ERROR: {e}"))
     
-    # Both should succeed and return same plaintext
-    results['both_succeed'] = (pt1 == plaintext) and (pt2 == plaintext)
-    results['same_result'] = pt1 == pt2
-    results['passed'] = results['both_succeed'] and results['same_result']
+    # Test 2: Replay is rejected
+    try:
+        pt2 = dec.decrypt_chunk(chunk)
+        results['fail'] += 1
+        results['tests'].append(("Replay rejected", "FAIL (not rejected)"))
+    except ValueError as e:
+        if "Replay" in str(e) or "already seen" in str(e):
+            results['pass'] += 1
+            results['tests'].append(("Replay rejected", "PASS (ValueError)"))
+        else:
+            results['fail'] += 1
+            results['tests'].append(("Replay rejected", f"FAIL (wrong error: {e})"))
+    except Exception as e:
+        results['fail'] += 1
+        results['tests'].append(("Replay rejected", f"ERROR: {e}"))
     
-    print(f"  Same chunk decrypted twice: both succeed")
-    print(f"  Same plaintext: {results['same_result']}")
-    print(f"  Note: Replay protection is application layer responsibility")
+    # Test 3: check_replay=False allows replay (for recovery)
+    try:
+        pt3 = dec.decrypt_chunk(chunk, check_replay=False)
+        if pt3 == plaintext:
+            results['pass'] += 1
+            results['tests'].append(("check_replay=False", "PASS"))
+        else:
+            results['fail'] += 1
+            results['tests'].append(("check_replay=False", "FAIL (wrong plaintext)"))
+    except Exception as e:
+        results['fail'] += 1
+        results['tests'].append(("check_replay=False", f"ERROR: {e}"))
+    
+    results['passed'] = results['fail'] == 0
+    
+    for desc, status in results['tests']:
+        print(f"    {desc}: {status}")
+    
+    print(f"  Note: Replay protection is built-in (can disable with check_replay=False)")
     print(f"  Result: {'PASS ✓' if results['passed'] else 'FAIL ✗'}")
     
     return results
-
 
 # =============================================================================
 # S3. Security-in-Practice Tests
