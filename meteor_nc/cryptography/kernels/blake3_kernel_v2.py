@@ -154,12 +154,19 @@ void blake3_derive_keys_v2(
 
     const unsigned char* m_ptr = messages + tid * msg_bytes;
     const unsigned char* ct_ptr = ct_hashes + tid * 32;
-    unsigned char is_ok = ok_mask[tid];
+    
+    // Constant-time: generate mask without branching
+    unsigned int mask = (ok_mask[tid] != 0) * 0xFFFFFFFF;
+    unsigned int nmask = ~mask;
+    
+    // Select input length via constant-time arithmetic
+    int input_bytes_ok = msg_bytes;
+    int input_bytes_fail = 32;
+    int input_bytes = (input_bytes_ok & (int)mask) | (input_bytes_fail & (int)nmask);
 
     unsigned int cv[8];
     for (int i = 0; i < 8; i++) cv[i] = IV_V2[i];
     
-    int input_bytes = is_ok ? msg_bytes : 32;
     int total_bytes = input_bytes + 32;
     int num_blocks = (total_bytes + 63) / 64;
     
@@ -171,16 +178,20 @@ void blake3_derive_keys_v2(
             unsigned int word = 0;
             for (int j = 0; j < 4; j++) {
                 int pos = byte_idx + i * 4 + j;
-                unsigned char b = 0;
-                if (pos < input_bytes) {
-                    if (is_ok) {
-                        b = m_ptr[pos];
-                    } else {
-                        b = z[pos];
-                    }
-                } else if (pos < total_bytes) {
-                    b = ct_ptr[pos - input_bytes];
-                }
+                
+                // Always read from both sources
+                unsigned char b_msg = (pos < msg_bytes) ? m_ptr[pos] : 0;
+                unsigned char b_z = (pos < 32) ? z[pos] : 0;
+                unsigned char b_ct = ((pos >= input_bytes) && (pos < total_bytes)) 
+                                   ? ct_ptr[pos - input_bytes] : 0;
+                
+                // Select message source via bitmask
+                unsigned char b_input = (b_msg & (unsigned char)(mask & 0xFF)) 
+                                      | (b_z & (unsigned char)(nmask & 0xFF));
+                
+                // Use input if in range, else ct_hash if in range, else 0
+                unsigned char b = (pos < input_bytes) ? b_input : b_ct;
+                
                 word |= ((unsigned int)b) << (j * 8);
             }
             block[i] = word;
