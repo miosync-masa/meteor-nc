@@ -342,15 +342,21 @@ def test_i4_tamper_detection() -> Dict:
     print("  Testing ciphertext tamper...")
     try:
         # Create tampered message
-        ct_tampered = bytearray(encrypted.ciphertext)
+        ct_tampered = bytearray(encrypted.stream_ciphertext)
         ct_tampered[0] ^= 1
         
         msg_tampered = EncryptedMessage(
-            kem_ciphertext=encrypted.kem_ciphertext,
-            ciphertext=bytes(ct_tampered),
-            tag=encrypted.tag,
-            nonce=encrypted.nonce,
             sender_id=encrypted.sender_id,
+            recipient_id=encrypted.recipient_id,
+            kem_u=encrypted.kem_u.copy(),
+            kem_v=encrypted.kem_v.copy(),
+            stream_ciphertext=bytes(ct_tampered),
+            stream_tag=encrypted.stream_tag,
+            stream_id=encrypted.stream_id,
+            seq=encrypted.seq,
+            original_len=encrypted.original_len,
+            checksum=encrypted.checksum,
+            timestamp=encrypted.timestamp,
         )
         
         bob.decrypt_string(msg_tampered)
@@ -363,15 +369,21 @@ def test_i4_tamper_detection() -> Dict:
     # === Test 3: Tampered tag rejected ===
     print("  Testing tag tamper...")
     try:
-        tag_tampered = bytearray(encrypted.tag)
+        tag_tampered = bytearray(encrypted.stream_tag)
         tag_tampered[0] ^= 1
         
         msg_tampered = EncryptedMessage(
-            kem_ciphertext=encrypted.kem_ciphertext,
-            ciphertext=encrypted.ciphertext,
-            tag=bytes(tag_tampered),
-            nonce=encrypted.nonce,
             sender_id=encrypted.sender_id,
+            recipient_id=encrypted.recipient_id,
+            kem_u=encrypted.kem_u.copy(),
+            kem_v=encrypted.kem_v.copy(),
+            stream_ciphertext=encrypted.stream_ciphertext,
+            stream_tag=bytes(tag_tampered),
+            stream_id=encrypted.stream_id,
+            seq=encrypted.seq,
+            original_len=encrypted.original_len,
+            checksum=encrypted.checksum,
+            timestamp=encrypted.timestamp,
         )
         
         bob.decrypt_string(msg_tampered)
@@ -384,15 +396,21 @@ def test_i4_tamper_detection() -> Dict:
     # === Test 4: Tampered KEM CT rejected ===
     print("  Testing KEM CT tamper...")
     try:
-        kem_ct_tampered = bytearray(encrypted.kem_ciphertext)
-        kem_ct_tampered[50] ^= 1  # Tamper somewhere in the middle
+        kem_u_tampered = encrypted.kem_u.copy()
+        kem_u_tampered[50] ^= 1  # Tamper somewhere in the middle
         
         msg_tampered = EncryptedMessage(
-            kem_ciphertext=bytes(kem_ct_tampered),
-            ciphertext=encrypted.ciphertext,
-            tag=encrypted.tag,
-            nonce=encrypted.nonce,
             sender_id=encrypted.sender_id,
+            recipient_id=encrypted.recipient_id,
+            kem_u=kem_u_tampered,
+            kem_v=encrypted.kem_v.copy(),
+            stream_ciphertext=encrypted.stream_ciphertext,
+            stream_tag=encrypted.stream_tag,
+            stream_id=encrypted.stream_id,
+            seq=encrypted.seq,
+            original_len=encrypted.original_len,
+            checksum=encrypted.checksum,
+            timestamp=encrypted.timestamp,
         )
         
         bob.decrypt_string(msg_tampered)
@@ -888,15 +906,21 @@ def test_i10_mitm_prevention() -> Dict:
     original = alice.encrypt_string("Bob", "Original message")
     
     # Eve tampers with ciphertext
-    tampered_ct = bytearray(original.ciphertext)
+    tampered_ct = bytearray(original.stream_ciphertext)
     tampered_ct[0] ^= 0xFF
     
     tampered = EncryptedMessage(
-        kem_ciphertext=original.kem_ciphertext,
-        ciphertext=bytes(tampered_ct),
-        tag=original.tag,
-        nonce=original.nonce,
         sender_id=original.sender_id,
+        recipient_id=original.recipient_id,
+        kem_u=original.kem_u.copy(),
+        kem_v=original.kem_v.copy(),
+        stream_ciphertext=bytes(tampered_ct),
+        stream_tag=original.stream_tag,
+        stream_id=original.stream_id,
+        seq=original.seq,
+        original_len=original.original_len,
+        checksum=original.checksum,
+        timestamp=original.timestamp,
     )
     
     # Bob detects tampering
