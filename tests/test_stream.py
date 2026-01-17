@@ -689,10 +689,10 @@ def test_s5_throughput() -> Dict:
         enc = StreamDEM(session_key=session_key, stream_id=stream_id)
         dec = StreamDEM(session_key=session_key, stream_id=stream_id)
         
-        # Warmup
+        # Warmup (with check_replay=False for repeated decryption)
         for _ in range(3):
             chunk = enc.encrypt_chunk(plaintext)
-            dec.decrypt_chunk(chunk)
+            dec.decrypt_chunk(chunk, check_replay=False)
         
         # Encrypt benchmark
         iterations = max(10, 100 * 1024 * 1024 // chunk_size)  # ~100MB total
@@ -702,10 +702,10 @@ def test_s5_throughput() -> Dict:
             chunk = enc.encrypt_chunk(plaintext)
         enc_time = time.perf_counter() - start
         
-        # Decrypt benchmark
+        # Decrypt benchmark (check_replay=False for benchmark)
         start = time.perf_counter()
         for _ in range(iterations):
-            dec.decrypt_chunk(chunk)
+            dec.decrypt_chunk(chunk, check_replay=False)
         dec_time = time.perf_counter() - start
         
         enc_mbps = (iterations * chunk_size) / enc_time / (1024 * 1024)
