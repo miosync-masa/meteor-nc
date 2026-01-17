@@ -1,19 +1,16 @@
-# meteor_nc/cryptography/__init__.py
+# meteor_nc/__init__.py
 """
-Meteor-NC Cryptography Module
-
-Correct PKE Design:
-  - Public key (pk_seed + b) allows encryption
-  - Secret key (s) required for decryption
-  - pk_seed leak does NOT compromise secret key
-
-Wire Format:
-  - Header fields: big-endian
-  - Coefficient arrays: little-endian uint32
+Meteor-NC: Post-Quantum Hybrid Cryptosystem
+WEB4.0 Protocol Ready!
+- Post-Quantum Key Encapsulation (LWE-KEM)
+- High-Speed Streaming Encryption (XChaCha20-Poly1305)
+- P2P Communication Protocol
+- Device-Bound Authentication
 """
+__version__ = "2.0.0"
 
-from .common import (
-    # Constants
+# Core (CPU/GPU optional)
+from .cryptography.common import (
     HKDF,
     Q_DEFAULT,
     MSG_BYTES,
@@ -21,19 +18,8 @@ from .common import (
     SECURITY_PARAMS,
     GPU_AVAILABLE,
     CRYPTO_AVAILABLE,
-    # Utilities
-    _sha256,
-    prg_sha256,
-    small_error_from_seed,
-    # Data structures (wire format support)
-    LWEPublicKey,
-    LWESecretKey,
-    LWECiphertext,
-    FullCiphertext,
-    CenteredBinomial,
 )
-
-from .core import (
+from .cryptography.core import (
     LWEKEM,
     HybridKEM,
     SymmetricMixer,
@@ -41,21 +27,21 @@ from .core import (
 
 # Batch KEM (GPU required)
 try:
-    from .batch import BatchLWEKEM, BatchHybridKEM, BatchCiphertext
+    from .cryptography.batch import BatchLWEKEM, BatchHybridKEM, BatchCiphertext
     BATCH_AVAILABLE = True
 except ImportError:
     BATCH_AVAILABLE = False
 
 # Batch Multi-Level (n=256/512/1024)
 try:
-    from .kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
+    from .cryptography.kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
     BATCH_MULTILEVEL_AVAILABLE = BATCH_V2_AVAILABLE and BLAKE3_V2_AVAILABLE
 except ImportError:
     BATCH_MULTILEVEL_AVAILABLE = False
 
-# Stream DEM
+# Stream DEM (XChaCha20-Poly1305)
 try:
-    from .stream import (
+    from .cryptography.stream import (
         StreamDEM,
         StreamHybridKEM,
         StreamCiphertext,
@@ -66,51 +52,116 @@ try:
 except ImportError:
     STREAM_AVAILABLE = False
 
-# Practical encryption
+# Practical API (String/File encryption)
 try:
-    from .practical import MeteorPractical, quick_encrypt, quick_decrypt
+    from .cryptography.practical import (
+        MeteorPractical,
+        quick_encrypt,
+        quick_decrypt,
+    )
     PRACTICAL_AVAILABLE = True
 except ImportError:
     PRACTICAL_AVAILABLE = False
 
+# Protocol Layer (P2P Communication)
+try:
+    from .protocols.meteor_protocol import (
+        MeteorNode,
+        MeteorPeer,
+        MeteorMessage,
+        MeteorProtocol,
+    )
+    PROTOCOL_AVAILABLE = True
+except ImportError:
+    PROTOCOL_AVAILABLE = False
+
+# Advanced Protocol Testing
+try:
+    from .protocols.advanced import (
+        MeteorNetwork,
+        LatencySimulator,
+        LatencyProfile,
+        SessionManager,
+        run_comprehensive_tests,
+    )
+    ADVANCED_AVAILABLE = True
+except ImportError:
+    ADVANCED_AVAILABLE = False
+
+# Authentication (Device-Bound)
+try:
+    from .auth.core import (
+        MeteorAuth,
+        MeteorAuthServer,
+        UserRecord,
+        verify_device_binding,
+        generate_recovery_codes,
+    )
+    AUTH_AVAILABLE = True
+except ImportError:
+    AUTH_AVAILABLE = False
+
 __all__ = [
-    # CORE
+    # Version
+    "__version__",
+    
+    # Core Cryptography
+    "HKDF",
     "LWEKEM",
     "HybridKEM",
     "SymmetricMixer",
-    # Batch
+    
+    # Batch KEM
     "BatchLWEKEM",
     "BatchHybridKEM",
     "BatchCiphertext",
-    # Stream
+    
+    # Stream DEM
     "StreamDEM",
     "StreamHybridKEM",
     "StreamCiphertext",
     "EncryptedChunk",
     "StreamHeader",
-    # Practical
+    
+    # Practical API
     "MeteorPractical",
     "quick_encrypt",
     "quick_decrypt",
-    # Data structures
-    "LWEPublicKey",
-    "LWESecretKey",
-    "LWECiphertext",
-    "FullCiphertext",
-    "CenteredBinomial",
-    # Common
-    "HKDF",
+    
+    # Protocol (Basic)
+    "MeteorNode",
+    "MeteorPeer",
+    "MeteorMessage",
+    "MeteorProtocol",
+    
+    # Protocol (Advanced)
+    "MeteorNetwork",
+    "LatencySimulator",
+    "LatencyProfile",
+    "SessionManager",
+    "run_comprehensive_tests",
+    
+    # Authentication
+    "MeteorAuth",
+    "MeteorAuthServer",
+    "UserRecord",
+    "verify_device_binding",
+    "generate_recovery_codes",
+    
+    # Constants
     "Q_DEFAULT",
     "MSG_BYTES",
     "MSG_BITS",
     "SECURITY_PARAMS",
-    "prg_sha256",
-    "small_error_from_seed",
-    # Flags
+    
+    # Availability Flags
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
     "BATCH_AVAILABLE",
     "BATCH_MULTILEVEL_AVAILABLE",
     "STREAM_AVAILABLE",
     "PRACTICAL_AVAILABLE",
+    "PROTOCOL_AVAILABLE",
+    "ADVANCED_AVAILABLE",
+    "AUTH_AVAILABLE",
 ]
