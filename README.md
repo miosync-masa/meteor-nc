@@ -4,47 +4,37 @@
 
 > This repository accompanies the TCHES 2026 submission
 
----
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Overview
 
-Meteor-NC is a practical implementation of a post-quantum key encapsulation mechanism (KEM) achieving **4M+ encapsulations/second** on modern GPUs. The cryptographic security relies entirely on well-established primitives:
+Meteor-NC is a practical implementation of a post-quantum lattice-based key encapsulation mechanism (KEM). The cryptographic security relies entirely on **well-established primitives**:
 
 | Component | Foundation | Reference |
 |-----------|------------|-----------|
 | KEM | LWE Problem | Regev 2005, NIST PQC |
-| IND-CCA2 | Fujisaki-Okamoto Transform | ePrint 2017/604 |
-| Key Derivation | HKDF | RFC 5869 |
-| Authenticated Encryption | AES-GCM | RFC 5116 |
+| IND-CCA2 | Fujisaki–Okamoto (FO) Transform | ePrint 2017/604 |
+| Key Derivation | HKDF (Extract-and-Expand) | RFC 5869 |
+| Authenticated Encryption | (X)ChaCha20-Poly1305 / AES-GCM | RFC 8439 / RFC 5116 |
 
-**No novel cryptographic assumptions are introduced.** The contribution is a high-throughput implementation suitable for server-side batch operations and real-time applications.
+**No novel cryptographic assumptions are introduced.** The contribution is an implementation-first, throughput-oriented design with byte-exact FO behavior across CPU/GPU backends.
 
-### System Architecture
+---
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Meteor-NC System                         │
-├─────────────────────────────────────────────────────────────┤
-│  Security Layer (Established Primitives)                    │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐        │
-│  │   LWE   │  │   F-O   │  │  HKDF   │  │ AES-GCM │        │
-│  │ Problem │  │Transform│  │RFC 5869 │  │  AEAD   │        │
-│  └─────────┘  └─────────┘  └─────────┘  └─────────┘        │
-├─────────────────────────────────────────────────────────────┤
-│  Implementation Layer (This Work)                           │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
-│  │ GPU Batch   │  │   32-byte   │  │  Protocol   │         │
-│  │ Processing  │  │ Seed KDF    │  │   Layers    │         │
-│  │ (4M ops/s)  │  │ (Compact)   │  │ (P2P/Stream)│         │
-│  └─────────────┘  └─────────────┘  └─────────────┘         │
-└─────────────────────────────────────────────────────────────┘
-```
+## ✨ Key Features
+
+- **🚀 High Throughput**: 4M+ ops/sec on RTX 4090 (batch backend)
+- **🔐 Post-Quantum Security**: Based on LWE with FO transform (IND-CCA2)
+- **📦 Compact Keys**: 32-byte seed-based key storage
+- **🔄 CPU/GPU Interop**: Byte-exact FO across backends
+- **🌐 Protocol Ready**: P2P, streaming, and auth layers included
 
 ---
 
 ## Performance Results
 
-Tested on NVIDIA RTX 4090, all security levels pass 100% correctness tests.
+Measured on NVIDIA RTX 4090 (batch backend). All security levels pass correctness tests.
 
 ### Batch KEM Throughput
 
@@ -54,15 +44,13 @@ Tested on NVIDIA RTX 4090, all security levels pass 100% correctness tests.
 | NIST Level 3 | 512 | **2,379,398 ops/sec** | 21.0 ms |
 | NIST Level 5 | 1024 | **1,017,945 ops/sec** | 9.8 ms |
 
-### Test Results Summary
-
 ```
 ======================================================================
 FINAL SUMMARY - ALL SECURITY LEVELS
-======================================================================
-  n=256:  ✅ PASS  |  Peak: 4,175,900 ops/sec
-  n=512:  ✅ PASS  |  Peak: 2,379,398 ops/sec
-  n=1024: ✅ PASS  |  Peak: 1,017,945 ops/sec
+----------------------------------------------------------------------
+n=256:  ✅ PASS  |  Peak: 4,175,900 ops/sec
+n=512:  ✅ PASS  |  Peak: 2,379,398 ops/sec
+n=1024: ✅ PASS  |  Peak: 1,017,945 ops/sec
 
 RESULT: ✅ ALL LEVELS PASSED
 ======================================================================
@@ -70,60 +58,50 @@ RESULT: ✅ ALL LEVELS PASSED
 
 ---
 
-## Parameter Sets
-
-| Level | n | k | q | η | Shared Secret |
-|-------|-----|-----|----------|-----|---------------|
-| 128-bit (NIST L1) | 256 | 256 | 2³²−5 | 2 | 32 bytes |
-| 192-bit (NIST L3) | 512 | 512 | 2³²−5 | 2 | 32 bytes |
-| 256-bit (NIST L5) | 1024 | 1024 | 2³²−5 | 3 | 32 bytes |
-
-Concrete security should be assessed with standard LWE estimators (e.g., lattice-estimator).
-
----
-
-## Cryptographic Construction
-
-### MeteorNC-Core-KEM
-
-The KEM follows a standard LWE-based construction with FO transform:
-
-**Key Generation:**
-1. Derive matrix A ∈ Z_q^(k×n) from seeded RNG
-2. Sample s ← χ_η^n, e ← χ_η^k (Centered Binomial Distribution)
-3. Compute b = As + e
-4. Output pk = (A, b, pk_hash), sk = (s, z)
-
-**Encapsulation:**
-1. Sample random message m ← {0,1}^256
-2. Derive deterministic randomness r = H("random" ‖ m ‖ pk_hash)
-3. Compute ciphertext ct = (u, v) using hash-derived errors
-4. Output K = H("shared" ‖ m ‖ ct), ct
-
-**Decapsulation (with Implicit Rejection):**
-1. Decrypt to obtain m'
-2. Re-encrypt to verify ct' = ct
-3. If valid: K = H("shared" ‖ m' ‖ ct)
-4. If invalid: K = H("fail" ‖ z ‖ ct) ← **implicit rejection**
-
-### HybridKEM (KEM-DEM)
+## System Architecture
 
 ```
-K_kem → HKDF("aead-key") → k_aead → AES-GCM
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Meteor-NC System                            │
+├─────────────────────────────────────────────────────────────────────┤
+│  Security Layer (Established Primitives)                            │
+│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌─────────────────┐    │
+│  │   LWE    │  │    FO     │  │   HKDF   │  │ (X)ChaCha/AEAD  │    │
+│  │ Problem  │  │ Transform │  │ RFC 5869 │  │   (DEM layer)   │    │
+│  └──────────┘  └───────────┘  └──────────┘  └─────────────────┘    │
+├─────────────────────────────────────────────────────────────────────┤
+│  Implementation Layer (This Work)                                   │
+│  ┌──────────────┐  ┌───────────────┐  ┌────────────────────┐       │
+│  │  GPU Batch   │  │ 32-byte Seed  │  │  Protocol Layers   │       │
+│  │  Processing  │  │  Key Restore  │  │   (P2P / Stream)   │       │
+│  │  (4M ops/s)  │  │ (auth/repro)  │  │                    │       │
+│  └──────────────┘  └───────────────┘  └────────────────────┘       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-Domain separation ensures KEM and DEM key spaces are independent.
+## Quick Start
 
----
+### Basic KEM Usage
 
-## Implementation Highlights
+```python
+from meteor_nc.cryptography.core import LWEKEM
 
-### 1. GPU Batch Processing
+# Create KEM instance (NIST Level 1)
+kem = LWEKEM(n=256)
 
-Custom CUDA kernels for parallel encapsulation:
-- CBD sampling (Centered Binomial Distribution)
-- Matrix-vector multiplication
-- BLAKE3 hashing for key derivation
+# Generate keypair
+pk, sk = kem.key_gen()
+
+# Encapsulation (anyone with pk)
+K1, ct = kem.encaps()
+
+# Decapsulation (only sk holder)
+K2 = kem.decaps(ct)
+
+assert K1 == K2  # Shared secret matches!
+```
+
+### GPU Batch Processing
 
 ```python
 from meteor_nc.cryptography.batch import BatchLWEKEM
@@ -132,34 +110,107 @@ kem = BatchLWEKEM(n=256, device_id=0)
 kem.key_gen()
 
 # 100,000 parallel encapsulations
-K_batch, ct_batch, _ = kem.encaps_batch(100000)
-# → 4M+ ops/sec on RTX 4090
+K_batch, U_batch, V_batch = kem.encaps_batch(100000)
+# → 4M+ ops/sec on RTX-class GPUs
 ```
 
-### 2. Compact Key Storage
-
-Full key pairs derived from 32-byte master seed via HKDF:
+### Compact Key Storage (32-byte seed)
 
 ```python
-from meteor_nc.cryptography import create_kdf_meteor
+import secrets
+from meteor_nc.cryptography.core import LWEKEM
 
-kdf = create_kdf_meteor(security_level=256)
-kdf.key_gen()
+master_seed = secrets.token_bytes(32)
 
-seed = kdf.export_seed()  # 32 bytes only!
-# Later: restore full keys from seed
+# Generate keypair from seed
+kem1 = LWEKEM(n=256)
+pk1, sk1 = kem1.key_gen(seed=master_seed)
+
+# Later: restore deterministically
+kem2 = LWEKEM(n=256)
+pk2, sk2 = kem2.key_gen(seed=master_seed)
+
+assert pk1 == pk2 and sk1 == sk2  # Identical!
 ```
 
-### 3. CPU/GPU Interoperability
+> ⚠️ **Security note**: Deterministic mode is for device-bound auth/recovery. If `master_seed` leaks, the secret key leaks. For standard encryption, use `seed=None`.
 
-FO transform requires byte-exact ciphertext reconstruction. Hash-derived randomness (not backend RNG) ensures NumPy and CuPy produce identical ciphertexts:
+---
 
-```python
-# Works identically on CPU and GPU
-r_vec = small_error_from_seed(H("r" ‖ r), k)
-e1 = small_error_from_seed(H("e1" ‖ r), n)
-e2 = small_error_from_seed(H("e2" ‖ r), 8μ)
+## Parameter Sets
+
+| Level | n | k | q (default) | η | Shared Secret |
+|-------|-----|-----|-------------|-----|---------------|
+| 128-bit (NIST L1) | 256 | 256 | 2³²−5 | 2 | 32 bytes |
+| 192-bit (NIST L3) | 512 | 512 | 2³²−5 | 2 | 32 bytes |
+| 256-bit (NIST L5) | 1024 | 1024 | 2³²−5 | 3 | 32 bytes |
+
+**Backend note**: GPU batch uses `q = 2³²` via native `uint32` wrap-around for fast modular arithmetic.
+
+---
+
+## Cryptographic Construction
+
+### Key Generation
+
 ```
+1. Sample pk_seed (32B) → reconstruct A ∈ Z_q^{k×n}
+2. Sample s ← χ_η^n (secret), e ← χ_η^k (error)
+3. Compute b = A·s + e (mod q)
+4. Compute pk_hash = H(pk_seed || b)
+5. Sample z ← {0,1}^256 (implicit rejection key)
+6. Output: pk = (params, pk_seed, b, pk_hash), sk = (s, z)
+```
+
+### Encapsulation (FO-style)
+
+```
+1. Sample m ← {0,1}^n
+2. Derive (seed_r, seed_e1, seed_e2) ← G(m, pk_hash)
+3. Sample r, e1, e2 from seeds
+4. Compute: u = A^T·r + e1, v = b^T·r + e2 + Encode(m)
+5. K = HKDF(m || H(ct), info="shared-secret")
+6. Output: (K, ct=(u,v))
+```
+
+### Decapsulation with Implicit Rejection
+
+```
+1. Recover m' = Decode(v − s^T·u)
+2. Re-encrypt m' → (u', v')
+3. If (u,v) == (u',v'):
+     K = HKDF(m' || H(ct), info="shared-secret")
+   Else:
+     K = HKDF(z || H(ct), info="implicit-reject")  ← IND-CCA2
+```
+
+---
+
+## HybridKEM (KEM-DEM)
+
+```
+K_kem
+├─ HKDF(info="aead-key")  → k_aead  → AEAD (XChaCha20-Poly1305)
+└─ HKDF(info="mixer-key") → k_mix   → protocol binding (optional)
+```
+---
+
+## Design Goals
+
+Meteor-NC targets deployments where:
+
+- 🔒 Long-lived credentials must be **post-quantum**
+- 💾 Endpoints store only a **small secret** (32 bytes)
+- 🌐 Sessions established over untrusted networks with **IND-CCA2**
+- ⚡ Throughput matters more than single-shot latency
+
+Three compatible backends:
+
+| Backend | Use Case | Performance |
+|---------|----------|-------------|
+| **Core** | Portability, correctness | Baseline |
+| **Batch** | High-throughput (GPU) | 4M+ ops/sec |
+| **Stream** | Chunked AEAD transport | Real-time |
 
 ---
 
@@ -174,7 +225,7 @@ meteor_nc/
 │   ├── stream.py        # StreamDEM (chunked AEAD)
 │   └── kernels/         # CUDA kernels
 ├── protocols/
-│   ├── basic.py         # P2P messaging
+│   ├── meteor_protocols.py         # P2P messaging
 │   └── advanced.py      # Network simulation
 └── tests/
     ├── test_core.py     # Correctness tests
@@ -207,61 +258,6 @@ pip install -e ".[dev]"
 
 ---
 
-## Usage
-
-### Basic KEM
-
-```python
-from meteor_nc.cryptography import LWEKEM
-
-alice = LWEKEM(n=256)
-alice.key_gen()
-
-bob = LWEKEM(n=256)
-bob.key_gen()
-
-K, ct = bob.encaps()
-K_dec = alice.decaps(ct)
-
-assert K == K_dec
-```
-
-### Hybrid Encryption
-
-```python
-from meteor_nc.cryptography import HybridKEM
-
-kem = HybridKEM(n=256)
-kem.key_gen()
-
-ciphertext = kem.encrypt(b"Secret message", aad=b"metadata")
-plaintext = kem.decrypt(ciphertext, aad=b"metadata")
-```
-
----
-
-## Testing
-
-```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Individual suites
-python -m tests.test_core   # KEM correctness
-python -m tests.test_batch  # Batch operations
-python -m tests.test_stream # Stream DEM
-```
-
-### Test Coverage
-
-| Test | Description | Status |
-|------|-------------|--------|
-| B1 | Encaps/Decaps consistency | ✅ |
-| B2 | Implicit rejection isolation | ✅ |
-| B3 | GPU≡CPU consistency | ✅ |
-| B4 | Dtype/shape handling | ✅ |
-| B5 | Determinism | ✅ |
-| B6 | Performance benchmark | ✅ |
 
 ---
 
