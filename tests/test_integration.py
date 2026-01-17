@@ -648,24 +648,6 @@ def test_i7_performance() -> Dict:
 # I8. Device Binding (Auth)
 # =============================================================================
 
-よっしゃ！書くぞ～！！💪✨
-I8-I11 の修正版、いくよ！
-python# tests/test_integration.py (I8-I11 修正版)
-"""
-Meteor-NC P2P Protocol Integration Test Suite for TCHES
-
-I8-I11: Auth Layer Tests (Device Binding + Biometric)
-"""
-
-import secrets
-import time
-from typing import Dict
-from unittest.mock import patch
-
-# =============================================================================
-# I8. Device Binding (Auth) - 修正版
-# =============================================================================
-
 def test_i8_device_binding() -> Dict:
     """
     I8: Device-bound authentication (3FA)
