@@ -299,7 +299,7 @@ class MeteorPractical:
         K, kem_ct = recipient_kem.encaps()
         
         # 2. Derive session key from K
-        session_key = _sha256(b"practical-session-v2", K)
+        session_key = _sha256(b"session", K)
         stream_id = secrets.token_bytes(16)
         
         # 3. Encrypt with StreamDEM
@@ -381,7 +381,7 @@ class MeteorPractical:
         K = self._kem.decaps(kem_ct)
         
         # 2. Derive session key from K
-        session_key = _sha256(b"practical-session-v2", K)
+        session_key = _sha256(b"session", K)
         
         # 3. Decrypt with StreamDEM
         stream = StreamDEM(
