@@ -4,6 +4,7 @@ Meteor-NC: Post-Quantum Hybrid Cryptosystem
 
 WEB 4.0 Protocol Ready!
 - Post-Quantum Key Encapsulation (LWE-KEM)
+- Kyber-Style Coefficient Compression (v2.0) ← NEW!
 - High-Speed Streaming Encryption (XChaCha20-Poly1305)
 - P2P Communication Protocol (libp2p)
 - Decentralized Peer Discovery (Kademlia DHT)
@@ -18,6 +19,7 @@ Architecture:
     │  ├── cryptography/     # Core crypto primitives         │
     │  │   ├── core.py       # LWEKEM, HybridKEM (CPU)        │
     │  │   ├── batch.py      # BatchKEM (GPU accelerated)     │
+    │  │   ├── compression.py # Coefficient compression (v2)  │
     │  │   ├── stream.py     # StreamDEM (chunked encryption) │
     │  │   └── practical.py  # High-level API                 │
     │  │                                                      │
@@ -29,6 +31,11 @@ Architecture:
     │  └── auth/             # Authentication                 │
     │      └── core.py       # Device-bound 2FA/3FA          │
     └─────────────────────────────────────────────────────────┘
+
+v2.0 Compression:
+    - Wire-based FO transform (canonical form for verification)
+    - Ciphertext sizes: 518B (n=256), 1094B (n=512), 2310B (n=1024)
+    - ~75% bandwidth reduction vs uncompressed
 """
 
 __version__ = "2.1.0"
@@ -52,6 +59,25 @@ from .cryptography.core import (
     HybridKEM,
     SymmetricMixer,
 )
+
+# =============================================================================
+# Compression (v2.0) ← NEW!
+# =============================================================================
+
+COMPRESSION_AVAILABLE = False
+try:
+    from .cryptography.compression import (
+        compress,
+        decompress,
+        compress_ciphertext,
+        decompress_ciphertext,
+        compressed_size,
+        get_compression_params,
+        COMPRESSION_PARAMS,
+    )
+    COMPRESSION_AVAILABLE = True
+except ImportError:
+    pass
 
 # =============================================================================
 # Batch KEM (GPU required)
@@ -206,6 +232,17 @@ __all__ = [
     "SymmetricMixer",
     
     # -------------------------------------------------------------------------
+    # Compression (v2.0)
+    # -------------------------------------------------------------------------
+    "compress",
+    "decompress",
+    "compress_ciphertext",
+    "decompress_ciphertext",
+    "compressed_size",
+    "get_compression_params",
+    "COMPRESSION_PARAMS",
+    
+    # -------------------------------------------------------------------------
     # Batch KEM (GPU)
     # -------------------------------------------------------------------------
     "BatchLWEKEM",
@@ -283,6 +320,7 @@ __all__ = [
     # -------------------------------------------------------------------------
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
+    "COMPRESSION_AVAILABLE",
     "BATCH_AVAILABLE",
     "BATCH_MULTILEVEL_AVAILABLE",
     "STREAM_AVAILABLE",
@@ -314,13 +352,9 @@ def status() -> dict:
             'version': '2.1.0',
             'core': True,
             'gpu': False,
+            'compression': True,
             'batch': False,
             'stream': True,
-            'practical': True,
-            'protocol': True,
-            'advanced': True,
-            'web4': True,
-            'auth': True,
             ...
         }
     """
@@ -329,6 +363,7 @@ def status() -> dict:
         'core': True,  # Always available
         'gpu': GPU_AVAILABLE,
         'crypto': CRYPTO_AVAILABLE,
+        'compression': COMPRESSION_AVAILABLE,
         'batch': BATCH_AVAILABLE,
         'batch_multilevel': BATCH_MULTILEVEL_AVAILABLE,
         'stream': STREAM_AVAILABLE,
