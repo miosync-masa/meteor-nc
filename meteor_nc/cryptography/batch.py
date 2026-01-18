@@ -599,7 +599,7 @@ class BatchLWEKEM:
         batch: int,
         return_ct: bool = True,
         return_msg: bool = False,  # v2.0: Return message for wire-based KDF
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    ):
         """
         Batch encapsulation (encryption) - returns shared keys.
         
@@ -612,10 +612,14 @@ class BatchLWEKEM:
             return_msg: Return message bytes (for wire-based KDF)
         
         Returns:
-            K: (batch, 32) shared keys (WARNING: raw-coefficient based, use encaps() for wire-based)
-            U: (batch, n) ciphertext part 1 (if return_ct=True)
-            V: (batch, msg_bits) ciphertext part 2 (if return_ct=True)
-            M: (batch, msg_bytes) message bytes (if return_msg=True)
+            If return_msg=False (default, backward compatible):
+                K: (batch, 32) shared keys
+                U: (batch, n) or None
+                V: (batch, msg_bits) or None
+            If return_msg=True:
+                K, U, V, M: where M is (batch, msg_bytes)
+            
+            WARNING: K is raw-coefficient based. Use encaps() for wire-based K.
         """
         if self.A is None or self.b is None:
             raise ValueError("Public key not initialized")
@@ -668,17 +672,18 @@ class BatchLWEKEM:
         
         K = cp.asnumpy(K_gpu)
         
+        # Return with backward compatibility
         if not return_ct:
             if return_msg:
                 return K, None, None, M_np
-            return K, None, None, None
+            return K, None, None  # 3 values (backward compat)
         
         U_out = cp.asnumpy(U_t)
         V_out = cp.asnumpy(V_t)
         
         if return_msg:
-            return K, U_out, V_out, M_np
-        return K, U_out, V_out, None
+            return K, U_out, V_out, M_np  # 4 values (v2.0)
+        return K, U_out, V_out  # 3 values (backward compat)
     
     def decaps_batch(self, U: np.ndarray, V: np.ndarray) -> np.ndarray:
         """
