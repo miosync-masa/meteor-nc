@@ -21,7 +21,12 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-
+from .compression import (
+    compress_ciphertext,
+    decompress_ciphertext,
+    compressed_size,
+    D_U, D_V,
+)
 # =============================================================================
 # Constants
 # =============================================================================
@@ -297,6 +302,19 @@ class LWECiphertext:
         """Get wire format size in bytes."""
         return 8 + len(self.u) * 4 + len(self.v) * 4
 
+    def to_bytes_compressed(self, q: int) -> bytes:
+        """Compress and serialize (75% smaller)."""
+        return compress_ciphertext(self.u, self.v, q)
+
+    @classmethod
+    def from_bytes_compressed(cls, data: bytes, q: int) -> "LWECiphertext":
+        """Deserialize from compressed format."""
+        u, v = decompress_ciphertext(data, q)
+        return cls(u=u, v=v)
+    
+    def wire_size_compressed(self) -> int:
+        """Compressed size in bytes."""
+        return compressed_size(len(self.u), len(self.v))
 
 @dataclass
 class FullCiphertext:
