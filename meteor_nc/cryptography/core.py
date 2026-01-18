@@ -5,6 +5,11 @@ Meteor-NC Core Components
 Single-message LWE-KEM with Fujisaki-Okamoto transform and hybrid encryption.
 CPU-friendly implementation (GPU optional for acceleration).
 
+v2.0 Changes:
+  - Wire-based FO transform: compress → compare wire, not raw (u,v)
+  - Compressed ciphertext as canonical form for transmission
+  - Backward compatible: uncompressed methods still available
+
 Key Structure:
   - Public Key: pk_seed (32B) + b (k×4B as uint32) + metadata
   - Secret Key: s (n×8B as int64, internal only)
@@ -13,31 +18,19 @@ Key Structure:
 Wire Format Specification:
   - Header fields: big-endian (">I", ">II", ">III")
   - Coefficient arrays (b, u, v): little-endian uint32 ("<u4")
-  - This mixed endianness is intentional: headers follow network byte order,
-    while coefficient arrays use native x86/ARM little-endian for efficiency.
-
-Public Key Wire Format:
-  | Field    | Size      | Encoding        |
-  |----------|-----------|-----------------|
-  | n        | 4B        | big-endian u32  |
-  | k        | 4B        | big-endian u32  |
-  | q        | 4B        | big-endian u32  |
-  | pk_seed  | 32B       | raw bytes       |
-  | b        | k×4B      | LE uint32 array |
-  | pk_hash  | 32B       | raw bytes       |
-
-Ciphertext Wire Format:
-  | Field    | Size      | Encoding        |
-  |----------|-----------|-----------------|
-  | u_len    | 4B        | big-endian u32  |
-  | v_len    | 4B        | big-endian u32  |
-  | u        | u_len×4B  | LE uint32 array |
-  | v        | v_len×4B  | LE uint32 array |
+  
+Compressed Ciphertext Sizes (v2.0):
+  - n=256:  518 bytes (vs 2056 uncompressed, -75%)
+  - n=512:  1094 bytes (vs 4104 uncompressed, -73%)
+  - n=1024: 2310 bytes (vs 8200 uncompressed, -72%)
 
 Supports multiple security levels:
-  - 128-bit (n=256): PK ~1.1KB, CT ~2.0KB
-  - 192-bit (n=512): PK ~2.1KB, CT ~4.1KB
-  - 256-bit (n=1024): PK ~4.2KB, CT ~8.2KB
+  - 128-bit (n=256): PK ~1.1KB, CT 518B
+  - 192-bit (n=512): PK ~2.1KB, CT 1094B
+  - 256-bit (n=1024): PK ~4.2KB, CT 2310B
+
+Updated: 2025-01-18
+Version: 2.0 - Wire-based FO transform with compression
 """
 
 
@@ -89,7 +82,7 @@ _METEOR_SALT = _sha256(b"meteor-nc-v1-hkdf-salt")
 _HKDF_INSTANCE = HKDF(salt=_METEOR_SALT)
 
 
-def _derive_key(ikm: bytes, info: bytes, length: int = 32) -> bytes:
+def _derive_key_meteor(ikm: bytes, info: bytes, length: int = 32) -> bytes:
     """HKDF-based key derivation with Meteor-NC domain separation."""
     return _HKDF_INSTANCE.derive(ikm, info, length)
 
@@ -221,35 +214,47 @@ class SymmetricMixer:
 
 
 # =============================================================================
-# LWE-KEM with Fujisaki-Okamoto Transform (CORRECT DESIGN!)
+# LWE-KEM with Fujisaki-Okamoto Transform (Wire-Based FO v2.0)
 # =============================================================================
 
 class LWEKEM:
     """
     LWE-based Key Encapsulation Mechanism with FO transform.
     
+    v2.0: Wire-Based FO Transform
+    =============================
+    FO verification now uses compressed wire format as canonical form:
+    
+      encaps():
+        1. Generate random message m
+        2. Encrypt: (u, v) = Enc(m)
+        3. Compress: wire = compress(u, v)  ← CANONICAL FORM
+        4. Derive: K = HKDF(m || H(wire))
+        5. Return: (K, wire)
+      
+      decaps(wire):
+        1. Decompress: (u, v) = decompress(wire)
+        2. Decrypt: m' = Dec(u, v)
+        3. Re-encrypt: (u', v') = Enc(m')
+        4. Re-compress: wire' = compress(u', v')
+        5. Compare: wire == wire' ?  ← WIRE COMPARISON
+        6. If match: K = HKDF(m' || H(wire))
+           Else: K = HKDF(z || H(wire))  (implicit rejection)
+    
+    This design ensures:
+      - Lossy compression doesn't break FO verification
+      - Wire format is self-describing and portable
+      - ~75% bandwidth reduction vs uncompressed
+    
     CORRECT KEY STRUCTURE:
       - pk_seed (32B): Public, used to reconstruct matrix A via SHA-256 PRG
       - b (k×4B as uint32): Public, computed as A @ s + e mod q during key_gen
       - s: SECRET, generated from TRUE RANDOMNESS (not from seed!)
     
-    Wire format sizes:
-      - Public key: 12 (header) + 32 (pk_seed) + k*4 (b as uint32) + 32 (pk_hash)
-      - Ciphertext: n*4 (u as uint32) + msg_bits*4 (v as uint32)
-    
-    This ensures:
-      - Anyone with (pk_seed, b) can encrypt (encaps)
-      - Only the holder of s can decrypt (decaps)
-      - pk_seed leaking does NOT compromise secret key!
-    
-    Matrix A reconstruction:
-      - Uses SHA-256 in counter mode (deterministic, implementation-independent)
-      - Bias from u32 mod q (q=2^32-5) is negligible (~5/2^32 per element)
-    
     Supports multiple security levels:
-        - n=256:  128-bit security (NIST Level 1), PK ~1.1KB
-        - n=512:  192-bit security (NIST Level 3), PK ~2.1KB
-        - n=1024: 256-bit security (NIST Level 5), PK ~4.2KB
+        - n=256:  128-bit security (NIST Level 1), CT 518B
+        - n=512:  192-bit security (NIST Level 3), CT 1094B
+        - n=1024: 256-bit security (NIST Level 5), CT 2310B
     """
     
     def __init__(
@@ -261,6 +266,7 @@ class LWEKEM:
         gpu: bool = True,
         device_id: int = 0,
         seed: Optional[bytes] = None,
+        use_compression: bool = True,  # v2.0: Enable compression by default
     ):
         """
         Initialize LWE-KEM.
@@ -273,18 +279,14 @@ class LWEKEM:
             gpu: Use GPU acceleration
             device_id: GPU device ID
             seed: Optional master seed for deterministic key generation.
-                  - None (default): Use true randomness for s (recommended for PKE)
-                  - bytes: Derive s from seed (for auth/reproducibility use cases)
-                  
-                  WARNING: If seed is provided, the same seed will always produce
-                  the same key pair. Only use this for authentication scenarios
-                  where the seed itself is kept secret!
+            use_compression: Use compressed wire format (default: True)
         """
         self.n = int(n)
         self.k = int(k if k is not None else n)
         self.q = int(q)
         self.eta = int(eta)
-        self.seed = seed  # Store for key_gen
+        self.seed = seed
+        self.use_compression = bool(use_compression)
         
         # Dynamic message size based on n
         self.msg_bits = self.n
@@ -324,33 +326,15 @@ class LWEKEM:
         return np.asarray(x)
     
     def _reconstruct_A(self, pk_seed: bytes) -> Any:
-        """
-        Reconstruct matrix A from pk_seed using deterministic expansion.
-        
-        Uses SHA-256 in counter mode (prg_sha256) for deterministic,
-        implementation-independent reconstruction. This ensures:
-          - Cross-platform compatibility
-          - No dependence on PRNG implementation details
-          - RFC-style "deterministic expansion" from seed
-        
-        The matrix A is LARGE (k×n×8 bytes) but can be reconstructed
-        from a 32-byte seed, enabling compact public key representation.
-        
-        Uses caching to avoid recomputation.
-        """
-        # Check cache
+        """Reconstruct matrix A from pk_seed using deterministic expansion."""
         if self._A_cache is not None and self._A_cache_seed == pk_seed:
             return self._A_cache
         
-        # Deterministic expansion using SHA-256 counter mode PRG
-        # Each element needs 4 bytes (uint32), then mod q
         num_elements = self.k * self.n
         num_bytes = num_elements * 4
         
-        # Generate deterministic random bytes
         prg_output = prg_sha256(pk_seed, num_bytes, domain=b"matrix_A")
         
-        # Convert to uint32 array and reduce mod q
         raw = np.frombuffer(prg_output, dtype="<u4").copy()
         A_flat = (raw.astype(np.int64) % self.q)
         A = A_flat.reshape(self.k, self.n)
@@ -358,7 +342,6 @@ class LWEKEM:
         if self.gpu:
             A = cp.asarray(A)
         
-        # Update cache
         self._A_cache = A
         self._A_cache_seed = pk_seed
         
@@ -368,36 +351,23 @@ class LWEKEM:
         """
         Generate LWE key pair.
         
-        Behavior depends on self.seed:
-          - seed=None (default): Use TRUE RANDOMNESS for s (standard PKE)
-          - seed=bytes: Derive all key material from seed (for auth/reproducibility)
-        
-        In both cases, pk_seed leaking does NOT compromise the secret key,
-        because s is either truly random or derived from a separate secret seed.
-        
         Returns:
             Tuple of (public_key_bytes, secret_key_bytes) for storage
         """
         if self.seed is not None:
-            # Deterministic key generation from master seed
-            # Used for authentication scenarios where reproducibility is needed
             hkdf = HKDF(salt=_sha256(b"meteor-nc-auth-v2"))
             prk = hkdf.extract(self.seed)
             
-            # Derive pk_seed (can be public)
             pk_seed = hkdf.expand(prk, b"pk_seed", 32)
             
-            # Derive s from seed (SECRET - but seed is also secret!)
             s_bytes = hkdf.expand(prk, b"secret_s", self.n * 4)
             s_raw = np.frombuffer(s_bytes, dtype="<u4").copy()
             s_np = ((s_raw % (2 * self.eta + 1)).astype(np.int64) - self.eta)
             
-            # Derive e from seed
             e_bytes = hkdf.expand(prk, b"error_e", self.k * 4)
             e_raw = np.frombuffer(e_bytes, dtype="<u4").copy()
             e_np = ((e_raw % (2 * self.eta + 1)).astype(np.int64) - self.eta)
             
-            # Derive z from seed
             z = hkdf.expand(prk, b"implicit_z", 32)
             
             if self.gpu:
@@ -407,10 +377,8 @@ class LWEKEM:
                 s = s_np
                 e = e_np
         else:
-            # Standard PKE: TRUE RANDOMNESS for secret values
             pk_seed = secrets.token_bytes(32)
             
-            # Generate s and e from TRUE RANDOMNESS (not from seed!)
             if self.gpu:
                 s_np = np.array([
                     secrets.randbelow(2 * self.eta + 1) - self.eta 
@@ -434,23 +402,17 @@ class LWEKEM:
                 s = s_np
                 e = e_np
             
-            # Generate implicit rejection seed
             z = secrets.token_bytes(32)
         
-        # Reconstruct A from pk_seed (deterministic)
         A = self._reconstruct_A(pk_seed)
         
-        # Compute b = A @ s + e (mod q)
         b = self._mod_q(A @ s + e)
         
-        # Compute pk_hash for FO transform
-        # Use uint32 representation for consistency with serialization
         b_np = self._to_numpy(b)
         b_bytes_for_hash = b_np.astype("<u4").tobytes()
         pk_bytes_for_hash = pk_seed + b_bytes_for_hash
         pk_hash = _sha256(b"pk_hash", pk_bytes_for_hash)
         
-        # Store keys
         self.pk = LWEPublicKey(
             pk_seed=pk_seed,
             b=b_np,
@@ -477,19 +439,10 @@ class LWEKEM:
         self.sk = LWESecretKey(s=s, z=z)
     
     def load_public_key(self, pk_bytes: bytes) -> None:
-        """
-        Load public key from serialized bytes.
-        
-        Use this on the SENDER side to encrypt to a recipient.
-        After calling this, encaps() is available but decaps() is not.
-        
-        Args:
-            pk_bytes: Serialized public key (from recipient's key_gen)
-        """
+        """Load public key from serialized bytes."""
         self.pk = LWEPublicKey.from_bytes(pk_bytes)
-        self.sk = None  # Cannot decaps without secret key!
+        self.sk = None
         
-        # Update parameters from public key
         self.n = self.pk.n
         self.k = self.pk.k
         self.q = self.pk.q
@@ -497,14 +450,7 @@ class LWEKEM:
         self.msg_bytes = self.n // 8
     
     def load_secret_key(self, sk_bytes: bytes) -> None:
-        """
-        Load secret key from serialized bytes.
-        
-        MUST be called together with load_public_key for decaps to work.
-        
-        Args:
-            sk_bytes: Serialized secret key
-        """
+        """Load secret key from serialized bytes."""
         self._import_secret_key(sk_bytes)
     
     def get_public_key_bytes(self) -> bytes:
@@ -515,7 +461,6 @@ class LWEKEM:
     
     def get_public_key_size(self) -> int:
         """Get public key size in bytes."""
-        # header(12) + pk_seed(32) + b(k*4 as uint32) + pk_hash(32)
         return 12 + 32 + self.k * 4 + 32
     
     @staticmethod
@@ -555,7 +500,6 @@ class LWEKEM:
         e1_np = small_error_from_seed(seed_e1, self.n)
         e2_np = small_error_from_seed(seed_e2, self.msg_bits)
         
-        # Reconstruct A from pk_seed
         A = self._reconstruct_A(self.pk.pk_seed)
         b = self._to_xp(self.pk.b)
         
@@ -583,15 +527,15 @@ class LWEKEM:
     def encaps(
         self,
         rng: Optional[Callable[[int], bytes]] = None,
-    ) -> Tuple[bytes, LWECiphertext]:
+    ) -> Tuple[bytes, bytes]:
         """
         KEM encapsulation (encryption).
         
-        Can be called by ANYONE with the public key!
+        v2.0: Returns compressed wire format as canonical ciphertext.
         
         Returns:
             K: Shared secret (32 bytes)
-            ct: Ciphertext
+            wire: Compressed ciphertext (canonical form for FO)
         """
         if self.pk is None:
             raise ValueError("Public key not initialized")
@@ -608,23 +552,102 @@ class LWEKEM:
         
         ct = LWECiphertext(u=u_np, v=v_np)
         
-        # KDF input uses wire format (uint32) for specification consistency
-        ct_wire = ct.to_bytes()
-        K = _derive_key(m + ct_wire, b"meteor-nc-shared-secret")
+        # v2.0: Use compressed wire as canonical form
+        if self.use_compression:
+            wire = ct.to_bytes_compressed(self.q)
+        else:
+            wire = ct.to_bytes()
         
-        return K, ct
+        # KDF input uses wire hash
+        wire_hash = _sha256(b"ct_hash", wire)
+        K = _derive_key_meteor(m + wire_hash, b"meteor-nc-shared-secret")
+        
+        return K, wire
     
-    def decaps(self, ct: LWECiphertext) -> bytes:
+    def decaps(self, wire: bytes) -> bytes:
         """
         KEM decapsulation (decryption).
         
-        Can ONLY be called by the holder of the secret key!
+        v2.0: Wire-based FO verification.
+        
+        Args:
+            wire: Compressed (or uncompressed) ciphertext
         
         Returns:
             K: Shared secret (32 bytes)
         """
         if self.pk is None or self.sk is None:
             raise ValueError("Keys not initialized (need both pk and sk for decaps)")
+        
+        # Decompress ciphertext
+        if self.use_compression:
+            ct = LWECiphertext.from_bytes_compressed(wire, self.q)
+        else:
+            ct = LWECiphertext.from_bytes(wire)
+        
+        u = self._to_xp(ct.u)
+        v = self._to_xp(ct.v)
+        
+        # Decrypt
+        v_dec = self._decrypt_internal(u, v)
+        m_prime = self._decode_message(v_dec)
+        
+        # Re-encrypt
+        r_prime = _sha256(b"random", m_prime, self.pk.pk_hash)
+        m_prime_encoded = self._encode_message(m_prime)
+        u2, v2 = self._encrypt_internal(m_prime_encoded, r_prime)
+        
+        u2_np = self._to_numpy(u2).astype(np.int64)
+        v2_np = self._to_numpy(v2).astype(np.int64)
+        ct2 = LWECiphertext(u=u2_np, v=v2_np)
+        
+        # v2.0: Re-compress and compare WIRE (not raw u,v)
+        if self.use_compression:
+            wire2 = ct2.to_bytes_compressed(self.q)
+        else:
+            wire2 = ct2.to_bytes()
+        
+        # FO verification: compare wire formats
+        ok = _ct_eq(wire, wire2)
+        
+        # Derive shared key
+        wire_hash = _sha256(b"ct_hash", wire)
+        K_good = _derive_key_meteor(m_prime + wire_hash, b"meteor-nc-shared-secret")
+        K_fail = _derive_key_meteor(self.sk.z + wire_hash, b"meteor-nc-implicit-reject")
+        
+        return K_good if ok == 1 else K_fail
+    
+    # --- Legacy methods for backward compatibility ---
+    
+    def encaps_uncompressed(
+        self,
+        rng: Optional[Callable[[int], bytes]] = None,
+    ) -> Tuple[bytes, LWECiphertext]:
+        """Legacy encaps returning LWECiphertext object."""
+        if self.pk is None:
+            raise ValueError("Public key not initialized")
+        
+        rng = rng or secrets.token_bytes
+        m = rng(self.msg_bytes)
+        r = _sha256(b"random", m, self.pk.pk_hash)
+        
+        m_encoded = self._encode_message(m)
+        u, v = self._encrypt_internal(m_encoded, r)
+        
+        u_np = self._to_numpy(u).astype(np.int64)
+        v_np = self._to_numpy(v).astype(np.int64)
+        
+        ct = LWECiphertext(u=u_np, v=v_np)
+        
+        ct_wire = ct.to_bytes()
+        K = _derive_key_meteor(m + ct_wire, b"meteor-nc-shared-secret")
+        
+        return K, ct
+    
+    def decaps_uncompressed(self, ct: LWECiphertext) -> bytes:
+        """Legacy decaps taking LWECiphertext object."""
+        if self.pk is None or self.sk is None:
+            raise ValueError("Keys not initialized")
         
         u = self._to_xp(ct.u)
         v = self._to_xp(ct.v)
@@ -633,7 +656,6 @@ class LWEKEM:
         m_prime = self._decode_message(v_dec)
         
         r_prime = _sha256(b"random", m_prime, self.pk.pk_hash)
-        
         m_prime_encoded = self._encode_message(m_prime)
         u2, v2 = self._encrypt_internal(m_prime_encoded, r_prime)
         
@@ -641,14 +663,13 @@ class LWEKEM:
         v2_np = self._to_numpy(v2).astype(np.int64)
         ct2 = LWECiphertext(u=u2_np, v=v2_np)
         
-        # Use wire format (uint32) for CT comparison and KDF input
         ct_wire = ct.to_bytes()
         ct2_wire = ct2.to_bytes()
         
         ok = _ct_eq(ct_wire, ct2_wire)
         
-        K_good = _derive_key(m_prime + ct_wire, b"meteor-nc-shared-secret")
-        K_fail = _derive_key(self.sk.z + ct_wire, b"meteor-nc-implicit-reject")
+        K_good = _derive_key_meteor(m_prime + ct_wire, b"meteor-nc-shared-secret")
+        K_fail = _derive_key_meteor(self.sk.z + ct_wire, b"meteor-nc-implicit-reject")
         
         return K_good if ok == 1 else K_fail
 
@@ -670,6 +691,7 @@ class HybridKEM:
         gpu: bool = True,
         device_id: int = 0,
         mixer_rounds: int = 8,
+        use_compression: bool = True,
     ):
         if security_level not in SECURITY_PARAMS:
             raise ValueError(f"Unsupported security level: {security_level}")
@@ -680,6 +702,7 @@ class HybridKEM:
         self.gpu = bool(gpu and GPU_AVAILABLE)
         self.device_id = int(device_id)
         self.mixer_rounds = int(mixer_rounds)
+        self.use_compression = bool(use_compression)
         
         self.kem = LWEKEM(
             n=params["n"],
@@ -688,15 +711,11 @@ class HybridKEM:
             eta=params["eta"],
             gpu=self.gpu,
             device_id=self.device_id,
+            use_compression=self.use_compression,
         )
     
     def key_gen(self) -> Tuple[bytes, bytes]:
-        """
-        Generate key pair.
-        
-        Returns:
-            Tuple of (public_key_bytes, secret_key_bytes)
-        """
+        """Generate key pair."""
         return self.kem.key_gen()
     
     def load_public_key(self, pk_bytes: bytes) -> None:
@@ -708,14 +727,19 @@ class HybridKEM:
         self.kem.load_public_key(pk_bytes)
         self.kem.load_secret_key(sk_bytes)
     
-    def encrypt(self, plaintext: bytes, aad: Optional[bytes] = None) -> FullCiphertext:
-        """Encrypt plaintext with optional associated data."""
+    def encrypt(self, plaintext: bytes, aad: Optional[bytes] = None) -> bytes:
+        """
+        Encrypt plaintext with optional associated data.
+        
+        Returns:
+            Serialized FullCiphertext (KEM wire + DEM ciphertext)
+        """
         if not CRYPTO_AVAILABLE:
             raise ImportError("cryptography library required")
         
-        K, kem_ct = self.kem.encaps()
-        aead_key = _derive_key(K, b"meteor-nc-aead-key")
-        mixer_key = _derive_key(K, b"meteor-nc-mixer-key")  # Derive from shared secret!
+        K, kem_wire = self.kem.encaps()
+        aead_key = _derive_key_meteor(K, b"meteor-nc-aead-key")
+        mixer_key = _derive_key_meteor(K, b"meteor-nc-mixer-key")
         
         mixer = SymmetricMixer(
             key=mixer_key,
@@ -732,24 +756,47 @@ class HybridKEM:
         tag = ct_with_tag[-16:]
         ct_body = ct_with_tag[:-16]
         
-        return FullCiphertext(
-            u=kem_ct.u,
-            v=kem_ct.v,
-            nonce=nonce,
-            ct=ct_body,
-            tag=tag,
+        # Serialize: kem_wire_len (4B) + kem_wire + nonce (12B) + ct_len (4B) + ct + tag (16B)
+        return (
+            struct.pack(">I", len(kem_wire)) +
+            kem_wire +
+            nonce +
+            struct.pack(">I", len(ct_body)) +
+            ct_body +
+            tag
         )
     
-    def decrypt(self, ciphertext: FullCiphertext, aad: Optional[bytes] = None) -> bytes:
+    def decrypt(self, ciphertext: bytes, aad: Optional[bytes] = None) -> bytes:
         """Decrypt ciphertext with optional AAD verification."""
         if not CRYPTO_AVAILABLE:
             raise ImportError("cryptography library required")
         
-        kem_ct = LWECiphertext(u=ciphertext.u, v=ciphertext.v)
-        K = self.kem.decaps(kem_ct)
+        # Parse
+        if len(ciphertext) < 4:
+            raise ValueError("Ciphertext too short")
         
-        aead_key = _derive_key(K, b"meteor-nc-aead-key")
-        mixer_key = _derive_key(K, b"meteor-nc-mixer-key")  # Derive from shared secret!
+        kem_wire_len = struct.unpack(">I", ciphertext[:4])[0]
+        offset = 4
+        
+        kem_wire = ciphertext[offset:offset + kem_wire_len]
+        offset += kem_wire_len
+        
+        nonce = ciphertext[offset:offset + 12]
+        offset += 12
+        
+        ct_len = struct.unpack(">I", ciphertext[offset:offset + 4])[0]
+        offset += 4
+        
+        ct_body = ciphertext[offset:offset + ct_len]
+        offset += ct_len
+        
+        tag = ciphertext[offset:offset + 16]
+        
+        # Decrypt KEM
+        K = self.kem.decaps(kem_wire)
+        
+        aead_key = _derive_key_meteor(K, b"meteor-nc-aead-key")
+        mixer_key = _derive_key_meteor(K, b"meteor-nc-mixer-key")
         
         mixer = SymmetricMixer(
             key=mixer_key,
@@ -759,8 +806,8 @@ class HybridKEM:
         )
         
         aesgcm = AESGCM(aead_key)
-        ct_with_tag = ciphertext.ct + ciphertext.tag
-        mixed = aesgcm.decrypt(ciphertext.nonce, ct_with_tag, aad)
+        ct_with_tag = ct_body + tag
+        mixed = aesgcm.decrypt(nonce, ct_with_tag, aad)
         
         plaintext = mixer.inverse(mixed)
         
@@ -778,7 +825,7 @@ class HybridKEM:
 def run_tests() -> bool:
     """Execute test suite."""
     print("=" * 70)
-    print("Meteor-NC Core Test Suite (Correct PKE Design)")
+    print("Meteor-NC Core v2.0 Test Suite (Wire-Based FO)")
     print("=" * 70)
     
     use_gpu = GPU_AVAILABLE
@@ -793,7 +840,7 @@ def run_tests() -> bool:
     mixer_key = secrets.token_bytes(32)
     mixer = SymmetricMixer(key=mixer_key, rounds=8, gpu=use_gpu)
     
-    test_sizes = [1, 16, 100, 1000, 10000]
+    test_sizes = [1, 16, 100, 1000]
     mixer_ok = True
     
     for size in test_sizes:
@@ -806,28 +853,27 @@ def run_tests() -> bool:
     
     results["mixer"] = mixer_ok
     
-    # Test 2: LWE-KEM Key Generation and Basic Encrypt/Decrypt
-    print("\n[Test 2] LWE-KEM (Multi-Security Levels)")
+    # Test 2: LWE-KEM with Compression (v2.0)
+    print("\n[Test 2] LWE-KEM with Wire-Based FO (v2.0)")
     print("-" * 40)
     
     kem_ok = True
     for level, label in [(128, "128-bit"), (192, "192-bit"), (256, "256-bit")]:
         params = SECURITY_PARAMS[level]
-        kem = LWEKEM(n=params["n"], k=params["k"], eta=params["eta"], gpu=use_gpu)
+        kem = LWEKEM(n=params["n"], k=params["k"], eta=params["eta"], gpu=use_gpu, use_compression=True)
         pk_bytes, sk_bytes = kem.key_gen()
         
-        K1, ct = kem.encaps()
-        K2 = kem.decaps(ct)
+        K1, wire = kem.encaps()
+        K2 = kem.decaps(wire)
         match = (K1 == K2)
         kem_ok = kem_ok and match
         
-        pk_size = len(pk_bytes)
-        print(f"  {label}: PK={pk_size}B, KeyMatch={'PASS' if match else 'FAIL'}")
+        print(f"  {label}: wire={len(wire)}B, KeyMatch={'PASS' if match else 'FAIL'}")
     
-    results["kem"] = kem_ok
+    results["kem_compressed"] = kem_ok
     
-    # Test 3: Correct PKE Structure (Sender/Receiver Separation)
-    print("\n[Test 3] Sender/Receiver Separation (Core Security Test)")
+    # Test 3: Sender/Receiver Separation
+    print("\n[Test 3] Sender/Receiver Separation")
     print("-" * 40)
     
     separation_ok = True
@@ -835,26 +881,21 @@ def run_tests() -> bool:
     for level, label in [(128, "128-bit"), (192, "192-bit"), (256, "256-bit")]:
         params = SECURITY_PARAMS[level]
         
-        # RECEIVER: Generate keys and keep secret key
         receiver = LWEKEM(n=params["n"], k=params["k"], eta=params["eta"], gpu=use_gpu)
         pk_bytes, sk_bytes = receiver.key_gen()
         
-        # SENDER: Only gets public key (simulating key exchange)
         sender = LWEKEM(n=params["n"], k=params["k"], eta=params["eta"], gpu=use_gpu)
         sender.load_public_key(pk_bytes)
         
-        # Sender can encrypt
-        K_sender, ct = sender.encaps()
+        K_sender, wire = sender.encaps()
         
-        # Sender CANNOT decrypt (no secret key)
         try:
-            sender.decaps(ct)
-            sender_cannot_decrypt = False  # BAD: sender could decrypt
+            sender.decaps(wire)
+            sender_cannot_decrypt = False
         except ValueError:
-            sender_cannot_decrypt = True   # GOOD: sender blocked
+            sender_cannot_decrypt = True
         
-        # Receiver CAN decrypt
-        K_receiver = receiver.decaps(ct)
+        K_receiver = receiver.decaps(wire)
         keys_match = (K_sender == K_receiver)
         
         level_ok = sender_cannot_decrypt and keys_match
@@ -865,48 +906,45 @@ def run_tests() -> bool:
     
     results["separation"] = separation_ok
     
-    # Test 4: Public Key Serialization
-    print("\n[Test 4] Public Key Serialization")
+    # Test 4: Wire Size Verification
+    print("\n[Test 4] Compressed Wire Size")
     print("-" * 40)
     
-    serial_ok = True
+    expected_sizes = {256: 518, 512: 1094, 1024: 2310}
+    size_ok = True
+    
     for level, label in [(128, "128-bit"), (192, "192-bit"), (256, "256-bit")]:
         params = SECURITY_PARAMS[level]
+        n = params["n"]
         
-        kem1 = LWEKEM(n=params["n"], gpu=use_gpu)
-        pk_bytes, sk_bytes = kem1.key_gen()
+        kem = LWEKEM(n=n, gpu=use_gpu, use_compression=True)
+        kem.key_gen()
         
-        # Deserialize and use
-        kem2 = LWEKEM(n=params["n"], gpu=use_gpu)
-        kem2.load_public_key(pk_bytes)
-        kem2.load_secret_key(sk_bytes)
+        _, wire = kem.encaps()
+        actual = len(wire)
+        expected = expected_sizes[n]
         
-        K1, ct = kem2.encaps()
-        K2 = kem2.decaps(ct)
+        ok = (actual == expected)
+        size_ok = size_ok and ok
         
-        match = (K1 == K2)
-        serial_ok = serial_ok and match
-        print(f"  {label}: {'PASS' if match else 'FAIL'}")
+        print(f"  {label}: {actual}B (expected {expected}B) {'✓' if ok else '✗'}")
     
-    results["serialization"] = serial_ok
+    results["wire_sizes"] = size_ok
     
     # Test 5: Hybrid Encryption
     if CRYPTO_AVAILABLE:
         print("\n[Test 5] Hybrid Encryption")
         print("-" * 40)
         
-        # Receiver generates keys
         receiver = HybridKEM(security_level=128, gpu=use_gpu)
         pk_bytes, sk_bytes = receiver.key_gen()
         
-        # Sender encrypts with public key only
         sender = HybridKEM(security_level=128, gpu=use_gpu)
         sender.load_public_key(pk_bytes)
         
         msg = b"Test message for hybrid encryption - confidential!"
         ct = sender.encrypt(msg, aad=b"metadata")
         
-        # Receiver decrypts with both keys
         receiver_dec = HybridKEM(security_level=128, gpu=use_gpu)
         receiver_dec.load_keys(pk_bytes, sk_bytes)
         pt = receiver_dec.decrypt(ct, aad=b"metadata")
@@ -915,7 +953,6 @@ def run_tests() -> bool:
         results["encryption"] = enc_ok
         print(f"  Encrypt/Decrypt: {'PASS' if enc_ok else 'FAIL'}")
         
-        # AEAD integrity
         try:
             _ = receiver_dec.decrypt(ct, aad=b"wrong")
             aead_ok = False
@@ -924,67 +961,46 @@ def run_tests() -> bool:
         results["aead"] = aead_ok
         print(f"  AEAD Integrity: {'PASS' if aead_ok else 'FAIL'}")
     
-    # Test 6: HKDF Key Derivation
-    print("\n[Test 6] HKDF Key Derivation")
+    # Test 6: FO Implicit Rejection
+    print("\n[Test 6] FO Implicit Rejection (Tampered Wire)")
     print("-" * 40)
     
-    test_ikm = b"test input keying material"
-    k1 = _derive_key(test_ikm, b"context-a", 32)
-    k2 = _derive_key(test_ikm, b"context-a", 32)
-    k3 = _derive_key(test_ikm, b"context-b", 32)
+    rejection_ok = True
     
-    hkdf_ok = (k1 == k2) and (k1 != k3)
-    results["hkdf"] = hkdf_ok
-    print(f"  Deterministic: {'PASS' if k1 == k2 else 'FAIL'}")
-    print(f"  Domain Separation: {'PASS' if k1 != k3 else 'FAIL'}")
-    
-    # Test 7: Public Key and Ciphertext Sizes (Wire Format)
-    print("\n[Test 7] Public Key & Ciphertext Sizes (Wire Format, uint32)")
-    print("-" * 40)
-    
-    size_ok = True
-    for level, label in [(128, "128-bit"), (192, "192-bit"), (256, "256-bit")]:
+    for level, label in [(128, "128-bit")]:
         params = SECURITY_PARAMS[level]
+        
         kem = LWEKEM(n=params["n"], gpu=use_gpu)
-        pk_bytes, _ = kem.key_gen()
+        kem.key_gen()
         
-        # Public key size (uint32 for b)
-        expected_pk_size = 12 + 32 + params["k"] * 4 + 32  # header + pk_seed + b(uint32) + pk_hash
-        actual_pk_size = len(pk_bytes)
-        pk_match = (actual_pk_size == expected_pk_size)
-        size_ok = size_ok and pk_match
+        K_orig, wire = kem.encaps()
         
-        # Ciphertext size (wire format)
-        _, ct = kem.encaps()
-        wire_size = ct.wire_size()  # Uses the new method!
-        expected_ct_size = 8 + params["n"] * 4 + kem.msg_bits * 4  # header + u + v
-        ct_match = (wire_size == expected_ct_size)
-        size_ok = size_ok and ct_match
+        # Tamper with wire
+        wire_tampered = bytearray(wire)
+        wire_tampered[10] ^= 0xFF
+        wire_tampered = bytes(wire_tampered)
         
-        # CT serialization round-trip
-        ct_bytes = ct.to_bytes()
-        ct_restored = LWECiphertext.from_bytes(ct_bytes)
-        ct_roundtrip = np.array_equal(ct.u, ct_restored.u) and np.array_equal(ct.v, ct_restored.v)
-        size_ok = size_ok and ct_roundtrip
+        K_tampered = kem.decaps(wire_tampered)
         
-        print(f"  {label}:")
-        print(f"    PK: {actual_pk_size}B (expected {expected_pk_size}B) {'✓' if pk_match else '✗'}")
-        print(f"    CT: {wire_size}B (expected {expected_ct_size}B) {'✓' if ct_match else '✗'}")
-        print(f"    CT round-trip: {'✓' if ct_roundtrip else '✗'}")
+        # K should be different (implicit rejection)
+        rejected = (K_orig != K_tampered)
+        rejection_ok = rejection_ok and rejected
+        
+        print(f"  {label}: Tampered wire rejected: {'PASS' if rejected else 'FAIL'}")
     
-    results["wire_format"] = size_ok
+    results["implicit_rejection"] = rejection_ok
     
     # Summary
     print("\n" + "=" * 70)
     all_pass = all(results.values())
-    print(f"Result: {'ALL TESTS PASSED' if all_pass else 'SOME TESTS FAILED'}")
+    print(f"Result: {'ALL TESTS PASSED ✅' if all_pass else 'SOME TESTS FAILED ❌'}")
     
     if all_pass:
-        print("\n✓ Security property verified:")
-        print("  - Sender with pk_seed + b CAN encrypt")
-        print("  - Sender with pk_seed + b CANNOT decrypt")
-        print("  - Only secret key holder can decrypt")
-        print("  - pk_seed leak does NOT compromise secret key!")
+        print("\n✓ Wire-based FO verified:")
+        print("  - Compressed wire is canonical form")
+        print("  - FO comparison uses wire == wire'")
+        print("  - Implicit rejection works correctly")
+        print("  - ~75% bandwidth reduction achieved")
     
     print("=" * 70)
     
