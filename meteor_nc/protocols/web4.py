@@ -1105,7 +1105,6 @@ class MeteorWeb4Node:
         K, kem_ct = peer_kem.encaps()
         
         # Derive session key and encrypt payload
-        from .web4 import StreamDEM  # or wherever it is
         session_key = _sha256(b"session", K)
         nonce = secrets.token_bytes(16)
         
