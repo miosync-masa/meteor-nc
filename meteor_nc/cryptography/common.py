@@ -9,6 +9,15 @@ Wire Format Specification:
   - Coefficient arrays (b, u, v): little-endian uint32 ("<u4")
   - This mixed endianness is intentional: headers follow network byte order,
     while coefficient arrays use native x86/ARM little-endian for efficiency.
+
+Compressed Wire Format (v2.0):
+  - Uses Kyber-style coefficient compression
+  - Level-specific d_u: 11 (n=256), 12 (n=512), 13 (n=1024)
+  - d_v = 5 for all levels
+  - Size reduction: ~75% vs uncompressed
+
+Updated: 2025-01-18
+Version: 2.0 - Added compression support
 """
 
 from __future__ import annotations
@@ -21,12 +30,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from .compression import (
-    compress_ciphertext,
-    decompress_ciphertext,
-    compressed_size,
-    D_U, D_V,
-)
+
 # =============================================================================
 # Constants
 # =============================================================================
@@ -192,6 +196,20 @@ class CenteredBinomial:
 
 
 # =============================================================================
+# Compression Support (v2.0)
+# =============================================================================
+
+# Import compression functions
+from .compression import (
+    compress_ciphertext,
+    decompress_ciphertext,
+    compressed_size,
+    get_compression_params,
+    Q_DEFAULT as COMPRESSION_Q,
+)
+
+
+# =============================================================================
 # Data Structures
 # =============================================================================
 
@@ -260,18 +278,36 @@ class LWECiphertext:
     """
     LWE ciphertext: (u, v)
     
-    Wire format (uint32 little-endian):
-      - header: 8 bytes (u_len, v_len as big-endian u32)
-      - u: u_len×4 bytes
-      - v: v_len×4 bytes
+    Wire Formats:
+    
+    1. Uncompressed (original, for internal use):
+       - header: 8 bytes (u_len, v_len as big-endian u32)
+       - u: u_len×4 bytes (LE uint32)
+       - v: v_len×4 bytes (LE uint32)
+    
+    2. Compressed (v2.0, for transmission):
+       - header: 6 bytes (n, msg_bits, d_u, d_v)
+       - u_packed: ceil(n * d_u / 8) bytes
+       - v_packed: ceil(msg_bits * d_v / 8) bytes
+       
+       Sizes (msg_bits = n):
+         n=256:  518 bytes (-75% vs uncompressed)
+         n=512:  1094 bytes (-73%)
+         n=1024: 2310 bytes (-72%)
+    
+    FO Transform Note:
+      When using compression, FO verification should compare
+      compressed wire formats (not raw u, v arrays).
     
     Internal representation uses int64 for computation headroom.
     """
     u: np.ndarray  # (n,) vector, int64 internally
     v: np.ndarray  # (msg_bits,) vector, int64 internally
     
+    # --- Uncompressed Wire Format (Original) ---
+    
     def to_bytes(self) -> bytes:
-        """Serialize to wire format (uint32 little-endian)."""
+        """Serialize to uncompressed wire format (uint32 little-endian)."""
         return (
             struct.pack(">II", len(self.u), len(self.v)) +
             self.u.astype("<u4").tobytes() +
@@ -280,7 +316,7 @@ class LWECiphertext:
     
     @classmethod
     def from_bytes(cls, data: bytes) -> "LWECiphertext":
-        """Deserialize from wire format with input validation."""
+        """Deserialize from uncompressed wire format with input validation."""
         if len(data) < 8:
             raise ValueError(f"LWECiphertext too short: {len(data)} < 8 bytes")
         
@@ -299,22 +335,49 @@ class LWECiphertext:
         return cls(u=u, v=v)
     
     def wire_size(self) -> int:
-        """Get wire format size in bytes."""
+        """Get uncompressed wire format size in bytes."""
         return 8 + len(self.u) * 4 + len(self.v) * 4
-
-    def to_bytes_compressed(self, q: int) -> bytes:
-        """Compress and serialize (75% smaller)."""
+    
+    # --- Compressed Wire Format (v2.0) ---
+    
+    def to_bytes_compressed(self, q: int = Q_DEFAULT) -> bytes:
+        """
+        Serialize to compressed wire format.
+        
+        This is the CANONICAL form for FO transform verification.
+        Use this for transmission and FO comparison.
+        
+        Args:
+            q: Modulus (default: Q_DEFAULT)
+        
+        Returns:
+            Compressed bytes
+        """
         return compress_ciphertext(self.u, self.v, q)
-
+    
     @classmethod
-    def from_bytes_compressed(cls, data: bytes, q: int) -> "LWECiphertext":
-        """Deserialize from compressed format."""
+    def from_bytes_compressed(cls, data: bytes, q: int = Q_DEFAULT) -> "LWECiphertext":
+        """
+        Deserialize from compressed wire format.
+        
+        Note: Decompressed values will differ slightly from originals
+        due to lossy compression. This is expected and safe within
+        the error bounds defined by d_u, d_v parameters.
+        
+        Args:
+            data: Compressed bytes
+            q: Modulus (default: Q_DEFAULT)
+        
+        Returns:
+            LWECiphertext with decompressed u, v
+        """
         u, v = decompress_ciphertext(data, q)
         return cls(u=u, v=v)
     
     def wire_size_compressed(self) -> int:
-        """Compressed size in bytes."""
+        """Get compressed wire format size in bytes."""
         return compressed_size(len(self.u), len(self.v))
+
 
 @dataclass
 class FullCiphertext:
