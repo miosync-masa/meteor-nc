@@ -12,27 +12,44 @@ Wire Format:
   - Coefficient arrays: little-endian uint32
 """
 
+ Common utilities and data structures
 from .common import (
     # Constants
-    HKDF,
     Q_DEFAULT,
+    SECURITY_PARAMS,
     MSG_BYTES,
     MSG_BITS,
-    SECURITY_PARAMS,
     GPU_AVAILABLE,
     CRYPTO_AVAILABLE,
     # Utilities
     _sha256,
+    _ct_eq,
+    _derive_key,
     prg_sha256,
     small_error_from_seed,
-    # Data structures (wire format support)
+    # HKDF
+    HKDF,
+    # Data structures
     LWEPublicKey,
     LWESecretKey,
     LWECiphertext,
     FullCiphertext,
+    # CBD
     CenteredBinomial,
 )
 
+# Compression (v2.0)
+from .compression import (
+    compress,
+    decompress,
+    compress_ciphertext,
+    decompress_ciphertext,
+    compressed_size,
+    get_compression_params,
+    COMPRESSION_PARAMS,
+)
+
+# Core KEM
 from .core import (
     LWEKEM,
     HybridKEM,
@@ -82,6 +99,14 @@ __all__ = [
     "BatchLWEKEM",
     "BatchHybridKEM",
     "BatchCiphertext",
+    # Compression
+    "compress",
+    "decompress",
+    "compress_ciphertext",
+    "decompress_ciphertext",
+    "compressed_size",
+    "get_compression_params",
+    "COMPRESSION_PARAMS",
     # Stream
     "StreamDEM",
     "StreamHybridKEM",
