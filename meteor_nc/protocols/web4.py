@@ -342,38 +342,13 @@ class Web4Identity:
         return _sha256(b"peer-id", self.ed25519_public)
     
     def get_libp2p_keypair(self) -> Optional[Any]:
-        """Get libp2p-compatible keypair."""
-        if not LIBP2P_AVAILABLE:
-            return None
+        """
+        Get libp2p-compatible keypair.
         
-        try:
-            # libp2p Ed25519PrivateKey API
-            from libp2p.crypto.ed25519 import Ed25519PrivateKey
-            
-            # from_bytes
-            try:
-                return Ed25519PrivateKey.from_bytes(self.meteor_id)
-            except (AttributeError, TypeError):
-                pass
-            
-            # new (Seed)
-            try:
-                return Ed25519PrivateKey.new(self.meteor_id)
-            except (AttributeError, TypeError):
-                pass
-            
-            # generate (Random)
-            try:
-                return Ed25519PrivateKey.generate()
-            except (AttributeError, TypeError):
-                pass
-            
-            logger.warning("Could not create Ed25519 keypair for libp2p")
-            return None
-            
-        except Exception as e:
-            logger.warning(f"libp2p keypair creation failed: {e}")
-            return None
+        Note: Currently returns None. libp2p generates its own keypair.
+        MeteorID <-> PeerID mapping is managed at application layer.
+        """
+        return None
     
     def sign(self, message: bytes) -> bytes:
         """Sign message with Ed25519."""
@@ -585,18 +560,7 @@ class Web4P2P:
             listen_addrs = ["/ip4/0.0.0.0/tcp/0"]
         
         try:
-            # libp2p keypair (None でも動作する)
-            key_pair = None
-            try:
-                key_pair = self.identity.get_libp2p_keypair()
-            except Exception as e:
-                logger.warning(f"Could not create libp2p keypair: {e}")
-            
-            # new_host の引数を動的に構築
             host_kwargs = {}
-            
-            if key_pair is not None:
-                host_kwargs['key_pair'] = key_pair
             
             if MULTIADDR_AVAILABLE and listen_addrs:
                 host_kwargs['listen_addrs'] = [Multiaddr(addr) for addr in listen_addrs]
@@ -614,7 +578,7 @@ class Web4P2P:
                 
         except Exception as e:
             logger.error(f"libp2p start failed: {e}")
-            # Mock mode
+            #  Mock mode
             logger.info("Falling back to mock mode")
             self._started = True
     
