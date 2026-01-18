@@ -30,6 +30,18 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+# =============================================================================
+# Compression Support (v2.0)
+# =============================================================================
+
+# Import compression functions
+from .compression import (
+    compress_ciphertext,
+    decompress_ciphertext,
+    compressed_size,
+    get_compression_params,
+    Q_DEFAULT as COMPRESSION_Q,
+)
 
 # =============================================================================
 # Constants
@@ -193,21 +205,6 @@ class CenteredBinomial:
     def sample_vector(self, n: int, rng: Optional[Any] = None) -> Any:
         """Sample a 1D vector."""
         return self.sample((n,), rng=rng)
-
-
-# =============================================================================
-# Compression Support (v2.0)
-# =============================================================================
-
-# Import compression functions
-from .compression import (
-    compress_ciphertext,
-    decompress_ciphertext,
-    compressed_size,
-    get_compression_params,
-    Q_DEFAULT as COMPRESSION_Q,
-)
-
 
 # =============================================================================
 # Data Structures
