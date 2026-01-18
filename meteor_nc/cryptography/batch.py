@@ -103,50 +103,77 @@ class BatchCiphertext:
     """
     Hybrid ciphertext for batch operations.
     
-    Wire format (uncompressed):
-        | header (12B) | U (n*4B) | V (msg_bits*4B) | nonce (24B) | ct | tag (16B) |
+    v2.0: Wire-based design with kem_wire as canonical form.
     
     Wire format (compressed, v2.0):
-        | header (12B) | U_packed | V_packed | nonce (24B) | ct | tag (16B) |
-        where U_packed and V_packed use Kyber-style coefficient compression
+        | header (16B) | kem_wire | nonce (24B) | ct | tag (16B) |
+        
+    CRITICAL: kem_wire is the canonical form for:
+      - FO transform verification (wire == recomputed_wire)
+      - AAD computation (AAD = H(kem_wire))
+      - Storage/transmission
+    
+    U/V are derived from kem_wire via decompression (for internal use only).
     """
-    U: np.ndarray           # (n,) uint32 - KEM ciphertext part 1
-    V: np.ndarray           # (msg_bits,) uint32 - KEM ciphertext part 2
+    U: np.ndarray           # (n,) uint32 - KEM ciphertext part 1 (derived from kem_wire)
+    V: np.ndarray           # (msg_bits,) uint32 - KEM ciphertext part 2 (derived from kem_wire)
     nonce: bytes            # 24 bytes - DEM nonce
     ciphertext: bytes       # Variable - DEM ciphertext
     tag: bytes              # 16 bytes - DEM auth tag
     n: int = 256
     msg_bits: int = 256
+    kem_wire: Optional[bytes] = None  # v2.0: Canonical KEM ciphertext (compressed)
+    q: int = Q_BATCH                   # v2.0: Modulus for compression
+    
+    def get_kem_wire(self) -> bytes:
+        """
+        Get canonical KEM wire format.
+        
+        If kem_wire is already set, return it.
+        Otherwise, compress U/V to create it.
+        """
+        if self.kem_wire is not None:
+            return self.kem_wire
+        
+        if not COMPRESSION_AVAILABLE:
+            raise ImportError("Compression module not available")
+        
+        self.kem_wire = compress_ciphertext(self.U, self.V, self.q)
+        return self.kem_wire
+    
+    def get_aad(self) -> bytes:
+        """
+        Get AAD for DEM encryption/decryption.
+        
+        CRITICAL: AAD must be derived from kem_wire (canonical form),
+        NOT from raw U/V coefficients!
+        """
+        return _sha256(b"batch-hybrid-aad", self.get_kem_wire())
     
     def to_bytes(self) -> bytes:
-        """Serialize to wire format (uncompressed)."""
+        """Serialize to wire format (uncompressed, legacy)."""
         u_bytes = self.U.astype('<u4').tobytes()
         v_bytes = self.V.astype('<u4').tobytes()
         ct_len = len(self.ciphertext)
         
         return (
-            struct.pack('>III', self.n, self.msg_bits, ct_len) +  # header (12B)
-            u_bytes +                                              # n*4 bytes
-            v_bytes +                                              # msg_bits*4 bytes
-            self.nonce +                                           # 24 bytes
-            self.ciphertext +                                      # variable
-            self.tag                                               # 16 bytes
+            struct.pack('>III', self.n, self.msg_bits, ct_len) +
+            u_bytes +
+            v_bytes +
+            self.nonce +
+            self.ciphertext +
+            self.tag
         )
     
-    def to_bytes_compressed(self, q: int = Q_DEFAULT) -> bytes:
+    def to_bytes_compressed(self) -> bytes:
         """
         Serialize to wire format (compressed, v2.0).
         
-        This is the canonical form for FO transform verification.
+        This uses kem_wire as the canonical KEM ciphertext.
         """
-        if not COMPRESSION_AVAILABLE:
-            raise ImportError("Compression module not available")
-        
-        # Compress KEM portion (U, V)
-        kem_wire = compress_ciphertext(self.U, self.V, q)
+        kem_wire = self.get_kem_wire()
         ct_len = len(self.ciphertext)
         
-        # Header: n, msg_bits, ct_len, kem_wire_len
         return (
             struct.pack('>IIII', self.n, self.msg_bits, ct_len, len(kem_wire)) +
             kem_wire +
@@ -157,7 +184,7 @@ class BatchCiphertext:
     
     @classmethod
     def from_bytes(cls, data: bytes) -> 'BatchCiphertext':
-        """Deserialize from wire format (uncompressed)."""
+        """Deserialize from wire format (uncompressed, legacy)."""
         if len(data) < 12:
             raise ValueError("Ciphertext too short")
         
@@ -188,12 +215,18 @@ class BatchCiphertext:
         return cls(
             U=U, V=V, nonce=nonce,
             ciphertext=ciphertext, tag=tag,
-            n=n, msg_bits=msg_bits
+            n=n, msg_bits=msg_bits,
+            kem_wire=None,  # Will be computed on demand
+            q=Q_BATCH,
         )
     
     @classmethod
-    def from_bytes_compressed(cls, data: bytes, q: int = Q_DEFAULT) -> 'BatchCiphertext':
-        """Deserialize from wire format (compressed, v2.0)."""
+    def from_bytes_compressed(cls, data: bytes, q: int = Q_BATCH) -> 'BatchCiphertext':
+        """
+        Deserialize from wire format (compressed, v2.0).
+        
+        CRITICAL: Preserves kem_wire as canonical form!
+        """
         if not COMPRESSION_AVAILABLE:
             raise ImportError("Compression module not available")
         
@@ -206,7 +239,7 @@ class BatchCiphertext:
         kem_wire = data[offset:offset + kem_wire_len]
         offset += kem_wire_len
         
-        # Decompress KEM portion
+        # Decompress to get U/V (for internal computation)
         U, V = decompress_ciphertext(kem_wire, q)
         
         nonce = data[offset:offset + 24]
@@ -220,7 +253,9 @@ class BatchCiphertext:
         return cls(
             U=U, V=V, nonce=nonce,
             ciphertext=ciphertext, tag=tag,
-            n=n, msg_bits=msg_bits
+            n=n, msg_bits=msg_bits,
+            kem_wire=kem_wire,  # Preserve canonical form!
+            q=q,
         )
     
     def wire_size(self) -> int:
@@ -421,7 +456,7 @@ class BatchLWEKEM:
         
         Returns:
             K: 32-byte shared secret
-            wire: Compressed KEM ciphertext bytes
+            wire: Compressed KEM ciphertext bytes (canonical form)
         """
         K_batch, U_batch, V_batch = self.encaps_batch(1, return_ct=True)
         
@@ -429,9 +464,9 @@ class BatchLWEKEM:
         V = V_batch[0]
         K = K_batch[0]
         
-        # v2.0: Compress to wire format
+        # v2.0: Compress to wire format using self.q
         if self.use_compression:
-            wire = compress_ciphertext(U, V, Q_DEFAULT)
+            wire = compress_ciphertext(U, V, self.q)
         else:
             # Uncompressed wire format
             wire = (
@@ -446,15 +481,17 @@ class BatchLWEKEM:
         """
         Single-message decapsulation with wire-based FO (v2.0).
         
+        CRITICAL: FO verification uses wire comparison, not coefficient comparison!
+        
         Args:
-            wire: Compressed KEM ciphertext bytes
+            wire: Compressed KEM ciphertext bytes (canonical form)
             
         Returns:
             K: 32-byte shared secret
         """
-        # Decompress
+        # Decompress using self.q
         if self.use_compression:
-            U, V = decompress_ciphertext(wire, Q_DEFAULT)
+            U, V = decompress_ciphertext(wire, self.q)
         else:
             u_len, v_len = struct.unpack('>II', wire[:8])
             offset = 8
@@ -462,13 +499,89 @@ class BatchLWEKEM:
             offset += u_len * 4
             V = np.frombuffer(wire[offset:offset + v_len * 4], dtype='<u4').copy()
         
-        # Use batch decaps internally
-        U_batch = U.reshape(1, -1)
-        V_batch = V.reshape(1, -1)
+        # Decaps with wire-based FO verification
+        K = self.decaps_single_wire(U, V, wire)
         
-        K_batch = self.decaps_batch(U_batch, V_batch)
+        return K
+    
+    def decaps_single_wire(self, U: np.ndarray, V: np.ndarray, wire: bytes) -> bytes:
+        """
+        Single-message decapsulation with wire-based FO verification.
         
-        return bytes(K_batch[0])
+        Args:
+            U, V: Decompressed coefficients (for LWE decryption)
+            wire: Original compressed wire (for FO comparison)
+            
+        Returns:
+            K: 32-byte shared secret
+        """
+        if self.A is None or self.s is None:
+            raise ValueError("Keys not initialized (need both pk and sk)")
+        
+        # Transfer to GPU
+        U_gpu = cp.asarray(U.reshape(1, -1), dtype=cp.uint32)
+        V_gpu = cp.asarray(V.reshape(1, -1), dtype=cp.uint32)
+        
+        # Decrypt: V - s^T U
+        S_dot_U = sdot_U(self.s, U_gpu)
+        V_dec = V_gpu - S_dot_U[:, None]
+        
+        # Decode message bits
+        V_signed = V_dec.view(cp.int32)
+        threshold = np.int32(1 << 30)
+        M_bits = ((V_signed > threshold) | (V_signed < -threshold)).astype(cp.uint8)
+        
+        # Pack bits to message
+        if self.n == 256:
+            M_recovered = pack_bits_gpu(M_bits)
+        else:
+            M_recovered = pack_bits_v2(M_bits, self.msg_bits, self.msg_bytes)
+        
+        M_np = cp.asnumpy(M_recovered)[0]
+        
+        # Re-derive FO seeds from recovered message
+        if self.n == 256:
+            seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_recovered, self.pk_hash)
+        else:
+            seeds_r, seeds_e1, seeds_e2 = self._blake3.derive_seeds_batch(M_recovered, self.pk_hash, self.msg_bytes)
+        
+        # Re-encrypt to get (U2, V2)
+        R2 = cbd_i32(seeds_r, self.k, self.eta)
+        E1_2 = cbd_i32(seeds_e1, self.n, self.eta)
+        E2_2 = cbd_i32(seeds_e2, self.msg_bits, self.eta)
+        
+        M_bits_u32 = M_bits.astype(cp.uint32)
+        M_encoded = M_bits_u32 * np.uint32(self.delta)
+        
+        U2 = matmul_AT_R(self.A, R2, E1_2)
+        B_dot_R2 = bdot_R(self.b, R2)
+        V2 = B_dot_R2[None, :] + E2_2.astype(cp.uint32) + M_encoded.T
+        
+        U2_np = cp.asnumpy(U2.T)[0]
+        V2_np = cp.asnumpy(V2.T)[0]
+        
+        # v2.0: FO verification using WIRE COMPARISON (not coefficient comparison!)
+        if self.use_compression:
+            wire2 = compress_ciphertext(U2_np, V2_np, self.q)
+            ok = (wire == wire2)
+        else:
+            wire2 = (
+                struct.pack('>II', len(U2_np), len(V2_np)) +
+                U2_np.astype('<u4').tobytes() +
+                V2_np.astype('<u4').tobytes()
+            )
+            ok = (wire == wire2)
+        
+        # ct_hash from original wire (canonical form)
+        ct_hash = _sha256(b"ct_hash", wire)
+        
+        # Derive key with implicit rejection
+        if ok:
+            K = _sha256(b"shared_key", M_np.tobytes(), ct_hash)
+        else:
+            K = _sha256(b"reject_key", self.z, ct_hash)
+        
+        return K
     
     # =========================================================================
     # Batch Operations (Internal Format for GPU Efficiency)
@@ -673,38 +786,54 @@ class BatchHybridKEM:
         self.load_secret_key(sk_bytes)
     
     # =========================================================================
-    # Single Message Interface (v2.0: Wire-Based)
+    # Single Message Interface (v2.0: Wire-Based with Correct AAD)
     # =========================================================================
     
     def encrypt(self, plaintext: bytes) -> BatchCiphertext:
         """
         Encrypt a single message.
         
+        v2.0: AAD is derived from kem_wire (canonical form), not raw coefficients!
+        
         Returns:
             BatchCiphertext (use to_bytes_compressed() for transmission)
         """
-        # 1. KEM: Get shared key
+        # 1. KEM: Get shared key and raw ciphertext
         K, U, V = self.kem.encaps_batch(1, return_ct=True)
         shared_key = K[0]
         
-        # 2. DEM: Encrypt with ChaCha20-Poly1305
+        # 2. Create kem_wire FIRST (canonical form)
+        if self.use_compression:
+            kem_wire = compress_ciphertext(U[0], V[0], self.kem.q)
+        else:
+            kem_wire = (
+                struct.pack('>II', len(U[0]), len(V[0])) +
+                U[0].astype('<u4').tobytes() +
+                V[0].astype('<u4').tobytes()
+            )
+        
+        # 3. AAD from kem_wire (CRITICAL: must match decrypt side!)
+        aad = _sha256(b"batch-hybrid-aad", kem_wire)
+        
+        # 4. DEM: Encrypt with ChaCha20-Poly1305
         dem = GPUChaCha20Poly1305(shared_key, device_id=self.device_id)
         nonce = secrets.token_bytes(24)
-        
-        # AAD includes KEM ciphertext hash for binding
-        aad = _sha256(b"batch-hybrid-aad", U[0].tobytes(), V[0].tobytes())
         
         ciphertext, tag = dem.encrypt(plaintext, nonce, aad)
         
         return BatchCiphertext(
             U=U[0], V=V[0],
             nonce=nonce, ciphertext=ciphertext, tag=tag,
-            n=self.kem.n, msg_bits=self.kem.msg_bits
+            n=self.kem.n, msg_bits=self.kem.msg_bits,
+            kem_wire=kem_wire,  # v2.0: Store canonical form
+            q=self.kem.q,
         )
     
     def decrypt(self, ct: Union[BatchCiphertext, bytes]) -> bytes:
         """
         Decrypt a single message.
+        
+        v2.0: AAD is derived from kem_wire (canonical form)!
         
         Args:
             ct: BatchCiphertext or serialized bytes
@@ -714,21 +843,23 @@ class BatchHybridKEM:
             if len(ct) >= 16:
                 # Try compressed format first (16-byte header)
                 try:
-                    ct = BatchCiphertext.from_bytes_compressed(ct)
+                    ct = BatchCiphertext.from_bytes_compressed(ct, self.kem.q)
                 except:
                     ct = BatchCiphertext.from_bytes(ct)
             else:
                 ct = BatchCiphertext.from_bytes(ct)
         
-        # 1. KEM: Recover shared key
-        U_batch = ct.U.reshape(1, -1)
-        V_batch = ct.V.reshape(1, -1)
-        K = self.kem.decaps_batch(U_batch, V_batch)
-        shared_key = K[0]
+        # 1. Get kem_wire (canonical form)
+        kem_wire = ct.get_kem_wire()
         
-        # 2. DEM: Decrypt
-        dem = GPUChaCha20Poly1305(shared_key, device_id=self.device_id)
-        aad = _sha256(b"batch-hybrid-aad", ct.U.tobytes(), ct.V.tobytes())
+        # 2. KEM decaps with wire-based FO
+        K = self.kem.decaps_single_wire(ct.U, ct.V, kem_wire)
+        
+        # 3. AAD from kem_wire (MUST match encrypt side!)
+        aad = _sha256(b"batch-hybrid-aad", kem_wire)
+        
+        # 4. DEM: Decrypt
+        dem = GPUChaCha20Poly1305(K, device_id=self.device_id)
         
         return dem.decrypt(ct.ciphertext, ct.tag, ct.nonce, aad)
     
@@ -737,34 +868,56 @@ class BatchHybridKEM:
     # =========================================================================
     
     def encrypt_batch(self, plaintexts: List[bytes]) -> List[BatchCiphertext]:
-        """Encrypt multiple messages in parallel."""
+        """
+        Encrypt multiple messages in parallel.
+        
+        v2.0: AAD is derived from kem_wire for each message.
+        """
         batch = len(plaintexts)
         
         K, U, V = self.kem.encaps_batch(batch, return_ct=True)
         
         results = []
         for i in range(batch):
+            # Create kem_wire first
+            if self.use_compression:
+                kem_wire = compress_ciphertext(U[i], V[i], self.kem.q)
+            else:
+                kem_wire = (
+                    struct.pack('>II', len(U[i]), len(V[i])) +
+                    U[i].astype('<u4').tobytes() +
+                    V[i].astype('<u4').tobytes()
+                )
+            
+            # AAD from kem_wire
+            aad = _sha256(b"batch-hybrid-aad", kem_wire)
+            
             dem = GPUChaCha20Poly1305(K[i], device_id=self.device_id)
             nonce = secrets.token_bytes(24)
-            aad = _sha256(b"batch-hybrid-aad", U[i].tobytes(), V[i].tobytes())
             
             ciphertext, tag = dem.encrypt(plaintexts[i], nonce, aad)
             
             results.append(BatchCiphertext(
                 U=U[i], V=V[i],
                 nonce=nonce, ciphertext=ciphertext, tag=tag,
-                n=self.kem.n, msg_bits=self.kem.msg_bits
+                n=self.kem.n, msg_bits=self.kem.msg_bits,
+                kem_wire=kem_wire,
+                q=self.kem.q,
             ))
         
         return results
     
     def decrypt_batch(self, ciphertexts: List[Union[BatchCiphertext, bytes]]) -> List[bytes]:
-        """Decrypt multiple messages in parallel."""
+        """
+        Decrypt multiple messages in parallel.
+        
+        v2.0: Uses wire-based FO and kem_wire-derived AAD.
+        """
         cts = []
         for ct in ciphertexts:
             if isinstance(ct, bytes):
                 try:
-                    cts.append(BatchCiphertext.from_bytes_compressed(ct))
+                    cts.append(BatchCiphertext.from_bytes_compressed(ct, self.kem.q))
                 except:
                     cts.append(BatchCiphertext.from_bytes(ct))
             else:
@@ -772,16 +925,20 @@ class BatchHybridKEM:
         
         batch = len(cts)
         
-        U_batch = np.stack([ct.U for ct in cts])
-        V_batch = np.stack([ct.V for ct in cts])
-        K = self.kem.decaps_batch(U_batch, V_batch)
-        
+        # Decrypt each message with wire-based FO
         results = []
         for i in range(batch):
-            dem = GPUChaCha20Poly1305(K[i], device_id=self.device_id)
-            aad = _sha256(b"batch-hybrid-aad", cts[i].U.tobytes(), cts[i].V.tobytes())
+            ct = cts[i]
+            kem_wire = ct.get_kem_wire()
             
-            plaintext = dem.decrypt(cts[i].ciphertext, cts[i].tag, cts[i].nonce, aad)
+            # Decaps with wire-based FO
+            K = self.kem.decaps_single_wire(ct.U, ct.V, kem_wire)
+            
+            # AAD from kem_wire
+            aad = _sha256(b"batch-hybrid-aad", kem_wire)
+            
+            dem = GPUChaCha20Poly1305(K, device_id=self.device_id)
+            plaintext = dem.decrypt(ct.ciphertext, ct.tag, ct.nonce, aad)
             results.append(plaintext)
         
         return results
