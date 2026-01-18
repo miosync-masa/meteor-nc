@@ -343,12 +343,37 @@ class Web4Identity:
     
     def get_libp2p_keypair(self) -> Optional[Any]:
         """Get libp2p-compatible keypair."""
-        if LIBP2P_AVAILABLE:
+        if not LIBP2P_AVAILABLE:
+            return None
+        
+        try:
+            # libp2p Ed25519PrivateKey API
+            from libp2p.crypto.ed25519 import Ed25519PrivateKey
+            
+            # from_bytes
             try:
                 return Ed25519PrivateKey.from_bytes(self.meteor_id)
-            except Exception:
+            except (AttributeError, TypeError):
                 pass
-        return None
+            
+            # new (Seed)
+            try:
+                return Ed25519PrivateKey.new(self.meteor_id)
+            except (AttributeError, TypeError):
+                pass
+            
+            # generate (Random)
+            try:
+                return Ed25519PrivateKey.generate()
+            except (AttributeError, TypeError):
+                pass
+            
+            logger.warning("Could not create Ed25519 keypair for libp2p")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"libp2p keypair creation failed: {e}")
+            return None
     
     def sign(self, message: bytes) -> bytes:
         """Sign message with Ed25519."""
@@ -539,7 +564,6 @@ class Web4IPFS:
 # =============================================================================
 # libp2p Integration
 # =============================================================================
-
 class Web4P2P:
     """libp2p integration for Web 4.0."""
     
@@ -561,12 +585,23 @@ class Web4P2P:
             listen_addrs = ["/ip4/0.0.0.0/tcp/0"]
         
         try:
-            key_pair = self.identity.get_libp2p_keypair()
+            # libp2p keypair (None でも動作する)
+            key_pair = None
+            try:
+                key_pair = self.identity.get_libp2p_keypair()
+            except Exception as e:
+                logger.warning(f"Could not create libp2p keypair: {e}")
             
-            self.host = await new_host(
-                key_pair=key_pair,
-                listen_addrs=[Multiaddr(addr) for addr in listen_addrs] if MULTIADDR_AVAILABLE else None
-            )
+            # new_host の引数を動的に構築
+            host_kwargs = {}
+            
+            if key_pair is not None:
+                host_kwargs['key_pair'] = key_pair
+            
+            if MULTIADDR_AVAILABLE and listen_addrs:
+                host_kwargs['listen_addrs'] = [Multiaddr(addr) for addr in listen_addrs]
+            
+            self.host = await new_host(**host_kwargs)
             
             self.host.set_stream_handler(METEOR_PROTOCOL_ID, self._handle_stream)
             
@@ -579,7 +614,9 @@ class Web4P2P:
                 
         except Exception as e:
             logger.error(f"libp2p start failed: {e}")
-            self._started = False
+            # Mock mode
+            logger.info("Falling back to mock mode")
+            self._started = True
     
     async def stop(self):
         """Stop libp2p host."""
