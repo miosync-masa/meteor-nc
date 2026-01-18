@@ -565,7 +565,14 @@ class Web4P2P:
             if MULTIADDR_AVAILABLE and listen_addrs:
                 host_kwargs['listen_addrs'] = [Multiaddr(addr) for addr in listen_addrs]
             
-            self.host = await new_host(**host_kwargs)
+            # new_host() は sync かもしれないし async かもしれない
+            import inspect
+            host_result = new_host(**host_kwargs)
+            
+            if inspect.iscoroutine(host_result):
+                self.host = await host_result
+            else:
+                self.host = host_result
             
             self.host.set_stream_handler(METEOR_PROTOCOL_ID, self._handle_stream)
             
@@ -578,7 +585,6 @@ class Web4P2P:
                 
         except Exception as e:
             logger.error(f"libp2p start failed: {e}")
-            #  Mock mode
             logger.info("Falling back to mock mode")
             self._started = True
     
