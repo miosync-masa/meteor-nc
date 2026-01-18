@@ -246,10 +246,16 @@ from ..cryptography.core import LWEKEM
 # StreamHybridKEM (optional)
 STREAM_AVAILABLE = False
 try:
-    from ..cryptography.stream import StreamHybridKEM, StreamCiphertext
+    from ..cryptography.stream import (
+        StreamDEM,
+        StreamHybridKEM,
+        StreamCiphertext,
+        EncryptedChunk,
+        StreamHeader,
+    )
     STREAM_AVAILABLE = True
 except ImportError:
-    logger.warning("StreamHybridKEM not available")
+    logger.warning("Stream module not available")
 
 # MeteorAuth (optional)
 AUTH_AVAILABLE = False
