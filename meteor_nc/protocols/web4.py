@@ -832,7 +832,6 @@ class Web4PubSub:
 # =============================================================================
 # Main Node Class
 # =============================================================================
-
 class MeteorWeb4Node:
     """
     Meteor-Protocol Web 4.0 Complete Node.
@@ -859,6 +858,9 @@ class MeteorWeb4Node:
         >>> # Subscribe to topic
         >>> await node.pubsub_subscribe("chat", handler)
     """
+    
+    # クラス変数：ローカルノード登録（テスト用）
+    _local_nodes: Dict[bytes, 'MeteorWeb4Node'] = {}
     
     def __init__(
         self,
@@ -930,6 +932,9 @@ class MeteorWeb4Node:
             'ipfs_uploads': 0,
             'ipfs_downloads': 0,
         }
+        
+        # ★ ローカルネットワークに登録（meteor_id確定後！）
+        MeteorWeb4Node._local_nodes[self.meteor_id] = self
         
         logger.info(f"[{self.name}] Node created")
         logger.info(f"  MeteorID: {self.meteor_id.hex()[:32]}...")
@@ -1100,7 +1105,7 @@ class MeteorWeb4Node:
         K, kem_ct = peer_kem.encaps()
         
         # Derive session key and encrypt payload
-        from ..cryptography.stream import StreamDEM
+        from .web4 import StreamDEM  # or wherever it is
         session_key = _sha256(b"session", K)
         nonce = secrets.token_bytes(16)
         
@@ -1129,14 +1134,25 @@ class MeteorWeb4Node:
         )
         msg.signature = self.identity.sign(checksum.encode())
         
-        # Send via P2P
-        success = await self.p2p.send(peer['peer_id'], msg.to_bytes())
+        msg_bytes = msg.to_bytes()
+        
+        # ★ ローカル配送を試みる
+        recipient_node = MeteorWeb4Node._local_nodes.get(peer['meteor_id'])
+        if recipient_node:
+            # 直接配送
+            await recipient_node._handle_incoming(msg_bytes)
+            success = True
+            logger.info(f"[{self.name}] → [{peer_name}] (local): {len(data)} bytes")
+        else:
+            # P2P経由
+            success = await self.p2p.send(peer['peer_id'], msg_bytes)
+            if success:
+                logger.info(f"[{self.name}] → [{peer_name}]: {len(data)} bytes")
         
         if success:
             self.stats['messages_sent'] += 1
             self.stats['bytes_sent'] += len(data)
             peer['last_seen'] = time.time()
-            logger.info(f"[{self.name}] → [{peer_name}]: {len(data)} bytes")
         
         return success
     
