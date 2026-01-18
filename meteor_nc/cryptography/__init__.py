@@ -12,7 +12,6 @@ Wire Format:
   - Coefficient arrays: little-endian uint32
 """
 
- Common utilities and data structures
 from .common import (
     # Constants
     Q_DEFAULT,
