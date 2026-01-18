@@ -1,15 +1,42 @@
 # meteor_nc/__init__.py
 """
 Meteor-NC: Post-Quantum Hybrid Cryptosystem
-WEB4.0 Protocol Ready!
+
+WEB 4.0 Protocol Ready!
 - Post-Quantum Key Encapsulation (LWE-KEM)
 - High-Speed Streaming Encryption (XChaCha20-Poly1305)
-- P2P Communication Protocol
-- Device-Bound Authentication
-"""
-__version__ = "2.0.0"
+- P2P Communication Protocol (libp2p)
+- Decentralized Peer Discovery (Kademlia DHT)
+- Global Broadcast (PubSub/GossipSub)
+- Distributed Storage (IPFS)
+- Device-Bound Authentication (2FA/3FA)
+- Edge Device Compatible (CPU-only, no GPU required)
 
-# Core (CPU/GPU optional)
+Architecture:
+    ┌─────────────────────────────────────────────────────────┐
+    │  meteor_nc                                              │
+    │  ├── cryptography/     # Core crypto primitives         │
+    │  │   ├── core.py       # LWEKEM, HybridKEM (CPU)        │
+    │  │   ├── batch.py      # BatchKEM (GPU accelerated)     │
+    │  │   ├── stream.py     # StreamDEM (chunked encryption) │
+    │  │   └── practical.py  # High-level API                 │
+    │  │                                                      │
+    │  ├── protocols/        # P2P communication              │
+    │  │   ├── meteor_protocol.py  # Basic P2P               │
+    │  │   ├── advanced.py         # Testing & validation    │
+    │  │   └── web4.py             # Full Web 4.0 stack      │
+    │  │                                                      │
+    │  └── auth/             # Authentication                 │
+    │      └── core.py       # Device-bound 2FA/3FA          │
+    └─────────────────────────────────────────────────────────┘
+"""
+
+__version__ = "2.1.0"
+
+# =============================================================================
+# Core Cryptography (CPU/GPU optional)
+# =============================================================================
+
 from .cryptography.common import (
     HKDF,
     Q_DEFAULT,
@@ -19,27 +46,37 @@ from .cryptography.common import (
     GPU_AVAILABLE,
     CRYPTO_AVAILABLE,
 )
+
 from .cryptography.core import (
     LWEKEM,
     HybridKEM,
     SymmetricMixer,
 )
 
+# =============================================================================
 # Batch KEM (GPU required)
+# =============================================================================
+
+BATCH_AVAILABLE = False
 try:
     from .cryptography.batch import BatchLWEKEM, BatchHybridKEM, BatchCiphertext
     BATCH_AVAILABLE = True
 except ImportError:
-    BATCH_AVAILABLE = False
+    pass
 
 # Batch Multi-Level (n=256/512/1024)
+BATCH_MULTILEVEL_AVAILABLE = False
 try:
     from .cryptography.kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
     BATCH_MULTILEVEL_AVAILABLE = BATCH_V2_AVAILABLE and BLAKE3_V2_AVAILABLE
 except ImportError:
-    BATCH_MULTILEVEL_AVAILABLE = False
+    pass
 
+# =============================================================================
 # Stream DEM (XChaCha20-Poly1305)
+# =============================================================================
+
+STREAM_AVAILABLE = False
 try:
     from .cryptography.stream import (
         StreamDEM,
@@ -50,9 +87,13 @@ try:
     )
     STREAM_AVAILABLE = True
 except ImportError:
-    STREAM_AVAILABLE = False
+    pass
 
+# =============================================================================
 # Practical API (String/File encryption)
+# =============================================================================
+
+PRACTICAL_AVAILABLE = False
 try:
     from .cryptography.practical import (
         MeteorPractical,
@@ -61,9 +102,13 @@ try:
     )
     PRACTICAL_AVAILABLE = True
 except ImportError:
-    PRACTICAL_AVAILABLE = False
+    pass
 
-# Protocol Layer (P2P Communication)
+# =============================================================================
+# Protocol Layer (Basic P2P)
+# =============================================================================
+
+PROTOCOL_AVAILABLE = False
 try:
     from .protocols.meteor_protocol import (
         MeteorNode,
@@ -73,9 +118,13 @@ try:
     )
     PROTOCOL_AVAILABLE = True
 except ImportError:
-    PROTOCOL_AVAILABLE = False
+    pass
 
+# =============================================================================
 # Advanced Protocol Testing
+# =============================================================================
+
+ADVANCED_AVAILABLE = False
 try:
     from .protocols.advanced import (
         MeteorNetwork,
@@ -86,75 +135,152 @@ try:
     )
     ADVANCED_AVAILABLE = True
 except ImportError:
-    ADVANCED_AVAILABLE = False
+    pass
 
-# Authentication (Device-Bound)
+# =============================================================================
+# Web 4.0 Protocol (Full Stack)
+# =============================================================================
+
+WEB4_AVAILABLE = False
+LIBP2P_AVAILABLE = False
+DHT_AVAILABLE = False
+PUBSUB_AVAILABLE = False
+IPFS_AVAILABLE = False
+NACL_AVAILABLE = False
+
+try:
+    from .protocols.web4 import (
+        MeteorWeb4Node,
+        Web4Identity,
+        Web4Message,
+        Web4P2P,
+        Web4DHT,
+        Web4PubSub,
+        Web4IPFS,
+        MessageType,
+        LIBP2P_AVAILABLE,
+        DHT_AVAILABLE,
+        PUBSUB_AVAILABLE,
+        IPFS_AVAILABLE,
+        NACL_AVAILABLE,
+    )
+    WEB4_AVAILABLE = True
+except ImportError:
+    pass
+
+# =============================================================================
+# Authentication (Device-Bound 2FA/3FA)
+# =============================================================================
+
+AUTH_AVAILABLE = False
 try:
     from .auth.core import (
         MeteorAuth,
         MeteorAuthServer,
         UserRecord,
+        BiometricProvider,
+        BiometricStatus,
+        CallbackBiometricProvider,
+        MockBiometricProvider,
         verify_device_binding,
         generate_recovery_codes,
     )
     AUTH_AVAILABLE = True
 except ImportError:
-    AUTH_AVAILABLE = False
+    pass
+
+# =============================================================================
+# Exports
+# =============================================================================
 
 __all__ = [
     # Version
     "__version__",
     
+    # -------------------------------------------------------------------------
     # Core Cryptography
+    # -------------------------------------------------------------------------
     "HKDF",
     "LWEKEM",
     "HybridKEM",
     "SymmetricMixer",
     
-    # Batch KEM
+    # -------------------------------------------------------------------------
+    # Batch KEM (GPU)
+    # -------------------------------------------------------------------------
     "BatchLWEKEM",
     "BatchHybridKEM",
     "BatchCiphertext",
     
+    # -------------------------------------------------------------------------
     # Stream DEM
+    # -------------------------------------------------------------------------
     "StreamDEM",
     "StreamHybridKEM",
     "StreamCiphertext",
     "EncryptedChunk",
     "StreamHeader",
     
+    # -------------------------------------------------------------------------
     # Practical API
+    # -------------------------------------------------------------------------
     "MeteorPractical",
     "quick_encrypt",
     "quick_decrypt",
     
+    # -------------------------------------------------------------------------
     # Protocol (Basic)
+    # -------------------------------------------------------------------------
     "MeteorNode",
     "MeteorPeer",
     "MeteorMessage",
     "MeteorProtocol",
     
-    # Protocol (Advanced)
+    # -------------------------------------------------------------------------
+    # Protocol (Advanced Testing)
+    # -------------------------------------------------------------------------
     "MeteorNetwork",
     "LatencySimulator",
     "LatencyProfile",
     "SessionManager",
     "run_comprehensive_tests",
     
+    # -------------------------------------------------------------------------
+    # Web 4.0 Protocol
+    # -------------------------------------------------------------------------
+    "MeteorWeb4Node",
+    "Web4Identity",
+    "Web4Message",
+    "Web4P2P",
+    "Web4DHT",
+    "Web4PubSub",
+    "Web4IPFS",
+    "MessageType",
+    
+    # -------------------------------------------------------------------------
     # Authentication
+    # -------------------------------------------------------------------------
     "MeteorAuth",
     "MeteorAuthServer",
     "UserRecord",
+    "BiometricProvider",
+    "BiometricStatus",
+    "CallbackBiometricProvider",
+    "MockBiometricProvider",
     "verify_device_binding",
     "generate_recovery_codes",
     
+    # -------------------------------------------------------------------------
     # Constants
+    # -------------------------------------------------------------------------
     "Q_DEFAULT",
     "MSG_BYTES",
     "MSG_BITS",
     "SECURITY_PARAMS",
     
+    # -------------------------------------------------------------------------
     # Availability Flags
+    # -------------------------------------------------------------------------
     "GPU_AVAILABLE",
     "CRYPTO_AVAILABLE",
     "BATCH_AVAILABLE",
@@ -163,5 +289,57 @@ __all__ = [
     "PRACTICAL_AVAILABLE",
     "PROTOCOL_AVAILABLE",
     "ADVANCED_AVAILABLE",
+    "WEB4_AVAILABLE",
+    "LIBP2P_AVAILABLE",
+    "DHT_AVAILABLE",
+    "PUBSUB_AVAILABLE",
+    "IPFS_AVAILABLE",
+    "NACL_AVAILABLE",
     "AUTH_AVAILABLE",
 ]
+
+
+# =============================================================================
+# Quick Status Check
+# =============================================================================
+
+def status() -> dict:
+    """
+    Get availability status of all components.
+    
+    Example:
+        >>> import meteor_nc
+        >>> meteor_nc.status()
+        {
+            'version': '2.1.0',
+            'core': True,
+            'gpu': False,
+            'batch': False,
+            'stream': True,
+            'practical': True,
+            'protocol': True,
+            'advanced': True,
+            'web4': True,
+            'auth': True,
+            ...
+        }
+    """
+    return {
+        'version': __version__,
+        'core': True,  # Always available
+        'gpu': GPU_AVAILABLE,
+        'crypto': CRYPTO_AVAILABLE,
+        'batch': BATCH_AVAILABLE,
+        'batch_multilevel': BATCH_MULTILEVEL_AVAILABLE,
+        'stream': STREAM_AVAILABLE,
+        'practical': PRACTICAL_AVAILABLE,
+        'protocol': PROTOCOL_AVAILABLE,
+        'advanced': ADVANCED_AVAILABLE,
+        'web4': WEB4_AVAILABLE,
+        'libp2p': LIBP2P_AVAILABLE,
+        'dht': DHT_AVAILABLE,
+        'pubsub': PUBSUB_AVAILABLE,
+        'ipfs': IPFS_AVAILABLE,
+        'nacl': NACL_AVAILABLE,
+        'auth': AUTH_AVAILABLE,
+    }
