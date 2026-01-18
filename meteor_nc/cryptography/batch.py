@@ -454,28 +454,35 @@ class BatchLWEKEM:
         """
         Single-message encapsulation with wire-based FO (v2.0).
         
+        CRITICAL: K is derived from wire (canonical form), NOT raw coefficients!
+        
         Returns:
-            K: 32-byte shared secret
+            K: 32-byte shared secret (wire-based KDF)
             wire: Compressed KEM ciphertext bytes (canonical form)
         """
-        K_batch, U_batch, V_batch = self.encaps_batch(1, return_ct=True)
+        # Get (U, V, m) from batch encaps
+        # NOTE: We discard K from encaps_batch because it uses raw-coefficient KDF
+        _, U_batch, V_batch, M_np = self.encaps_batch(1, return_ct=True, return_msg=True)
         
         U = U_batch[0]
         V = V_batch[0]
-        K = K_batch[0]
+        m = M_np[0].tobytes()
         
-        # v2.0: Compress to wire format using self.q
+        # v2.0: Compress to wire format (canonical form)
         if self.use_compression:
             wire = compress_ciphertext(U, V, self.q)
         else:
-            # Uncompressed wire format
             wire = (
                 struct.pack('>II', len(U), len(V)) +
                 U.astype('<u4').tobytes() +
                 V.astype('<u4').tobytes()
             )
         
-        return bytes(K), wire
+        # v2.0: Wire-based KDF (MUST match decaps_single_wire!)
+        ct_hash = _sha256(b"ct_hash", wire)
+        K = _sha256(b"shared_key", m, ct_hash)
+        
+        return K, wire
     
     def decaps(self, wire: bytes) -> bytes:
         """
@@ -590,18 +597,25 @@ class BatchLWEKEM:
     def encaps_batch(
         self,
         batch: int,
-        return_ct: bool = True
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+        return_ct: bool = True,
+        return_msg: bool = False,  # v2.0: Return message for wire-based KDF
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         """
         Batch encapsulation (encryption) - returns shared keys.
         
         For GPU efficiency, returns raw (U, V) arrays instead of wire format.
         Use encaps() for single-message wire-based operation.
         
+        Args:
+            batch: Number of messages to encapsulate
+            return_ct: Return (U, V) arrays
+            return_msg: Return message bytes (for wire-based KDF)
+        
         Returns:
-            K: (batch, 32) shared keys
+            K: (batch, 32) shared keys (WARNING: raw-coefficient based, use encaps() for wire-based)
             U: (batch, n) ciphertext part 1 (if return_ct=True)
             V: (batch, msg_bits) ciphertext part 2 (if return_ct=True)
+            M: (batch, msg_bytes) message bytes (if return_msg=True)
         """
         if self.A is None or self.b is None:
             raise ValueError("Public key not initialized")
@@ -642,10 +656,10 @@ class BatchLWEKEM:
         U_t = cp.ascontiguousarray(U.T)
         V_t = cp.ascontiguousarray(V.T)
         
-        # 9. ct_hash
+        # 9. ct_hash (raw coefficient based - for backward compat only)
         ct_hash = self._blake3.hash_u32_concat_batch(U_t, V_t, self.n, self.msg_bits)
         
-        # 10. Derive shared keys
+        # 10. Derive shared keys (WARNING: raw-coefficient based!)
         ok_mask = cp.ones(batch, dtype=cp.uint8)
         if self.n == 256:
             K_gpu = self._blake3.derive_keys_batch(M_gpu, ct_hash, self.z or b'\x00' * 32, ok_mask)
@@ -655,9 +669,16 @@ class BatchLWEKEM:
         K = cp.asnumpy(K_gpu)
         
         if not return_ct:
-            return K, None, None
+            if return_msg:
+                return K, None, None, M_np
+            return K, None, None, None
         
-        return K, cp.asnumpy(U_t), cp.asnumpy(V_t)
+        U_out = cp.asnumpy(U_t)
+        V_out = cp.asnumpy(V_t)
+        
+        if return_msg:
+            return K, U_out, V_out, M_np
+        return K, U_out, V_out, None
     
     def decaps_batch(self, U: np.ndarray, V: np.ndarray) -> np.ndarray:
         """
@@ -786,43 +807,42 @@ class BatchHybridKEM:
         self.load_secret_key(sk_bytes)
     
     # =========================================================================
-    # Single Message Interface (v2.0: Wire-Based with Correct AAD)
+    # Single Message Interface (v2.0: Wire-Based with Correct KDF)
     # =========================================================================
     
     def encrypt(self, plaintext: bytes) -> BatchCiphertext:
         """
         Encrypt a single message.
         
-        v2.0: AAD is derived from kem_wire (canonical form), not raw coefficients!
+        v2.0: Uses wire-based KDF for K (matches decrypt side!)
         
         Returns:
             BatchCiphertext (use to_bytes_compressed() for transmission)
         """
-        # 1. KEM: Get shared key and raw ciphertext
-        K, U, V = self.kem.encaps_batch(1, return_ct=True)
-        shared_key = K[0]
+        # 1. KEM encaps with wire-based KDF
+        K, kem_wire = self.kem.encaps()
         
-        # 2. Create kem_wire FIRST (canonical form)
+        # 2. Decompress to get U/V for storage
         if self.use_compression:
-            kem_wire = compress_ciphertext(U[0], V[0], self.kem.q)
+            U, V = decompress_ciphertext(kem_wire, self.kem.q)
         else:
-            kem_wire = (
-                struct.pack('>II', len(U[0]), len(V[0])) +
-                U[0].astype('<u4').tobytes() +
-                V[0].astype('<u4').tobytes()
-            )
+            u_len, v_len = struct.unpack('>II', kem_wire[:8])
+            off = 8
+            U = np.frombuffer(kem_wire[off:off + u_len * 4], dtype='<u4').copy()
+            off += u_len * 4
+            V = np.frombuffer(kem_wire[off:off + v_len * 4], dtype='<u4').copy()
         
-        # 3. AAD from kem_wire (CRITICAL: must match decrypt side!)
+        # 3. AAD from kem_wire (canonical form)
         aad = _sha256(b"batch-hybrid-aad", kem_wire)
         
         # 4. DEM: Encrypt with ChaCha20-Poly1305
-        dem = GPUChaCha20Poly1305(shared_key, device_id=self.device_id)
+        dem = GPUChaCha20Poly1305(K, device_id=self.device_id)
         nonce = secrets.token_bytes(24)
         
         ciphertext, tag = dem.encrypt(plaintext, nonce, aad)
         
         return BatchCiphertext(
-            U=U[0], V=V[0],
+            U=U, V=V,
             nonce=nonce, ciphertext=ciphertext, tag=tag,
             n=self.kem.n, msg_bits=self.kem.msg_bits,
             kem_wire=kem_wire,  # v2.0: Store canonical form
@@ -871,15 +891,16 @@ class BatchHybridKEM:
         """
         Encrypt multiple messages in parallel.
         
-        v2.0: AAD is derived from kem_wire for each message.
+        v2.0: Uses wire-based KDF for each message.
         """
         batch = len(plaintexts)
         
-        K, U, V = self.kem.encaps_batch(batch, return_ct=True)
+        # Get (U, V, M) - we'll recompute K with wire-based KDF
+        _, U, V, M_np = self.kem.encaps_batch(batch, return_ct=True, return_msg=True)
         
         results = []
         for i in range(batch):
-            # Create kem_wire first
+            # Create kem_wire (canonical form)
             if self.use_compression:
                 kem_wire = compress_ciphertext(U[i], V[i], self.kem.q)
             else:
@@ -889,10 +910,14 @@ class BatchHybridKEM:
                     V[i].astype('<u4').tobytes()
                 )
             
+            # Wire-based KDF (MUST match decrypt side!)
+            ct_hash = _sha256(b"ct_hash", kem_wire)
+            K = _sha256(b"shared_key", M_np[i].tobytes(), ct_hash)
+            
             # AAD from kem_wire
             aad = _sha256(b"batch-hybrid-aad", kem_wire)
             
-            dem = GPUChaCha20Poly1305(K[i], device_id=self.device_id)
+            dem = GPUChaCha20Poly1305(K, device_id=self.device_id)
             nonce = secrets.token_bytes(24)
             
             ciphertext, tag = dem.encrypt(plaintexts[i], nonce, aad)
