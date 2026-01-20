@@ -415,7 +415,6 @@ session, handshake = await adapter.initiate_session(peer_addr, peer_pk_blob)
 ## Links
 
 - [Meteor-NC Repository](https://github.com/miosync-masa/meteor-nc)
-- [TCHES 2026 Submission](https://anonymous.4open.science/r/meteor-nc-F73C/)
 
 ---
 
