@@ -642,10 +642,10 @@ class SecureChannel:
         )
         
         # Build chunk for decryption
-        # Note: Use recv_dem's stream_id (matches sender's send_dem stream_id)
+        # Note: Use envelope.sequence as StreamDEM derives nonce from seq
         header = StreamHeader(
             stream_id=self._recv_dem.stream_id,
-            seq=0,  # StreamDEM manages its own sequence
+            seq=seq,  # Must match sender's StreamDEM._encrypt_seq
             chunk_len=len(envelope.payload),
             flags=0,
         )
