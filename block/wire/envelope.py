@@ -86,9 +86,41 @@ SEQUENCE_SIZE = 8
 # Header: version(1) + type(1) + flags(2) + suite_id(1) + auth_scheme(1) + 
 #         chain_id(4) + sender_id(32) + recipient_id(32) + session_id(8) + sequence(8) = 90
 HEADER_SIZE = 1 + 1 + 2 + 1 + 1 + 4 + 32 + 32 + 8 + 8  # 90 bytes
+HEADER_FMT = ">BBHBBI32s32s8sQ"
 
 # Domain separator
 DOMAIN_SEPARATOR = b"meteor-nc-block-v3"
+
+
+def _pack_header(
+    version: int,
+    env_type: "EnvelopeType",
+    flags: "EnvelopeFlags",
+    suite_id: int,
+    auth_scheme: int,
+    chain_id: int,
+    sender_id: bytes,
+    recipient_id: bytes,
+    session_id: bytes,
+    sequence: int,
+) -> bytes:
+    """
+    Pack the canonical 90-byte header.
+    IMPORTANT: AAD should commit to these bytes to prevent header tampering.
+    """
+    return struct.pack(
+        HEADER_FMT,
+        version,
+        int(env_type),
+        int(flags),
+        suite_id,
+        auth_scheme,
+        chain_id,
+        sender_id,
+        recipient_id,
+        session_id,
+        sequence,
+    )
 
 
 # =============================================================================
@@ -231,6 +263,10 @@ class SecureEnvelope:
         if has_pk_blob and len(self.pk_blob) != PK_BLOB_SIZE:
             raise ValueError(f"pk_blob must be {PK_BLOB_SIZE}B, got {len(self.pk_blob)}")
         
+        # HANDSHAKE must carry pk_blob (fix wire semantics / prevent key-confusion)
+        if self.env_type == EnvelopeType.HANDSHAKE and not has_pk_blob:
+            raise ValueError("HANDSHAKE requires pk_blob (set INCLUDE_PK_BLOB and provide pk_blob)")
+        
         # kem_ct size
         if len(self.kem_ct) != expected_kem_ct_size:
             raise ValueError(f"kem_ct must be {expected_kem_ct_size}B for suite 0x{self.suite_id:02x}, got {len(self.kem_ct)}")
@@ -242,6 +278,13 @@ class SecureEnvelope:
         # sender_auth consistency
         has_auth = self.sender_auth is not None
         auth_flag_set = bool(self.flags & EnvelopeFlags.HAS_AUTH)
+        
+        # Enforce canonical auth semantics:
+        #   - HAS_AUTH <=> auth_scheme != NONE (0x00)
+        if auth_flag_set and self.auth_scheme == 0x00:
+            raise ValueError("HAS_AUTH is set but auth_scheme is NONE (0x00)")
+        if (not auth_flag_set) and self.auth_scheme != 0x00:
+            raise ValueError("auth_scheme is not NONE but HAS_AUTH is not set")
         
         if has_auth != auth_flag_set:
             raise ValueError("sender_auth presence must match HAS_AUTH flag")
@@ -278,7 +321,12 @@ class SecureEnvelope:
         """
         flags = EnvelopeFlags.INCLUDE_PK_BLOB
         if sender_auth is not None:
+            if auth_scheme == 0x00:
+                raise ValueError("sender_auth provided but auth_scheme is NONE (set auth_scheme)")
             flags |= EnvelopeFlags.HAS_AUTH
+        else:
+            # Canonical: no auth => auth_scheme must be NONE
+            auth_scheme = 0x00
         
         return cls(
             version=PROTOCOL_VERSION,
@@ -323,7 +371,11 @@ class SecureEnvelope:
         if request_ack:
             flags |= EnvelopeFlags.REQUEST_ACK
         if sender_auth is not None:
+            if auth_scheme == 0x00:
+                raise ValueError("sender_auth provided but auth_scheme is NONE (set auth_scheme)")
             flags |= EnvelopeFlags.HAS_AUTH
+        else:
+            auth_scheme = 0x00
         
         return cls(
             version=PROTOCOL_VERSION,
@@ -367,7 +419,11 @@ class SecureEnvelope:
         if include_pk_blob:
             flags |= EnvelopeFlags.INCLUDE_PK_BLOB
         if sender_auth is not None:
+            if auth_scheme == 0x00:
+                raise ValueError("sender_auth provided but auth_scheme is NONE (set auth_scheme)")
             flags |= EnvelopeFlags.HAS_AUTH
+        else:
+            auth_scheme = 0x00
         
         return cls(
             version=PROTOCOL_VERSION,
@@ -460,19 +516,7 @@ class SecureEnvelope:
         Wire: [header:90][pk_blob:64?][kem_ct:var][tag:16][payload:N][sender_auth:var?]
         """
         # Header (90 bytes)
-        # Format: >BBHBBI32s32s8sQ
-        #   B: version (1)
-        #   B: type (1)
-        #   H: flags (2)
-        #   B: suite_id (1)
-        #   B: auth_scheme (1)
-        #   I: chain_id (4)
-        #   32s: sender_id (32)
-        #   32s: recipient_id (32)
-        #   8s: session_id (8)
-        #   Q: sequence (8)
-        header = struct.pack(
-            ">BBHBBI32s32s8sQ",
+        header = _pack_header(
             self.version,
             self.env_type,
             self.flags,
@@ -511,7 +555,7 @@ class SecureEnvelope:
             raise ValueError(f"Data too short for header: {len(data)} < {HEADER_SIZE}")
         
         # Parse header
-        header_fmt = ">BBHBBI32s32s8sQ"
+        header_fmt = HEADER_FMT
         (
             version, env_type_raw, flags_raw, suite_id, auth_scheme_id,
             chain_id, sender_id, recipient_id, session_id, sequence
@@ -656,27 +700,46 @@ def compute_aad(
     session_id: bytes,
     sequence: int,
     kem_ct: bytes,
+    *,
+    version: int = PROTOCOL_VERSION,
+    auth_scheme: int = DEFAULT_AUTH_SCHEME_ID,
     flags: EnvelopeFlags = EnvelopeFlags.NONE,
     pk_blob: Optional[bytes] = None,
 ) -> bytes:
     """
     Compute AAD for AEAD encryption.
     
-    AAD binds: domain, suite, chain, type, sender, recipient, session, sequence, flags, kem_ct, pk_blob
+    AAD binds (tamper-proof): DOMAIN || HEADER_BYTES || [pk_blob] || kem_ct
+    - Header bytes include: version, type, flags, suite_id, auth_scheme, chain_id, ids, session_id, sequence
     """
+    # Ensure pk_blob <-> flag consistency for callers
+    if pk_blob is not None:
+        if not (flags & EnvelopeFlags.INCLUDE_PK_BLOB):
+            raise ValueError("pk_blob provided but INCLUDE_PK_BLOB flag is not set")
+        if len(pk_blob) != PK_BLOB_SIZE:
+            raise ValueError(f"pk_blob must be {PK_BLOB_SIZE}B, got {len(pk_blob)}")
+    else:
+        if flags & EnvelopeFlags.INCLUDE_PK_BLOB:
+            raise ValueError("INCLUDE_PK_BLOB flag set but pk_blob is None")
+    
     h = hashlib.sha256()
     h.update(DOMAIN_SEPARATOR)
-    h.update(struct.pack(">B", suite_id))
-    h.update(struct.pack(">I", chain_id))
-    h.update(struct.pack(">B", env_type))
-    h.update(struct.pack(">H", flags))  # Include flags in AAD
-    h.update(sender_id)
-    h.update(recipient_id)
-    h.update(session_id)
-    h.update(struct.pack(">Q", sequence))
-    h.update(kem_ct)
+    header = _pack_header(
+        version,
+        env_type,
+        flags,
+        suite_id,
+        auth_scheme,
+        chain_id,
+        sender_id,
+        recipient_id,
+        session_id,
+        sequence,
+    )
+    h.update(header)
     if pk_blob:
         h.update(pk_blob)
+    h.update(kem_ct)
     
     return h.digest()
 
@@ -687,13 +750,22 @@ def compute_auth_message(envelope: SecureEnvelope) -> bytes:
     """
     h = hashlib.sha256()
     h.update(b"meteor-nc-block-auth-v3")
-    h.update(struct.pack(">B", envelope.suite_id))
-    h.update(struct.pack(">I", envelope.chain_id))
-    h.update(struct.pack(">B", envelope.env_type))
-    h.update(envelope.sender_id)
-    h.update(envelope.recipient_id)
-    h.update(envelope.session_id)
-    h.update(struct.pack(">Q", envelope.sequence))
+    # Commit to the canonical header bytes (includes version/flags/suite/auth_scheme/etc.)
+    h.update(_pack_header(
+        envelope.version,
+        envelope.env_type,
+        envelope.flags,
+        envelope.suite_id,
+        envelope.auth_scheme,
+        envelope.chain_id,
+        envelope.sender_id,
+        envelope.recipient_id,
+        envelope.session_id,
+        envelope.sequence,
+    ))
+    # If present, bind pk_blob (prevents key-confusion on handshake)
+    if envelope.pk_blob:
+        h.update(envelope.pk_blob)
     h.update(envelope.kem_ct)
     h.update(envelope.tag)
     h.update(hashlib.sha256(envelope.payload).digest())
@@ -846,11 +918,11 @@ def run_tests() -> bool:
     
     aad1 = compute_aad(
         EnvelopeType.DATA, 0x01, chain_id, sender_id, recipient_id,
-        session_id, 1, kem_ct, EnvelopeFlags.NONE
+        session_id, 1, kem_ct, flags=EnvelopeFlags.NONE
     )
     aad2 = compute_aad(
         EnvelopeType.DATA, 0x01, chain_id, sender_id, recipient_id,
-        session_id, 2, kem_ct, EnvelopeFlags.NONE
+        session_id, 2, kem_ct, flags=EnvelopeFlags.NONE
     )
     
     aad_ok = len(aad1) == 32 and aad1 != aad2
