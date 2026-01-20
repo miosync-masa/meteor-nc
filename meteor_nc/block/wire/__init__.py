@@ -62,6 +62,7 @@ from .envelope import (
     # Helpers
     compute_aad,
     compute_auth_message,
+    compute_commit,
 )
 
 # Re-export from suites for convenience
@@ -132,6 +133,7 @@ __all__ = [
     # Helpers
     "compute_aad",
     "compute_auth_message",
+    "compute_commit",
 ]
 
 __version__ = "0.3.0"
