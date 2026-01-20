@@ -102,6 +102,7 @@ from .registry import (
 # Import from mempool module
 from .mempool import (
     TxEncryptor,
+    TxDecryptor,
     EncryptedTx,
     CommitReveal,
     ShieldedTx,
@@ -161,6 +162,7 @@ __all__ = [
     
     # Mempool (MEV Protection)
     "TxEncryptor",
+    "TxDecryptor",
     "EncryptedTx",
     "CommitReveal",
     "ShieldedTx",
