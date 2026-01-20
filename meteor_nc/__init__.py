@@ -4,13 +4,14 @@ Meteor-NC: Post-Quantum Hybrid Cryptosystem
 
 WEB 4.0 Protocol Ready!
 - Post-Quantum Key Encapsulation (LWE-KEM)
-- Kyber-Style Coefficient Compression (v2.0) ← NEW!
+- Kyber-Style Coefficient Compression (v2.0)
 - High-Speed Streaming Encryption (XChaCha20-Poly1305)
 - P2P Communication Protocol (libp2p)
 - Decentralized Peer Discovery (Kademlia DHT)
 - Global Broadcast (PubSub/GossipSub)
 - Distributed Storage (IPFS)
 - Device-Bound Authentication (2FA/3FA)
+- Blockchain Integration (EVM, MEV Protection) ← NEW!
 - Edge Device Compatible (CPU-only, no GPU required)
 
 Architecture:
@@ -28,8 +29,15 @@ Architecture:
     │  │   ├── advanced.py         # Testing & validation    │
     │  │   └── web4.py             # Full Web 4.0 stack      │
     │  │                                                      │
-    │  └── auth/             # Authentication                 │
-    │      └── core.py       # Device-bound 2FA/3FA          │
+    │  ├── auth/             # Authentication                 │
+    │  │   └── core.py       # Device-bound 2FA/3FA          │
+    │  │                                                      │
+    │  └── block/            # Blockchain Integration ← NEW!  │
+    │      ├── wire/         # SecureEnvelope v0.3           │
+    │      ├── transport/    # SecureChannel, WalletChannel  │
+    │      ├── registry/     # PKStore, PKRegistry.sol       │
+    │      ├── mempool/      # TxEncryptor, CommitReveal     │
+    │      └── adapters/     # MetaMask, WalletConnect       │
     └─────────────────────────────────────────────────────────┘
 
 v2.0 Compression:
@@ -38,7 +46,7 @@ v2.0 Compression:
     - ~75% bandwidth reduction vs uncompressed
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # =============================================================================
 # Core Cryptography (CPU/GPU optional)
@@ -216,6 +224,48 @@ except ImportError:
     pass
 
 # =============================================================================
+# Blockchain Integration (Post-Quantum for EVM)
+# =============================================================================
+
+BLOCK_AVAILABLE = False
+try:
+    from .block import (
+        # Wire format
+        SecureEnvelope,
+        EnvelopeType,
+        EnvelopeFlags,
+        
+        # Transport
+        SecureChannel,
+        WalletChannel,
+        WalletSession,
+        SecureRPCClient,
+        SecureRPCHandler,
+        
+        # Registry
+        PKStore,
+        KeyResolver,
+        KeyType,
+        
+        # MEV Protection
+        TxEncryptor,
+        TxDecryptor,
+        CommitReveal,
+        ShieldedTx,
+        
+        # Wallet Adapters
+        WalletAdapter,
+        MockWalletAdapter,
+        MetaMaskAdapter,
+        WalletConnectAdapter,
+        WalletState,
+        WalletCapability,
+    )
+    BLOCK_AVAILABLE = True
+except ImportError:
+    pass
+
+# =============================================================================
 # Exports
 # =============================================================================
 
@@ -308,6 +358,31 @@ __all__ = [
     "generate_recovery_codes",
     
     # -------------------------------------------------------------------------
+    # Blockchain Integration
+    # -------------------------------------------------------------------------
+    "SecureEnvelope",
+    "EnvelopeType",
+    "EnvelopeFlags",
+    "SecureChannel",
+    "WalletChannel",
+    "WalletSession",
+    "SecureRPCClient",
+    "SecureRPCHandler",
+    "PKStore",
+    "KeyResolver",
+    "KeyType",
+    "TxEncryptor",
+    "TxDecryptor",
+    "CommitReveal",
+    "ShieldedTx",
+    "WalletAdapter",
+    "MockWalletAdapter",
+    "MetaMaskAdapter",
+    "WalletConnectAdapter",
+    "WalletState",
+    "WalletCapability",
+    
+    # -------------------------------------------------------------------------
     # Constants
     # -------------------------------------------------------------------------
     "Q_DEFAULT",
@@ -334,6 +409,7 @@ __all__ = [
     "IPFS_AVAILABLE",
     "NACL_AVAILABLE",
     "AUTH_AVAILABLE",
+    "BLOCK_AVAILABLE",
 ]
 
 
@@ -377,4 +453,5 @@ def status() -> dict:
         'ipfs': IPFS_AVAILABLE,
         'nacl': NACL_AVAILABLE,
         'auth': AUTH_AVAILABLE,
+        'block': BLOCK_AVAILABLE,
     }
