@@ -34,7 +34,7 @@ Meteor-NC is a practical implementation of a post-quantum lattice-based key enca
 
 ## Performance Results
 
-Measured on NVIDIA RTX 4090 (batch backend). All security levels pass correctness tests.
+Measured on Colab A100（40G）(batch backend). All security levels pass correctness tests.
 
 ### Batch KEM Throughput
 
@@ -43,6 +43,20 @@ Measured on NVIDIA RTX 4090 (batch backend). All security levels pass correctnes
 | NIST Level 1 | 256 | **4,175,900 ops/sec** | 23.9 ms |
 | NIST Level 3 | 512 | **2,379,398 ops/sec** | 21.0 ms |
 | NIST Level 5 | 1024 | **1,017,945 ops/sec** | 9.8 ms |
+
+### Batch KEM Throughput　compressed
+
+| Security Level | n    | Encaps (ops/sec) | Decaps (ops/sec) |
+|----------------|------|------------------|------------------|
+| NIST Level 1   | 256  | 1,247,081        | 1,572,313        |
+| NIST Level 3   | 512  |   983,053        | 1,529,012        |
+| NIST Level 5   | 1024 |   983,053        | 1,529,012        |
+
+| Scheme     | Security Level | PK (B) | CT (B) | CT Compressed (B) | SS (B) |
+|------------|----------------|--------|--------|-------------------|--------|
+| Meteor-NC | n=256 (L1)     | 1100   | 2056   | **518**           | 32     |
+| Meteor-NC | n=512 (L3)     | 2124   | 4104   | **1094**          | 32     |
+| Meteor-NC | n=1024 (L5)    | 4172   | 8200   | **2310**          | 32     |
 
 ```
 ======================================================================
