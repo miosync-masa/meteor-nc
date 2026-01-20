@@ -24,7 +24,7 @@ Meteor-NC is a practical implementation of a post-quantum lattice-based key enca
 
 ## ✨ Key Features
 
-- **🚀 High Throughput**: 4M+ ops/sec on RTX 4090 (batch backend)
+- **🚀 High Throughput**: 4M+ ops/sec on Colab A100(40G) (batch backend)
 - **🔐 Post-Quantum Security**: Based on LWE with FO transform (IND-CCA2)
 - **📦 Compact Keys**: 32-byte seed-based key storage
 - **🔄 CPU/GPU Interop**: Byte-exact FO across backends
@@ -250,6 +250,7 @@ meteor_nc/
 │   ├── common.py        # HKDF, CBD, constants
 │   ├── batch.py         # BatchLWEKEM (GPU)
 │   ├── stream.py        # StreamDEM (chunked AEAD)
+│   ├── compression.py   # Compression
 │   └── kernels/         # CUDA kernels
 ├── protocols/
 │   ├── meteor_protocols.py         # P2P messaging
