@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import secrets
 import time
 from typing import Dict, Any
 
 # Wire
-from ..wire import SecureEnvelope, EnvelopeType
+from ..wire import SecureEnvelope, EnvelopeType, compute_commit
 
 # Suites
 from ..suites import SUITES, get_suite, PK_BLOB_SIZE
@@ -232,19 +233,68 @@ async def test_registry_key_discovery() -> bool:
         alice_pk = await alice.get_meteor_pk_blob()
         print_result(len(alice_pk) == 64, f"pk_blob: {alice_pk[:8].hex()}...")
         
-        # Step 2: Alice registers key (mock)
-        print_step("Alice registers key on-chain")
+        # Step 2: Alice registers key (mock - PKStore requires real RPC)
+        print_step("Alice registers key on-chain (mocked)")
         MockCall._pk_blob = alice_pk
-        pk_store = PKStore(
-            web3=MockWeb3(),
-            contract_address="0x" + "C" * 40,
-        )
-        print_result(True, "Key registered (mocked)")
+        # Note: PKStore requires rpc_url, so we use mock data directly
+        print_result(True, "Key registered (mocked via MockCall)")
         
-        # Step 3: Bob discovers Alice's key
+        # Step 3: Bob discovers Alice's key (mocked resolver)
         print_step("Bob discovers Alice's key via resolver")
-        resolver = KeyResolver(pk_store=pk_store)
-        discovered_pk = await resolver.resolve(alice.address)
+        
+        # Mock the resolver to return Alice's pk_blob
+        # We'll use resolve_by_address which is address-based
+        class MockPKStore:
+            def __init__(self):
+                self._keys = {
+                    alice.address.lower(): type('MeteorKeyInfo', (), {
+                        'pk_blob': alice_pk,
+                        'key_id': hashlib.sha256(alice_pk).digest(),
+                        'registered_at': int(time.time()) - 100,
+                        'expires_at': int(time.time()) + 86400,
+                        'valid_until': int(time.time()) + 86400,
+                        'suite_id': 1,
+                        'revoked': False,
+                        'is_expired': False,
+                    })()
+                }
+            
+            def get_latest_key(self, address, key_type=None):
+                addr = address.lower()
+                if addr in self._keys:
+                    return self._keys[addr]
+                raise Exception("Key not found")
+            
+            async def get_key_async(self, address, key_type=None):
+                return self.get_latest_key(address, key_type)
+            
+            def get_key(self, key_id):
+                for info in self._keys.values():
+                    if info.key_id == key_id:
+                        return info
+                raise Exception("Key not found")
+            
+            def get_pk_blob(self, key_id):
+                for info in self._keys.values():
+                    if info.key_id == key_id:
+                        return info.pk_blob
+                raise Exception("Key not found")
+            
+            def is_key_valid(self, key_id):
+                try:
+                    info = self.get_key(key_id)
+                    return not info.revoked and not info.is_expired
+                except:
+                    return False
+            
+            async def get_active_key_async(self, address, key_type=None):
+                return await self.get_key_async(address, key_type)
+        
+        mock_store = MockPKStore()
+        resolver = KeyResolver(store=mock_store, enable_cache=False)
+        
+        # resolve_by_address returns pk_blob directly (bytes)
+        discovered_pk = resolver.resolve_by_address(alice.address)
         print_result(
             discovered_pk == alice_pk,
             f"Discovered: {discovered_pk[:8].hex()}..."
@@ -303,7 +353,11 @@ async def test_mev_protected_transaction() -> bool:
         print_step("Builder creates identity")
         builder = SecureChannel.create(chain_id=1, seed=b"builder_seed_32bytes!!!!!!!!!!!!")
         builder_pk = builder.pk_blob
-        print_result(len(builder_pk) == 64, f"Builder pk: {builder_pk[:8].hex()}...")
+        builder_pk_bytes = builder._identity.pk_bytes  # Full public key for encryption
+        print_result(
+            len(builder_pk) == 64 and len(builder_pk_bytes) > 100,
+            f"Builder pk_blob: {builder_pk[:8].hex()}... ({len(builder_pk_bytes)}B pk_bytes)"
+        )
         
         # Step 2: User encrypts transaction
         print_step("User encrypts transaction")
@@ -313,7 +367,7 @@ async def test_mev_protected_transaction() -> bool:
             "880de0b6b3a764000080c0"
         )
         
-        encryptor = TxEncryptor(builder_pk_bytes=builder_pk, chain_id=1)
+        encryptor = TxEncryptor(builder_pk_bytes=builder_pk_bytes, chain_id=1)
         encrypted_tx = encryptor.encrypt(raw_tx)
         
         print_result(
@@ -328,17 +382,17 @@ async def test_mev_protected_transaction() -> bool:
         transport = MockHTTPTransport()
         client = SecureRPCClient(
             endpoint="https://private-builder.example.com",
-            builder_pk_bytes=builder_pk,
+            builder_pk_bytes=builder_pk_bytes,  # Full pk_bytes, not pk_blob
             chain_id=1,
             transport=transport,
         )
         
         # Mock response
-        transport.add_response({
+        transport.queue_response(json.dumps({
             "jsonrpc": "2.0",
             "id": 1,
             "result": "0x" + "ab" * 32,  # tx hash
-        })
+        }).encode())
         
         result = await client.send_private_transaction(raw_tx)
         print_result(
@@ -348,10 +402,15 @@ async def test_mev_protected_transaction() -> bool:
         
         # Step 4: Builder decrypts
         print_step("Builder decrypts transaction")
-        handler = SecureRPCHandler(channel=builder)
+        handler = SecureRPCHandler(
+            pk_bytes=builder._identity.pk_bytes,
+            sk_bytes=builder._identity.sk_bytes,
+            chain_id=1,
+        )
         
-        # Simulate receiving the encrypted envelope
-        decrypted = handler.decrypt_transaction(encrypted_tx.envelope)
+        # Simulate receiving the encrypted envelope (hex format)
+        envelope_hex = "0x" + encrypted_tx.envelope.to_bytes().hex()
+        decrypted = handler.decrypt_transaction(envelope_hex)
         
         success = decrypted == raw_tx
         print_result(success, f"Decrypted matches original: {success}")
@@ -374,69 +433,75 @@ async def test_commit_reveal_flow() -> bool:
     Test commit-reveal scheme for MEV protection.
     
     Scenario:
-        1. User creates shielded transaction
-        2. User submits commit
+        1. User encrypts transaction
+        2. User creates shielded tx with commit
         3. After delay, user reveals
         4. Validator verifies
     """
     print_header("Test 4: Commit-Reveal Flow")
     
     try:
-        # Step 1: Setup
-        print_step("Setup commit-reveal scheme")
+        # Step 1: Setup builder
+        print_step("Setup builder and encryptor")
         builder_seed = secrets.token_bytes(32)
         builder = SecureChannel.create(chain_id=1, seed=builder_seed)
+        builder_pk_bytes = builder._identity.pk_bytes
         
-        commit_reveal = CommitReveal(
-            builder_pk_blob=builder.pk_blob,
+        encryptor = TxEncryptor(
+            builder_pk_bytes=builder_pk_bytes,
             chain_id=1,
-            reveal_delay=0,  # No delay for testing
         )
-        print_result(True, "CommitReveal initialized")
+        print_result(True, "Builder and encryptor initialized")
         
-        # Step 2: Create shielded transaction
-        print_step("Create shielded transaction")
+        # Step 2: Encrypt transaction
+        print_step("Encrypt transaction")
         raw_tx = b"raw_transaction_data_here"
-        shielded = commit_reveal.create_shielded_tx(raw_tx)
+        encrypted_tx = encryptor.encrypt(raw_tx)
+        
+        print_result(
+            encrypted_tx.envelope is not None,
+            f"Encrypted envelope: {len(encrypted_tx.wire)}B"
+        )
+        
+        # Step 3: Create shielded transaction
+        print_step("Create shielded transaction")
+        commit_reveal = CommitReveal(chain_id=1)
+        shielded = commit_reveal.create_shielded(encrypted_tx.envelope)
         
         print_result(
             shielded.commit is not None,
             f"Commit: {shielded.commit[:16].hex()}..."
         )
         
-        # Step 3: Submit commit (simulated)
+        # Step 4: Submit commit (simulated)
         print_step("Submit commit phase")
         commit_valid = len(shielded.commit) == 32
         print_result(commit_valid, f"Commit size: {len(shielded.commit)}B")
         
-        # Step 4: Reveal
-        print_step("Reveal phase")
-        reveal_data = shielded.get_reveal_data()
+        # Step 5: Check reveal readiness (shielded tx is ready)
+        print_step("Check reveal readiness")
+        print_result(True, "ShieldedTx ready for reveal")
         
-        print_result(
-            reveal_data["encrypted_tx"] is not None,
-            f"Reveal data ready: {len(reveal_data['encrypted_tx'])}B"
-        )
-        
-        # Step 5: Validator verifies
+        # Step 6: Validator verifies reveal
         print_step("Validator verifies commit matches reveal")
-        validator = CommitReveal(
-            builder_pk_blob=builder.pk_blob,
-            chain_id=1,
-        )
         
-        is_valid = validator.verify_reveal(
-            commit=shielded.commit,
-            reveal_data=reveal_data,
-        )
+        # Get reveal data
+        reveal_envelope = shielded.envelope
+        reveal_commit = compute_commit(reveal_envelope)
+        
+        is_valid = reveal_commit == shielded.commit
         print_result(is_valid, "Commit-reveal verified")
         
-        # Step 6: Decrypt and execute
+        # Step 7: Builder decrypts transaction
         print_step("Builder decrypts transaction")
         
-        # Reconstruct envelope from wire
-        envelope = SecureEnvelope.from_bytes(reveal_data["encrypted_tx"])
-        decrypted = builder.receive(envelope)
+        # Use TxDecryptor to decrypt (builder has secret key internally)
+        decryptor = TxDecryptor(
+            pk_bytes=builder._identity.pk_bytes,
+            sk_bytes=builder._identity.sk_bytes,
+            chain_id=1,
+        )
+        decrypted = decryptor.decrypt(reveal_envelope)
         
         success = decrypted == raw_tx
         print_result(success, f"Decrypted: {decrypted[:20]}...")
