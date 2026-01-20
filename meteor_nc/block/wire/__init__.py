@@ -63,6 +63,7 @@ from .envelope import (
     compute_aad,
     compute_auth_message,
     compute_commit,
+    compute_aad_from_envelope,
 )
 
 # Re-export from suites for convenience
@@ -134,6 +135,7 @@ __all__ = [
     "compute_aad",
     "compute_auth_message",
     "compute_commit",
+    "compute_aad_from_envelope",
 ]
 
 __version__ = "0.3.0"
