@@ -646,10 +646,16 @@ class MetaMaskAdapter(WalletAdapter):
             )
             pk_blob = bytes.fromhex(pk_blob_hex[2:])
             
+            # For mock provider, also get the seed for testing
+            # In production, Snap manages keys internally
+            seed = None
+            if isinstance(self._provider, MockEthereumProvider):
+                seed = self._provider._snap_state.get(f"seed:{self.address}")
+            
             return MeteorIdentity(
                 address=self.address,
                 pk_blob=pk_blob,
-                seed=None,  # Snap manages keys internally
+                seed=seed,  # May be None for real Snap
             )
         else:
             # Fall back to base implementation (signature-derived)
