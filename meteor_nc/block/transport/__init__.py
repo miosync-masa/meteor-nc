@@ -7,32 +7,23 @@ Integrates with cryptography/ primitives (LWEKEM, StreamDEM, compression).
 
 Modules:
     channel: SecureChannel for encrypted P2P communication
+    wallet: WalletChannel for Ethereum wallet-to-wallet messaging
+    rpc: SecureRPCClient for encrypted RPC communication
 
 Usage:
+    # Basic channel
     from meteor_nc.block.transport import SecureChannel, ChannelState
+    channel = SecureChannel.create(chain_id=1)
     
-    # Create channel with identity
-    channel = SecureChannel.create(
-        chain_id=1,
-        suite_id=0x01,  # Level 1
-    )
+    # Wallet-to-wallet
+    from meteor_nc.block.transport import WalletChannel, WalletMessage
+    wallet = WalletChannel.create(address="0x...", chain_id=1)
+    session, handshake = wallet.initiate_handshake(peer_addr, peer_pk_blob)
     
-    # Get pk_blob for sharing
-    my_pk_blob = channel.get_pk_blob()
-    
-    # Connect to peer (initiator side)
-    handshake = channel.connect(peer_pk_blob)
-    # Send handshake envelope to peer...
-    
-    # Accept handshake (responder side)
-    response = peer_channel.accept(handshake)
-    # Send response back...
-    
-    # Send encrypted data
-    envelope = channel.send(b"Hello!")
-    
-    # Receive and decrypt
-    data = channel.receive(envelope)
+    # Secure RPC
+    from meteor_nc.block.transport import SecureRPCClient
+    client = SecureRPCClient(endpoint="https://...", builder_pk_bytes=pk, chain_id=1)
+    tx_hash = await client.send_private_transaction(raw_tx)
 """
 
 from .channel import (
@@ -43,12 +34,65 @@ from .channel import (
     DecryptionError,
 )
 
+from .wallet import (
+    WalletChannel,
+    WalletSession,
+    WalletMessage,
+    MessageType,
+    WalletError,
+    AddressError,
+    ResolutionError,
+    MessageError,
+)
+
+from .rpc import (
+    SecureRPCClient,
+    SecureRPCHandler,
+    RPCRequest,
+    RPCResponse,
+    PrivateTxRequest,
+    RPCError,
+    ResponseError,
+    EncryptionError,
+    MockHTTPTransport,
+    METHOD_SEND_PRIVATE_TX,
+    METHOD_PRIVATE_CALL,
+    METHOD_GET_BUILDER_PK,
+    METHOD_SUBMIT_COMMIT,
+    METHOD_SUBMIT_REVEAL,
+)
+
 __all__ = [
+    # Channel
     "SecureChannel",
     "ChannelState",
     "ChannelError",
     "HandshakeError",
     "DecryptionError",
+    # Wallet
+    "WalletChannel",
+    "WalletSession",
+    "WalletMessage",
+    "MessageType",
+    "WalletError",
+    "AddressError",
+    "ResolutionError",
+    "MessageError",
+    # RPC
+    "SecureRPCClient",
+    "SecureRPCHandler",
+    "RPCRequest",
+    "RPCResponse",
+    "PrivateTxRequest",
+    "RPCError",
+    "ResponseError",
+    "EncryptionError",
+    "MockHTTPTransport",
+    "METHOD_SEND_PRIVATE_TX",
+    "METHOD_PRIVATE_CALL",
+    "METHOD_GET_BUILDER_PK",
+    "METHOD_SUBMIT_COMMIT",
+    "METHOD_SUBMIT_REVEAL",
 ]
 
 __version__ = "0.3.0"
