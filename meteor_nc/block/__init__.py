@@ -99,6 +99,15 @@ from .registry import (
     KeyNotFoundError,
 )
 
+# Import from mempool module
+from .mempool import (
+    TxEncryptor,
+    EncryptedTx,
+    CommitReveal,
+    ShieldedTx,
+    CommitPhase,
+)
+
 __all__ = [
     # Main class
     "SecureEnvelope",
@@ -149,6 +158,13 @@ __all__ = [
     "KeyResolver",
     "RegistryError",
     "KeyNotFoundError",
+    
+    # Mempool (MEV Protection)
+    "TxEncryptor",
+    "EncryptedTx",
+    "CommitReveal",
+    "ShieldedTx",
+    "CommitPhase",
 ]
 
 __version__ = "0.3.0"
