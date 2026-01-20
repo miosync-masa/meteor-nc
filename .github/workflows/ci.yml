@@ -82,7 +82,8 @@ jobs:
           print(f'✓ KeyGen OK - PK size: {len(pk)} bytes')
           
           K1, ct = kem.encaps()
-          print(f'✓ Encaps OK - CT size: {ct.wire_size()} bytes')
+          ct_size = len(ct) if isinstance(ct, bytes) else ct.wire_size()
+          print(f'✓ Encaps OK - CT size: {ct_size} bytes')
           
           K2 = kem.decaps(ct)
           assert K1 == K2, 'Key mismatch!'
