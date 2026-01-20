@@ -48,9 +48,9 @@ Measured on Colab A100（40G）(batch backend). All security levels pass correct
 
 | Security Level | n    | Encaps (ops/sec) | Decaps (ops/sec) |
 |----------------|------|------------------|------------------|
-| NIST Level 1   | 256  | 1,247,081        | 1,572,313        |
-| NIST Level 3   | 512  |   983,053        | 1,529,012        |
-| NIST Level 5   | 1024 |   983,053        | 1,529,012        |
+| NIST Level 1   | 256  | 1,344,648        | 1,377,240        |
+| NIST Level 3   | 512  | 1,238,124        | 1,572,161        |
+| NIST Level 5   | 1024 |   973,204        | 1,519,720        |
 
 | Scheme     | Security Level | PK (B) | CT (B) | CT Compressed (B) | SS (B) |
 |------------|----------------|--------|--------|-------------------|--------|
@@ -68,6 +68,19 @@ n=1024: ✅ PASS  |  Peak: 1,017,945 ops/sec
 
 RESULT: ✅ ALL LEVELS PASSED
 ======================================================================
+
+======================================================================
+COMPRESSED FINAL SUMMARY - ALL SECURITY LEVELS
+----------------------------------------------------------------------
+n=256:  ✅ PASS  |  Peak: 1,344,648 ops/sec
+n=512:  ✅ PASS  |  Peak: 1,238,124 ops/sec
+n=1024: ✅ PASS  |  Peak: 973,204   ops/sec
+
+RESULT: ✅ ALL LEVELS PASSED
+======================================================================
+
+
+
 ```
 
 ---
