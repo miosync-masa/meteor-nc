@@ -722,6 +722,12 @@ def compute_aad(
         if flags & EnvelopeFlags.INCLUDE_PK_BLOB:
             raise ValueError("INCLUDE_PK_BLOB flag set but pk_blob is None")
     
+    # Enforce canonical auth semantics here too (prevents call-site footguns)
+    if (flags & EnvelopeFlags.HAS_AUTH) and auth_scheme == 0x00:
+        raise ValueError("HAS_AUTH set but auth_scheme is NONE (0x00)")
+    if (not (flags & EnvelopeFlags.HAS_AUTH)) and auth_scheme != 0x00:
+        raise ValueError("auth_scheme != NONE but HAS_AUTH is not set")
+    
     h = hashlib.sha256()
     h.update(DOMAIN_SEPARATOR)
     header = _pack_header(
@@ -777,7 +783,7 @@ def compute_commit(envelope: SecureEnvelope) -> bytes:
     """
     Compute commit value for commit-reveal MEV protection.
     
-    Commit binds (tamper-proof): DOMAIN || HEADER_BYTES || [pk_blob] || kem_ct || tag || H(payload)
+    Commit binds (tamper-proof): DOMAIN || HEADER_BYTES || [pk_blob] || kem_ct || tag || H(payload) || [sender_auth]
     
     This is structurally identical to compute_auth_message() but with a different
     domain separator to prevent cross-protocol attacks.
@@ -808,7 +814,32 @@ def compute_commit(envelope: SecureEnvelope) -> bytes:
     h.update(envelope.tag)
     h.update(hashlib.sha256(envelope.payload).digest())
     
+    # If present, also bind sender_auth (prevents auth-swapping on reveal)
+    if envelope.sender_auth:
+        h.update(envelope.sender_auth)
+    
     return h.digest()
+
+
+def compute_aad_from_envelope(envelope: SecureEnvelope) -> bytes:
+    """
+    Convenience helper to avoid mismatched args at call sites.
+    (version/auth_scheme/flags/pk_blob are taken from the envelope)
+    """
+    return compute_aad(
+        envelope.env_type,
+        envelope.suite_id,
+        envelope.chain_id,
+        envelope.sender_id,
+        envelope.recipient_id,
+        envelope.session_id,
+        envelope.sequence,
+        envelope.kem_ct,
+        version=envelope.version,
+        auth_scheme=envelope.auth_scheme,
+        flags=envelope.flags,
+        pk_blob=envelope.pk_blob,
+    )
 
 
 # =============================================================================
