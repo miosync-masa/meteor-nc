@@ -773,6 +773,44 @@ def compute_auth_message(envelope: SecureEnvelope) -> bytes:
     return h.digest()
 
 
+def compute_commit(envelope: SecureEnvelope) -> bytes:
+    """
+    Compute commit value for commit-reveal MEV protection.
+    
+    Commit binds (tamper-proof): DOMAIN || HEADER_BYTES || [pk_blob] || kem_ct || tag || H(payload)
+    
+    This is structurally identical to compute_auth_message() but with a different
+    domain separator to prevent cross-protocol attacks.
+    
+    Usage:
+        # Commit phase: publish commit = compute_commit(encrypted_tx_envelope)
+        # Reveal phase: publish envelope, verifier checks compute_commit(envelope) == commit
+    """
+    h = hashlib.sha256()
+    h.update(b"meteor-nc-block-commit-v3")
+    # Commit to the canonical header bytes
+    h.update(_pack_header(
+        envelope.version,
+        envelope.env_type,
+        envelope.flags,
+        envelope.suite_id,
+        envelope.auth_scheme,
+        envelope.chain_id,
+        envelope.sender_id,
+        envelope.recipient_id,
+        envelope.session_id,
+        envelope.sequence,
+    ))
+    # If present, bind pk_blob
+    if envelope.pk_blob:
+        h.update(envelope.pk_blob)
+    h.update(envelope.kem_ct)
+    h.update(envelope.tag)
+    h.update(hashlib.sha256(envelope.payload).digest())
+    
+    return h.digest()
+
+
 # =============================================================================
 # Test
 # =============================================================================
