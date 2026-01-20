@@ -1,87 +1,32 @@
-# meteor_nc/block/__init__.py
+# meteor_nc/block/transport/__init__.py
 """
-Meteor-NC Block: Blockchain Integration Layer v0.3
+Meteor-NC Block Transport Layer
 
-Post-quantum cryptography for blockchain applications.
-Supports multiple security levels, auth schemes, and session management.
+Off-chain encrypted communication using SecureEnvelope v0.3 wire format.
+Integrates with cryptography/ primitives (LWEKEM, StreamDEM, compression).
 
-Submodules:
-    suites/     - Cryptographic suite definitions
-    wire/       - Wire formats (SecureEnvelope v0.3)
-    transport/  - Off-chain communication (SecureChannel)
-    registry/   - On-chain PK registry (PKStore, KeyResolver)
-    mempool/    - MEV protection (TODO)
-    adapters/   - Wallet integration (TODO)
+Modules:
+    channel: SecureChannel for encrypted P2P communication
+    wallet: WalletChannel for Ethereum wallet-to-wallet messaging
+    rpc: SecureRPCClient for encrypted RPC communication
 
 Usage:
-    from meteor_nc.block import SecureEnvelope, EnvelopeType
-    from meteor_nc.block import SUITES, AUTH_SCHEMES, generate_session_id_random
+    # Basic channel
+    from meteor_nc.block.transport import SecureChannel, ChannelState
+    channel = SecureChannel.create(chain_id=1)
     
-    # Create envelope
-    session_id = generate_session_id_random()
-    env = SecureEnvelope.create_data(
-        chain_id=1,
-        sender_id=my_key_id,
-        recipient_id=peer_key_id,
-        session_id=session_id,
-        sequence=42,
-        kem_ct=kem_ct,
-        tag=tag,
-        payload=encrypted_data,
-        suite_id=0x01,  # Level 1
-    )
-    wire = env.to_bytes()
+    # Wallet-to-wallet
+    from meteor_nc.block.transport import WalletChannel, WalletMessage
+    wallet = WalletChannel.create(address="0x...", chain_id=1)
+    session, handshake = wallet.initiate_handshake(peer_addr, peer_pk_blob)
     
-    # Use SecureChannel for P2P communication
-    from meteor_nc.block.transport import SecureChannel
-    alice = SecureChannel.create(chain_id=1)
-    
-    # Use registry for key management
-    from meteor_nc.block.registry import PKStore, KeyResolver, KeyType
-
-See ARCHITECTURE.md for design details.
+    # Secure RPC
+    from meteor_nc.block.transport import SecureRPCClient
+    client = SecureRPCClient(endpoint="https://...", builder_pk_bytes=pk, chain_id=1)
+    tx_hash = await client.send_private_transaction(raw_tx)
 """
 
-# Import from suites module
-from .suites import (
-    # Suite definitions
-    SUITES,
-    Suite,
-    get_suite,
-    get_kem_ct_size,
-    get_pk_blob_size,
-    DEFAULT_SUITE_ID,
-    
-    # Auth scheme definitions
-    AUTH_SCHEMES,
-    AuthScheme,
-    get_auth_scheme,
-    get_auth_size,
-    DEFAULT_AUTH_SCHEME_ID,
-    
-    # Session ID generation
-    generate_session_id_random,
-    generate_session_id_deterministic,
-    
-    # PK Blob helpers
-    PK_BLOB_SIZE,
-    create_pk_blob,
-    parse_pk_blob,
-)
-
-# Import from wire module
-from .wire import (
-    SecureEnvelope,
-    EnvelopeType,
-    EnvelopeFlags,
-    PROTOCOL_VERSION,
-    DOMAIN_SEPARATOR,
-    compute_aad,
-    compute_auth_message,
-)
-
-# Import from transport module
-from .transport import (
+from .channel import (
     SecureChannel,
     ChannelState,
     ChannelError,
@@ -89,84 +34,65 @@ from .transport import (
     DecryptionError,
 )
 
-# Import from registry module
-from .registry import (
-    PKStore,
-    KeyType,
-    MeteorKeyInfo,
-    KeyResolver,
-    RegistryError,
-    KeyNotFoundError,
+from .wallet import (
+    WalletChannel,
+    WalletSession,
+    WalletMessage,
+    MessageType,
+    WalletError,
+    AddressError,
+    ResolutionError,
+    MessageError,
 )
 
-# Import from mempool module
-from .mempool import (
-    TxEncryptor,
-    TxDecryptor,
-    EncryptedTx,
-    CommitReveal,
-    ShieldedTx,
-    CommitPhase,
+from .rpc import (
+    SecureRPCClient,
+    SecureRPCHandler,
+    RPCRequest,
+    RPCResponse,
+    PrivateTxRequest,
+    RPCError,
+    ResponseError,
+    EncryptionError,
+    MockHTTPTransport,
+    METHOD_SEND_PRIVATE_TX,
+    METHOD_PRIVATE_CALL,
+    METHOD_GET_BUILDER_PK,
+    METHOD_SUBMIT_COMMIT,
+    METHOD_SUBMIT_REVEAL,
 )
 
 __all__ = [
-    # Main class
-    "SecureEnvelope",
-    "EnvelopeType",
-    "EnvelopeFlags",
-    
-    # Protocol
-    "PROTOCOL_VERSION",
-    "DOMAIN_SEPARATOR",
-    
-    # Suite/Auth
-    "SUITES",
-    "Suite",
-    "get_suite",
-    "get_kem_ct_size",
-    "get_pk_blob_size",
-    "DEFAULT_SUITE_ID",
-    "AUTH_SCHEMES",
-    "AuthScheme",
-    "get_auth_scheme",
-    "get_auth_size",
-    "DEFAULT_AUTH_SCHEME_ID",
-    
-    # Session ID
-    "generate_session_id_random",
-    "generate_session_id_deterministic",
-    
-    # PK Blob
-    "PK_BLOB_SIZE",
-    "create_pk_blob",
-    "parse_pk_blob",
-    
-    # Helpers
-    "compute_aad",
-    "compute_auth_message",
-    
-    # Transport
+    # Channel
     "SecureChannel",
     "ChannelState",
     "ChannelError",
     "HandshakeError",
     "DecryptionError",
-    
-    # Registry
-    "PKStore",
-    "KeyType",
-    "MeteorKeyInfo",
-    "KeyResolver",
-    "RegistryError",
-    "KeyNotFoundError",
-    
-    # Mempool (MEV Protection)
-    "TxEncryptor",
-    "TxDecryptor",
-    "EncryptedTx",
-    "CommitReveal",
-    "ShieldedTx",
-    "CommitPhase",
+    # Wallet
+    "WalletChannel",
+    "WalletSession",
+    "WalletMessage",
+    "MessageType",
+    "WalletError",
+    "AddressError",
+    "ResolutionError",
+    "MessageError",
+    # RPC
+    "SecureRPCClient",
+    "SecureRPCHandler",
+    "RPCRequest",
+    "RPCResponse",
+    "PrivateTxRequest",
+    "RPCError",
+    "ResponseError",
+    "EncryptionError",
+    "MockHTTPTransport",
+    "METHOD_SEND_PRIVATE_TX",
+    "METHOD_PRIVATE_CALL",
+    "METHOD_GET_BUILDER_PK",
+    "METHOD_SUBMIT_COMMIT",
+    "METHOD_SUBMIT_REVEAL",
 ]
 
 __version__ = "0.3.0"
