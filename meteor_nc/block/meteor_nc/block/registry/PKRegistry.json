@@ -1,0 +1,235 @@
+{
+  "contractName": "PKRegistry",
+  "abi": [
+    {
+      "inputs": [],
+      "name": "VERSION",
+      "outputs": [{"internalType": "string", "name": "", "type": "string"}],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {"internalType": "bytes32", "name": "pkSeed", "type": "bytes32"},
+        {"internalType": "bytes32", "name": "bHash", "type": "bytes32"},
+        {"internalType": "uint8", "name": "suiteId", "type": "uint8"},
+        {"internalType": "enum PKRegistry.KeyType", "name": "keyType", "type": "uint8"},
+        {"internalType": "uint64", "name": "validUntil", "type": "uint64"}
+      ],
+      "name": "registerKey",
+      "outputs": [{"internalType": "bytes32", "name": "keyId", "type": "bytes32"}],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {"internalType": "bytes", "name": "pkBlob", "type": "bytes"},
+        {"internalType": "uint8", "name": "suiteId", "type": "uint8"},
+        {"internalType": "enum PKRegistry.KeyType", "name": "keyType", "type": "uint8"},
+        {"internalType": "uint64", "name": "validUntil", "type": "uint64"}
+      ],
+      "name": "registerKeyFromBlob",
+      "outputs": [{"internalType": "bytes32", "name": "keyId", "type": "bytes32"}],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {"internalType": "bytes32", "name": "oldKeyId", "type": "bytes32"},
+        {"internalType": "bytes32", "name": "newPkSeed", "type": "bytes32"},
+        {"internalType": "bytes32", "name": "newBHash", "type": "bytes32"},
+        {"internalType": "uint8", "name": "newSuiteId", "type": "uint8"},
+        {"internalType": "uint64", "name": "newValidUntil", "type": "uint64"}
+      ],
+      "name": "rotateKey",
+      "outputs": [{"internalType": "bytes32", "name": "newKeyId", "type": "bytes32"}],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [{"internalType": "bytes32", "name": "keyId", "type": "bytes32"}],
+      "name": "revokeKey",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [{"internalType": "bytes32", "name": "keyId", "type": "bytes32"}],
+      "name": "getKey",
+      "outputs": [
+        {
+          "components": [
+            {"internalType": "bytes32", "name": "keyId", "type": "bytes32"},
+            {"internalType": "bytes32", "name": "pkSeed", "type": "bytes32"},
+            {"internalType": "bytes32", "name": "bHash", "type": "bytes32"},
+            {"internalType": "uint8", "name": "suiteId", "type": "uint8"},
+            {"internalType": "enum PKRegistry.KeyType", "name": "keyType", "type": "uint8"},
+            {"internalType": "uint64", "name": "validFrom", "type": "uint64"},
+            {"internalType": "uint64", "name": "validUntil", "type": "uint64"},
+            {"internalType": "bool", "name": "revoked", "type": "bool"}
+          ],
+          "internalType": "struct PKRegistry.MeteorKey",
+          "name": "key",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [{"internalType": "bytes32", "name": "keyId", "type": "bytes32"}],
+      "name": "getPkBlob",
+      "outputs": [{"internalType": "bytes", "name": "pkBlob", "type": "bytes"}],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [{"internalType": "bytes32", "name": "keyId", "type": "bytes32"}],
+      "name": "isKeyValid",
+      "outputs": [{"internalType": "bool", "name": "valid", "type": "bool"}],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [{"internalType": "address", "name": "owner", "type": "address"}],
+      "name": "getKeyIdsByOwner",
+      "outputs": [{"internalType": "bytes32[]", "name": "", "type": "bytes32[]"}],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [{"internalType": "bytes32", "name": "keyId", "type": "bytes32"}],
+      "name": "getKeyOwnerAddress",
+      "outputs": [{"internalType": "address", "name": "owner", "type": "address"}],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [{"internalType": "address", "name": "owner", "type": "address"}],
+      "name": "getActiveKeys",
+      "outputs": [
+        {
+          "components": [
+            {"internalType": "bytes32", "name": "keyId", "type": "bytes32"},
+            {"internalType": "bytes32", "name": "pkSeed", "type": "bytes32"},
+            {"internalType": "bytes32", "name": "bHash", "type": "bytes32"},
+            {"internalType": "uint8", "name": "suiteId", "type": "uint8"},
+            {"internalType": "enum PKRegistry.KeyType", "name": "keyType", "type": "uint8"},
+            {"internalType": "uint64", "name": "validFrom", "type": "uint64"},
+            {"internalType": "uint64", "name": "validUntil", "type": "uint64"},
+            {"internalType": "bool", "name": "revoked", "type": "bool"}
+          ],
+          "internalType": "struct PKRegistry.MeteorKey[]",
+          "name": "activeKeys",
+          "type": "tuple[]"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {"internalType": "address", "name": "owner", "type": "address"},
+        {"internalType": "enum PKRegistry.KeyType", "name": "keyType", "type": "uint8"}
+      ],
+      "name": "getLatestKey",
+      "outputs": [
+        {
+          "components": [
+            {"internalType": "bytes32", "name": "keyId", "type": "bytes32"},
+            {"internalType": "bytes32", "name": "pkSeed", "type": "bytes32"},
+            {"internalType": "bytes32", "name": "bHash", "type": "bytes32"},
+            {"internalType": "uint8", "name": "suiteId", "type": "uint8"},
+            {"internalType": "enum PKRegistry.KeyType", "name": "keyType", "type": "uint8"},
+            {"internalType": "uint64", "name": "validFrom", "type": "uint64"},
+            {"internalType": "uint64", "name": "validUntil", "type": "uint64"},
+            {"internalType": "bool", "name": "revoked", "type": "bool"}
+          ],
+          "internalType": "struct PKRegistry.MeteorKey",
+          "name": "key",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [{"internalType": "bytes32[]", "name": "keyIds", "type": "bytes32[]"}],
+      "name": "batchIsKeyValid",
+      "outputs": [{"internalType": "bool[]", "name": "validities", "type": "bool[]"}],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [{"internalType": "bytes32[]", "name": "keyIds", "type": "bytes32[]"}],
+      "name": "batchGetPkBlob",
+      "outputs": [{"internalType": "bytes[]", "name": "pkBlobs", "type": "bytes[]"}],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {"indexed": true, "internalType": "address", "name": "owner", "type": "address"},
+        {"indexed": true, "internalType": "bytes32", "name": "keyId", "type": "bytes32"},
+        {"indexed": false, "internalType": "uint8", "name": "suiteId", "type": "uint8"},
+        {"indexed": false, "internalType": "enum PKRegistry.KeyType", "name": "keyType", "type": "uint8"},
+        {"indexed": false, "internalType": "uint64", "name": "validUntil", "type": "uint64"}
+      ],
+      "name": "KeyRegistered",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {"indexed": true, "internalType": "address", "name": "owner", "type": "address"},
+        {"indexed": true, "internalType": "bytes32", "name": "oldKeyId", "type": "bytes32"},
+        {"indexed": true, "internalType": "bytes32", "name": "newKeyId", "type": "bytes32"}
+      ],
+      "name": "KeyRotated",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {"indexed": true, "internalType": "address", "name": "owner", "type": "address"},
+        {"indexed": true, "internalType": "bytes32", "name": "keyId", "type": "bytes32"}
+      ],
+      "name": "KeyRevoked",
+      "type": "event"
+    },
+    {
+      "inputs": [{"internalType": "bytes32", "name": "keyId", "type": "bytes32"}],
+      "name": "KeyAlreadyRegistered",
+      "type": "error"
+    },
+    {
+      "inputs": [{"internalType": "bytes32", "name": "keyId", "type": "bytes32"}],
+      "name": "KeyNotFound",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {"internalType": "bytes32", "name": "keyId", "type": "bytes32"},
+        {"internalType": "address", "name": "caller", "type": "address"}
+      ],
+      "name": "NotKeyOwner",
+      "type": "error"
+    },
+    {
+      "inputs": [{"internalType": "bytes32", "name": "keyId", "type": "bytes32"}],
+      "name": "KeyAlreadyRevoked",
+      "type": "error"
+    },
+    {
+      "inputs": [{"internalType": "uint8", "name": "suiteId", "type": "uint8"}],
+      "name": "InvalidSuiteId",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "InvalidPkBlob",
+      "type": "error"
+    }
+  ]
+}
