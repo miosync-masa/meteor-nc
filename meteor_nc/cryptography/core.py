@@ -387,6 +387,54 @@ class LWEKEM:
 # Hybrid Cryptosystem
 # =============================================================================
 
+
+# =============================================================================
+# Hybrid DEM (shared by HybridKEM and BatchHybridKEM)
+# =============================================================================
+
+def hybrid_seal(K: bytes, kem_wire: bytes, plaintext: bytes,
+                aad: Optional[bytes], mixer_rounds: int = 8) -> bytes:
+    """Mixer + AES-GCM under keys derived from K; serialize with kem_wire."""
+    if not CRYPTO_AVAILABLE:
+        raise ImportError("cryptography library required")
+    aead_key = _derive_key_meteor(K, b"meteor-nc-aead-key")
+    mixer_key = _derive_key_meteor(K, b"meteor-nc-mixer-key")
+    mixed = SymmetricMixer(key=mixer_key, rounds=mixer_rounds, gpu=False).forward(plaintext)
+    nonce = secrets.token_bytes(12)
+    ct_with_tag = AESGCM(aead_key).encrypt(nonce, mixed, aad)
+    ct_body, tag = ct_with_tag[:-16], ct_with_tag[-16:]
+    return (struct.pack(">I", len(kem_wire)) + kem_wire + nonce +
+            struct.pack(">I", len(ct_body)) + ct_body + tag)
+
+
+def hybrid_parse(ciphertext: bytes) -> Tuple[bytes, bytes, bytes, bytes]:
+    """Split a hybrid ciphertext into (kem_wire, nonce, ct_body, tag)."""
+    if len(ciphertext) < 4:
+        raise ValueError("Ciphertext too short")
+    kem_wire_len = struct.unpack(">I", ciphertext[:4])[0]
+    o = 4
+    kem_wire = ciphertext[o:o + kem_wire_len]; o += kem_wire_len
+    nonce = ciphertext[o:o + 12]; o += 12
+    if len(ciphertext) < o + 4:
+        raise ValueError("Ciphertext truncated")
+    ct_len = struct.unpack(">I", ciphertext[o:o + 4])[0]; o += 4
+    ct_body = ciphertext[o:o + ct_len]; o += ct_len
+    tag = ciphertext[o:o + 16]
+    if len(kem_wire) != kem_wire_len or len(nonce) != 12 or len(ct_body) != ct_len or len(tag) != 16:
+        raise ValueError("Ciphertext truncated")
+    return kem_wire, nonce, ct_body, tag
+
+
+def hybrid_open(K: bytes, nonce: bytes, ct_body: bytes, tag: bytes,
+                aad: Optional[bytes], mixer_rounds: int = 8) -> bytes:
+    if not CRYPTO_AVAILABLE:
+        raise ImportError("cryptography library required")
+    aead_key = _derive_key_meteor(K, b"meteor-nc-aead-key")
+    mixer_key = _derive_key_meteor(K, b"meteor-nc-mixer-key")
+    mixed = AESGCM(aead_key).decrypt(nonce, ct_body + tag, aad)
+    return SymmetricMixer(key=mixer_key, rounds=mixer_rounds, gpu=False).inverse(mixed)
+
+
 class HybridKEM:
     """
     Hybrid Key Encapsulation Mechanism.
@@ -441,86 +489,16 @@ class HybridKEM:
         Encrypt plaintext with optional associated data.
         
         Returns:
-            Serialized FullCiphertext (KEM wire + DEM ciphertext)
+            kem_wire_len (4B) || kem_wire || nonce (12B) || ct_len (4B) || ct || tag (16B)
         """
-        if not CRYPTO_AVAILABLE:
-            raise ImportError("cryptography library required")
-        
         K, kem_wire = self.kem.encaps()
-        aead_key = _derive_key_meteor(K, b"meteor-nc-aead-key")
-        mixer_key = _derive_key_meteor(K, b"meteor-nc-mixer-key")
-        
-        mixer = SymmetricMixer(
-            key=mixer_key,
-            rounds=self.mixer_rounds,
-            gpu=self.gpu,
-            device_id=self.device_id,
-        )
-        mixed = mixer.forward(plaintext)
-        
-        aesgcm = AESGCM(aead_key)
-        nonce = secrets.token_bytes(12)
-        ct_with_tag = aesgcm.encrypt(nonce, mixed, aad)
-        
-        tag = ct_with_tag[-16:]
-        ct_body = ct_with_tag[:-16]
-        
-        # Serialize: kem_wire_len (4B) + kem_wire + nonce (12B) + ct_len (4B) + ct + tag (16B)
-        return (
-            struct.pack(">I", len(kem_wire)) +
-            kem_wire +
-            nonce +
-            struct.pack(">I", len(ct_body)) +
-            ct_body +
-            tag
-        )
+        return hybrid_seal(K, kem_wire, plaintext, aad, self.mixer_rounds)
     
     def decrypt(self, ciphertext: bytes, aad: Optional[bytes] = None) -> bytes:
         """Decrypt ciphertext with optional AAD verification."""
-        if not CRYPTO_AVAILABLE:
-            raise ImportError("cryptography library required")
-        
-        # Parse
-        if len(ciphertext) < 4:
-            raise ValueError("Ciphertext too short")
-        
-        kem_wire_len = struct.unpack(">I", ciphertext[:4])[0]
-        offset = 4
-        
-        kem_wire = ciphertext[offset:offset + kem_wire_len]
-        offset += kem_wire_len
-        
-        nonce = ciphertext[offset:offset + 12]
-        offset += 12
-        
-        ct_len = struct.unpack(">I", ciphertext[offset:offset + 4])[0]
-        offset += 4
-        
-        ct_body = ciphertext[offset:offset + ct_len]
-        offset += ct_len
-        
-        tag = ciphertext[offset:offset + 16]
-        
-        # Decrypt KEM
+        kem_wire, nonce, ct_body, tag = hybrid_parse(ciphertext)
         K = self.kem.decaps(kem_wire)
-        
-        aead_key = _derive_key_meteor(K, b"meteor-nc-aead-key")
-        mixer_key = _derive_key_meteor(K, b"meteor-nc-mixer-key")
-        
-        mixer = SymmetricMixer(
-            key=mixer_key,
-            rounds=self.mixer_rounds,
-            gpu=self.gpu,
-            device_id=self.device_id,
-        )
-        
-        aesgcm = AESGCM(aead_key)
-        ct_with_tag = ct_body + tag
-        mixed = aesgcm.decrypt(nonce, ct_with_tag, aad)
-        
-        plaintext = mixer.inverse(mixed)
-        
-        return plaintext
+        return hybrid_open(K, nonce, ct_body, tag, aad, self.mixer_rounds)
     
     def get_public_key_size(self) -> int:
         """Get public key size in bytes."""

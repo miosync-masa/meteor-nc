@@ -91,3 +91,23 @@ def test_kat(params):
         assert ct.hex().upper() == e["ct"], f"ct mismatch at count {e['count']}"
         assert ss.hex().upper() == e["ss"], f"ss mismatch at count {e['count']}"
         assert kem.decaps(sk, ct) == ss
+
+
+@pytest.mark.parametrize("matmul", ["f32split", "int64"])
+@pytest.mark.parametrize("params", [FRODO640, FRODO976, FRODO1344], ids=lambda p: p.name)
+def test_kat_batch_path(params, matmul):
+    """Same KATs through BatchFrodoKEM (CuPy if a GPU is present, else NumPy)."""
+    import numpy as np
+    from meteor_nc.cryptography.frodo_batch import BatchFrodoKEM
+    d = _kat_dir()
+    if d is None or not (d / KAT_FILES[params]).exists():
+        pytest.skip("FrodoKEM KAT files not available (set FRODO_KAT_DIR)")
+    bk = BatchFrodoKEM(params, matmul=matmul)
+    for e in _read_kats(d / KAT_FILES[params])[:N_VECTORS]:
+        drbg = NistDrbg(bytes.fromhex(e["seed"]))
+        pk, sk = FrodoKEM(params, randombytes=drbg.randombytes).keygen()
+        ms = np.frombuffer(drbg.randombytes(params.len_sec + params.len_salt), np.uint8)[None, :]
+        ct, ss = bk.encaps_batch(pk, ms)
+        assert ct[0].tobytes().hex().upper() == e["ct"], f"ct mismatch at count {e['count']}"
+        assert ss[0].tobytes().hex().upper() == e["ss"], f"ss mismatch at count {e['count']}"
+        assert bk.decaps_batch(sk, ct)[0].tobytes().hex().upper() == e["ss"]

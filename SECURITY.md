@@ -50,13 +50,19 @@ lattice-estimator outputs, but they are far from the claimed levels.
   (`tests/test_frodo_kat.py`).
 * `tests/test_core_v3.py` runs the v2 difference attack against v3 as a
   regression test; it must fail.
-* The insecure GPU batch classes are disabled. A GPU port of the v3 core is
-  future work.
+* The v2 GPU batch backend was removed. The v3 batch backend
+  (`batch.py`, `frodo_batch.py`) runs the same FrodoKEM core batched on GPU
+  (CuPy) or CPU (NumPy), byte-identical to the single implementation and the
+  KATs. Its GPU SHAKE kernel shares its C source with a CPU build that is
+  tested against hashlib (`tests/test_shake_kernel.py`).
 
 ## Remaining limitations
 
-* Pure Python/NumPy: no constant-time guarantees. Research and reference
-  use only.
+* Pure Python/NumPy/CuPy: no constant-time guarantees. Research and
+  reference use only.
+* The GPU path has been verified only through its CPU-equivalent code paths
+  in this repository's CI; run `benchmarks/bench_v3_gpu.py` on a CUDA machine
+  to check it there (it aborts on any mismatch).
 * Sizes grow to FrodoKEM's: public key ~9.6 / 15.6 / 21.5 KB and ciphertext
   ~9.8 / 15.8 / 21.7 KB for L1 / L3 / L5. The small v2 sizes were a
   consequence of the broken construction.

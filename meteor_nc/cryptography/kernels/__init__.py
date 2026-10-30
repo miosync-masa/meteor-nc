@@ -9,16 +9,22 @@ v2: n=256/512/1024 multi-level support
 # =============================================================================
 # v1: Original n=256 optimized kernels (DO NOT MODIFY)
 # =============================================================================
-from .blake3_kernel import GPUBlake3
-from .batch_kernels import (
-    cbd_i32,
-    matmul_AT_R,
-    bdot_R,
-    b_from_As,
-    sdot_U,
-    unpack_to_encoded,
-    pack_bits_gpu,
-)
+# These need CuPy at import time; keep the package importable without it so
+# that the v3 SHAKE kernel source (shake_kernel.py) can be tested on CPU.
+try:
+    from .blake3_kernel import GPUBlake3
+    from .batch_kernels import (
+        cbd_i32,
+        matmul_AT_R,
+        bdot_R,
+        b_from_As,
+        sdot_U,
+        unpack_to_encoded,
+        pack_bits_gpu,
+    )
+    V1_KERNELS_AVAILABLE = True
+except ImportError:
+    V1_KERNELS_AVAILABLE = False
 
 # =============================================================================
 # v2: Multi-level support (n=256/512/1024)

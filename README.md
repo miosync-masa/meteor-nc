@@ -13,9 +13,10 @@
 > the shared secret from the public key and a single ciphertext. Its
 > parameters were also far below the claimed security levels.
 > **v3 replaces the KEM core with FrodoKEM-640/976/1344-SHAKE** (verified
-> byte-exact against the official KATs). The GPU batch backend still
-> implements v2 and is disabled. The performance and size tables below
-> describe **v2** and are kept for history only. See [SECURITY.md](SECURITY.md).
+> byte-exact against the official KATs). The batch backend was rebuilt on the
+> same core for GPU (CuPy) and CPU (NumPy). The performance and size tables
+> further below describe **v2** and are kept for history only.
+> See [SECURITY.md](SECURITY.md).
 >
 > | v3 level (`n=`) | Core | PK (B) | CT (B) | CPU keygen / encaps / decaps |
 > |---|---|---|---|---|
@@ -24,6 +25,14 @@
 > | L5 (`1024`) | FrodoKEM-1344-SHAKE | 21,532 | 21,708 | 28.3 / 19.7 / 25.8 ms |
 >
 > Sizes include a 12-byte Meteor header. Timings: single-threaded NumPy, cloud VM.
+>
+> **Batch (v3).** `BatchLWEKEM(n=...)` batches encaps/decaps on the GPU when
+> CuPy and a CUDA device are present: SHAKE runs in a CUDA kernel (one thread
+> per item) and the LWE products run on cuBLAS SGEMM, split so that float32
+> results are exact. CPU (NumPy, batch 256): 1,791 / 1,603 (L1),
+> 1,256 / 1,128 (L3), 841 / 766 (L5) encaps / decaps per second. GPU figures:
+> run `benchmarks/bench_v3_gpu.py`, which first checks the GPU path against
+> the KATs and the CPU implementation.
 
 ## Overview
 
@@ -148,12 +157,12 @@ assert K1 == K2  # Shared secret matches!
 ```python
 from meteor_nc.cryptography.batch import BatchLWEKEM
 
-kem = BatchLWEKEM(n=256, device_id=0)
-kem.key_gen()
+kem = BatchLWEKEM(n=256, device_id=0)   # CuPy if a GPU is present, else NumPy
+pk, sk = kem.key_gen()
 
-# 100,000 parallel encapsulations
-K_batch, U_batch, V_batch = kem.encaps_batch(100000)
-# → 4M+ ops/sec on RTX-class GPUs
+K, wires = kem.encaps_batch(100_000)      # K: (B, 32) uint8, wires: (B, wire_len) uint8
+assert (kem.decaps_batch(wires) == K).all()
+# wires are ordinary v3 KEM ciphertexts: LWEKEM.decaps(wires[i].tobytes()) works too
 ```
 
 ### Compact Key Storage (32-byte seed)

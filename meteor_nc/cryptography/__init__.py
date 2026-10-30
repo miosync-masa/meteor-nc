@@ -58,15 +58,14 @@ from .core import (
 # Batch KEM (GPU required)
 try:
     from .batch import BatchLWEKEM, BatchHybridKEM, BatchCiphertext
-    # v2 GPU batch path is insecure and disabled (see SECURITY.md)
-    BATCH_AVAILABLE = False
+    BATCH_AVAILABLE = True   # v3: CuPy if a GPU is present, else NumPy
 except ImportError:
     BATCH_AVAILABLE = False
 
 # Batch Multi-Level (n=256/512/1024)
 try:
     from .kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
-    BATCH_MULTILEVEL_AVAILABLE = False  # v2 batch disabled (see SECURITY.md)
+    BATCH_MULTILEVEL_AVAILABLE = BATCH_AVAILABLE  # v3 batch supports L1/L3/L5
 except ImportError:
     BATCH_MULTILEVEL_AVAILABLE = False
 
