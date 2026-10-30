@@ -37,12 +37,13 @@
 >
 > | Level | encaps (GPU-resident) | decaps (GPU-resident) | encaps (to host, with K) | decaps (to host, with K) |
 > |---|---|---|---|---|
-> | L1 FrodoKEM-640 | 759,086 | 639,882 | 197,094 | 424,214 |
-> | L3 FrodoKEM-976 | 456,295 | 374,421 | 107,029 | 252,866 |
-> | L5 FrodoKEM-1344 | 331,049 | 272,258 | 60,390 | 184,092 |
+> | L1 FrodoKEM-640 | **1,244,275** | 947,686 | 197,161 | 193,103 |
+> | L3 FrodoKEM-976 | 719,645 | 534,176 | 119,816 | 109,634 |
+> | L5 FrodoKEM-1344 | 518,477 | 386,120 | 87,535 | 69,293 |
 >
 > "GPU-resident" leaves the FrodoKEM shared secrets and wires on the GPU;
-> "to host" also derives K and copies K and the ~10-22 KB wires back.
+> "to host" also derives K and moves the ~10-22 KB wires between host and
+> GPU, which currently limits it (host-transfer bound, not compute bound).
 > CPU (NumPy, batch 256): about 1,800 / 1,600 (L1) encaps / decaps per second.
 
 ## Overview
