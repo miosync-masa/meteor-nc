@@ -111,15 +111,29 @@ class MeteorNode:
             peer = MeteorPeer(name=name, meteor_id=meteor_id, public_key=public_key)
         except EnvelopeError as e:
             raise ValueError(f"cannot add peer {name!r}: {e}") from None
-        old = self.peers.get(name)
-        if old is not None:
-            self._by_id.pop(old.meteor_id, None)
-        self.peers[name] = peer
-        self._by_id[meteor_id] = name
+        if name in self.peers:
+            self.remove_peer(name)
+        with self._lock:
+            self.peers[name] = peer
+            self._by_id[meteor_id] = name
         logger.info("[%s] added peer %s (%s...)", self.name, name, meteor_id.hex()[:16])
 
     def get_peer(self, name: str) -> Optional[MeteorPeer]:
         return self.peers.get(name)
+
+    def remove_peer(self, name: str) -> bool:
+        """Forget a peer; its messages are rejected afterwards."""
+        with self._lock:
+            peer = self.peers.pop(name, None)
+            if peer is None:
+                return False
+            if self._by_id.get(peer.meteor_id) == name:
+                del self._by_id[peer.meteor_id]
+                for other, p in self.peers.items():       # another name for the same ID
+                    if p.meteor_id == peer.meteor_id:
+                        self._by_id[peer.meteor_id] = other
+                        break
+            return True
 
     def send(self, peer_name: str, plaintext: bytes) -> MeteorMessage:
         """Encrypt and sign ``plaintext`` for a known peer."""

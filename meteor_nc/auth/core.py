@@ -2,33 +2,39 @@
 """
 Meteor-Auth: Device-Bound Quantum-Resistant Authentication
 
-The world's first passwordless authentication system combining
-device binding with post-quantum cryptography.
+Passwordless authentication: user seed (knowledge) + device secret
+(possession) -> device-bound v3 identity, with challenge-response login.
 
 Features:
-    - Device-bound keys (3FA: Knowledge + Possession + Inherence)
+    - Device-bound keys (knowledge + possession; biometric gate optional,
+      a real factor only with a hardware keystore - see DeviceKeyStore)
     - Passwordless authentication via QR code
-    - Quantum-resistant (Meteor-NC LWE-KEM)
+    - Post-quantum (v3 KEM + hybrid Ed25519/ML-DSA-65 signatures)
     - Zero server trust (no password storage)
     - Full P2P integration
     - Biometric hook for iOS/Android integration
 
-Updated for Meteor-NC v2.0 API
+v3: see SECURITY.md for what changed and why.
 """
 
 from __future__ import annotations
 
-import hashlib
-import uuid
-import platform
+import hmac
+import logging
+import os
 import secrets
+import threading
 import time
-from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ..cryptography.common import _sha256, GPU_AVAILABLE
-from ..protocols.meteor_protocol import MeteorNode, MeteorMessage
+from ..cryptography.common import _sha256
+from ..protocols.envelope import MeteorIdentity
+from ..protocols.meteor_protocol import MeteorMessage, MeteorNode
+
+logger = logging.getLogger("meteor-auth")
 
 
 # =============================================================================
@@ -199,11 +205,12 @@ class DefaultBiometricProvider(BiometricProvider):
     """
     Default (no-op) biometric provider.
     
-    Used when biometrics are not required - always succeeds.
+    Used when biometrics are not required. Never reports success on its own
+    (fail closed): requiring biometrics without a real provider is an error.
     """
     
     def verify(self) -> BiometricStatus:
-        return BiometricStatus.SUCCESS
+        return BiometricStatus.NOT_AVAILABLE
     
     def is_available(self) -> bool:
         return False  # Not actually available, just bypassed
@@ -235,326 +242,232 @@ class BiometricFailedError(MeteorAuthError):
 
 
 # =============================================================================
+# Device secret storage (the possession factor)
+# =============================================================================
+
+class DeviceKeyStore:
+    """
+    Holds this device's 32-byte secret, the possession factor.
+
+    v2 used a "fingerprint" of public machine properties (MAC address, OS
+    strings), which an attacker holding the user seed could brute-force
+    offline (about a minute for 2^24 MAC candidates), and which changed on
+    OS updates or when no MAC was found. v3 uses a random secret that exists
+    only where it was created.
+
+    Implementations decide where the secret lives. For the secret (and any
+    biometric gate in front of it) to resist someone with full access to the
+    device's files, back it with a hardware keystore that releases it only
+    after user verification: iOS Secure Enclave / Keychain with
+    ``.biometryCurrentSet``, Android Keystore with
+    ``setUserAuthenticationRequired(true)``, or a TPM.
+    """
+
+    def load_or_create(self) -> bytes:
+        raise NotImplementedError
+
+    def exists(self) -> bool:
+        raise NotImplementedError
+
+
+class FileDeviceKeyStore(DeviceKeyStore):
+    """Secret in a file only the owner can read (0600), created on first use.
+
+    Default path: ``$METEOR_NC_DEVICE_KEY`` or ``~/.meteor_nc/device_key``.
+    Losing the file means a new device identity (re-register; keep the user
+    seed). Copying the file copies the device.
+    """
+
+    def __init__(self, path: Optional[str] = None):
+        self.path = Path(path or os.environ.get("METEOR_NC_DEVICE_KEY")
+                         or Path.home() / ".meteor_nc" / "device_key")
+
+    def exists(self) -> bool:
+        return self.path.exists()
+
+    def _read(self) -> bytes:
+        if os.name == "posix" and self.path.stat().st_mode & 0o077:
+            raise MeteorAuthError(f"device key {self.path} is readable by other users "
+                                  "(chmod 600 it, or delete it to start a new device identity)")
+        data = self.path.read_bytes()
+        if len(data) != 32:
+            raise MeteorAuthError(f"device key {self.path} is corrupted")
+        return data
+
+    def load_or_create(self) -> bytes:
+        if self.path.exists():
+            return self._read()
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:                     # created concurrently
+            return self._read()
+        try:
+            os.write(fd, secrets.token_bytes(32))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return self._read()
+
+
+class MemoryDeviceKeyStore(DeviceKeyStore):
+    """Secret kept in memory only (tests, ephemeral sessions)."""
+
+    def __init__(self, secret: Optional[bytes] = None):
+        if secret is not None and len(secret) != 32:
+            raise ValueError("device secret must be 32 bytes")
+        self._secret = secret
+
+    def exists(self) -> bool:
+        return self._secret is not None
+
+    def load_or_create(self) -> bytes:
+        if self._secret is None:
+            self._secret = secrets.token_bytes(32)
+        return self._secret
+
+
+# =============================================================================
 # Client Authentication
 # =============================================================================
 
 class MeteorAuth:
     """
-    Meteor-Auth Client: Device-Bound Quantum-Resistant Authentication
-    
-    Provides passwordless authentication using:
-    - User seed (Knowledge factor): 32-byte secret, stored as QR code
-    - Device fingerprint (Possession factor): Hardware-bound identifier
-    - Biometric verification (Inherence factor): Optional 3FA
-    
-    The combination creates a device-bound seed that generates
-    quantum-resistant keys for authentication.
-    
-    Security Levels:
-        - 2FA (default): Knowledge + Possession
-        - 3FA (with biometrics): Knowledge + Possession + Inherence
-    
-    3FA Security Model:
-        | Attacker has           | Can authenticate? |
-        |------------------------|-------------------|
-        | user_seed only         | ❌ Wrong device   |
-        | Device only            | ❌ No seed        |
-        | user_seed + device     | ❌ No biometric*  |
-        | user_seed + device + 指| ✅ (= legitimate) |
-        
-        * When require_biometric=True
-    
+    Meteor-Auth client: user seed + device secret -> device-bound identity.
+
+    Factors:
+    - Knowledge: the 32-byte user seed (e.g. kept as a QR code).
+    - Possession: a random 32-byte device secret in a DeviceKeyStore.
+      ``device-bound seed = SHA256(domain || user_seed || device_secret)``;
+      neither alone determines the identity.
+    - Biometrics (``require_biometric``): checked before the device secret is
+      read. In pure Python this is an application-level gate, not a
+      cryptographic factor: code running as the user can read the secret
+      directly. It becomes a real factor only when the DeviceKeyStore is a
+      hardware keystore that itself demands user verification (see
+      DeviceKeyStore).
+
     Example:
         >>> auth = MeteorAuth()
-        >>> user_seed = auth.generate_seed()  # Save as QR!
-        >>> meteor_id = auth.get_meteor_id(user_seed)  # Public identity
-        >>> node = auth.login(user_seed)  # Create P2P node
-        
-        # With biometric (3FA):
-        >>> auth = MeteorAuth(require_biometric=True, biometric_provider=my_provider)
-        >>> node = auth.login(user_seed)  # Triggers biometric verification
-        
-        # With callback (simple integration):
-        >>> auth = MeteorAuth(require_biometric=True)
-        >>> auth.set_biometric_callback(my_fingerprint_check)
-        >>> node = auth.login(user_seed)
+        >>> user_seed = auth.generate_seed()          # keep it safe
+        >>> node = auth.login(user_seed)              # MeteorNode bound to this device
+        >>> node.get_meteor_id() == auth.get_meteor_id(user_seed)
+        True
     """
-    
+
     def __init__(
         self,
-        gpu: bool = True,
+        gpu: bool = False,
         device_id: int = 0,
         require_biometric: bool = False,
         biometric_provider: Optional[BiometricProvider] = None,
+        device_store: Optional[DeviceKeyStore] = None,
     ):
-        """
-        Initialize Meteor-Auth client.
-        
-        Args:
-            gpu: Use GPU acceleration
-            device_id: GPU device ID
-            require_biometric: If True, login() requires biometric verification
-            biometric_provider: Custom biometric provider (platform-specific)
-        """
-        self.gpu = gpu and GPU_AVAILABLE
+        self.gpu = False
         self.device_id = device_id
         self.require_biometric = require_biometric
         self._biometric_provider = biometric_provider
-        
-        # Last biometric verification timestamp
+        self.device_store = device_store or FileDeviceKeyStore()
         self._last_biometric_time: Optional[float] = None
         self._biometric_valid_duration: float = 300.0  # 5 minutes
-    
+
+    # -- biometrics ----------------------------------------------------------
     @property
     def biometric_provider(self) -> BiometricProvider:
-        """Get current biometric provider."""
         return self._biometric_provider or DefaultBiometricProvider()
-    
+
     def set_biometric_provider(self, provider: BiometricProvider) -> None:
-        """
-        Set biometric provider.
-        
-        Args:
-            provider: BiometricProvider implementation
-        """
         self._biometric_provider = provider
-    
-    def set_biometric_callback(
-        self,
-        verify_callback: Callable[[], bool],
-        is_available_callback: Optional[Callable[[], bool]] = None,
-        biometric_type: str = "callback",
-    ) -> None:
-        """
-        Set biometric verification using simple callbacks.
-        
-        Convenience method for easy integration.
-        
-        Args:
-            verify_callback: Function returning True if verification succeeds
-            is_available_callback: Function returning True if biometric available
-            biometric_type: Type identifier (e.g., "fingerprint", "face_id")
-        
-        Example:
-            >>> def check_fingerprint():
-            ...     # Call platform API
-            ...     return native_fingerprint_verify()
-            >>> 
-            >>> auth.set_biometric_callback(check_fingerprint, biometric_type="fingerprint")
-        """
+
+    def set_biometric_callback(self, verify_callback: Callable[[], bool],
+                               is_available_callback: Optional[Callable[[], bool]] = None,
+                               biometric_type: str = "callback") -> None:
         self._biometric_provider = CallbackBiometricProvider(
             verify_callback=verify_callback,
             is_available_callback=is_available_callback,
             biometric_type=biometric_type,
         )
-    
+
     def _verify_biometric(self) -> BiometricStatus:
-        """
-        Internal biometric verification.
-        
-        Returns:
-            BiometricStatus: Result of verification
-        """
-        provider = self.biometric_provider
-        
-        # Check if recent verification is still valid
         if self._last_biometric_time is not None:
-            elapsed = time.time() - self._last_biometric_time
-            if elapsed < self._biometric_valid_duration:
+            if time.time() - self._last_biometric_time < self._biometric_valid_duration:
                 return BiometricStatus.SUCCESS
-        
-        # Perform verification
-        status = provider.verify()
-        
+        status = self.biometric_provider.verify()
         if status == BiometricStatus.SUCCESS:
             self._last_biometric_time = time.time()
-        
         return status
-    
+
     def is_biometric_available(self) -> bool:
-        """
-        Check if biometric authentication is available.
-        
-        Returns:
-            bool: True if biometrics can be used on this device
-        """
         return self.biometric_provider.is_available()
-    
+
     def get_biometric_type(self) -> str:
-        """
-        Get current biometric type.
-        
-        Returns:
-            str: Biometric type identifier
-        """
         return self.biometric_provider.get_type()
-    
+
     def invalidate_biometric(self) -> None:
-        """
-        Invalidate cached biometric verification.
-        
-        Forces re-verification on next login.
-        """
         self._last_biometric_time = None
-    
+
+    def _require_user_presence(self) -> None:
+        if not self.require_biometric:
+            return
+        provider = self.biometric_provider
+        if not provider.is_available():
+            raise BiometricRequiredError(
+                f"Biometric authentication required but not available. "
+                f"Provider: {provider.get_type()}")
+        status = self._verify_biometric()
+        if status != BiometricStatus.SUCCESS:
+            raise BiometricFailedError(status)
+
+    # -- device binding ------------------------------------------------------
+    def _device_secret(self) -> bytes:
+        self._require_user_presence()
+        return self.device_store.load_or_create()
+
     def get_device_fingerprint(self) -> bytes:
-        """
-        Generate device fingerprint (Possession factor).
-        
-        Components:
-        - MAC address (hardware identifier)
-        - Platform info (OS, machine, version)
-        - Processor info
-        
-        Returns:
-            bytes: 32-byte device fingerprint
-        """
-        # MAC address (hardware bound)
-        mac = uuid.getnode()
-        
-        # Platform info
-        system = platform.system()
-        machine = platform.machine()
-        version = platform.version()
-        processor = platform.processor()
-        
-        # Combine all components
-        device_info = f"{mac}|{system}|{machine}|{version}|{processor}"
-        
-        # Hash to 32 bytes (deterministic)
-        fingerprint = hashlib.sha256(device_info.encode('utf-8')).digest()
-        
-        return fingerprint
-    
+        """Public, stable identifier of this device (one-way from its secret).
+        Safe to display; not usable to derive keys."""
+        return _sha256(b"METEOR_AUTH_DEVICE_ID_v3", self._device_secret())
+
     def generate_seed(self) -> bytes:
-        """
-        Generate user seed (Knowledge factor).
-        
-        ⚠️ SAVE THIS SECURELY!
-        - Print as QR code
-        - Store in password manager
-        - Write on paper (secure location)
-        
-        Returns:
-            bytes: 32-byte cryptographically secure random seed
-        """
+        """New 32-byte user seed (knowledge factor). Store it safely."""
         return secrets.token_bytes(32)
-    
+
     def create_device_bound_seed(self, user_seed: bytes) -> bytes:
-        """
-        Create device-bound seed from user seed and device fingerprint.
-        
-        This combines:
-        - User seed (Knowledge: what you know)
-        - Device fingerprint (Possession: what you have)
-        
-        Args:
-            user_seed: 32-byte user seed
-            
-        Returns:
-            bytes: 32-byte device-bound seed
-        """
+        """SHA256(domain || user_seed || device_secret)."""
         if len(user_seed) != 32:
             raise ValueError("User seed must be 32 bytes")
-        
-        device_fp = self.get_device_fingerprint()
-        
-        # Domain separation for security
-        return _sha256(b"METEOR_AUTH_DEVICE_BOUND_v2", user_seed + device_fp)
-    
+        return _sha256(b"METEOR_AUTH_DEVICE_BOUND_v3", user_seed + self._device_secret())
+
     def get_meteor_id(self, user_seed: bytes) -> bytes:
-        """
-        Get MeteorID (public identifier) from user seed.
-        
-        The MeteorID is derived from the device-bound seed,
-        so the same user_seed produces different IDs on different devices.
-        
-        Args:
-            user_seed: 32-byte user seed
-            
-        Returns:
-            bytes: 32-byte MeteorID (safe to share publicly)
-        """
-        device_seed = self.create_device_bound_seed(user_seed)
-        return _sha256(b"meteor-id", device_seed)
-    
-    def login(
-        self,
-        user_seed: bytes,
-        node_name: Optional[str] = None,
-        skip_biometric: bool = False,
-    ) -> MeteorNode:
-        """
-        Login and create P2P node with device-bound keys.
-        
-        Args:
-            user_seed: 32-byte user seed
-            node_name: Optional node display name
-            skip_biometric: Skip biometric verification (for testing only!)
-            
-        Returns:
-            MeteorNode: P2P node with quantum-resistant keys
-            
+        """MeteorID that ``login(user_seed)`` produces on this device (public)."""
+        return MeteorIdentity(self.create_device_bound_seed(user_seed)).meteor_id
+
+    def login(self, user_seed: bytes, node_name: Optional[str] = None) -> MeteorNode:
+        """Create the device-bound MeteorNode (checks biometrics first when required).
+
         Raises:
-            BiometricRequiredError: If biometric required but not available
-            BiometricFailedError: If biometric verification fails
+            BiometricRequiredError: biometric required but not available
+            BiometricFailedError: biometric verification failed
         """
-        # Biometric verification (3FA)
-        if self.require_biometric and not skip_biometric:
-            provider = self.biometric_provider
-            
-            # Check availability
-            if not provider.is_available():
-                raise BiometricRequiredError(
-                    f"Biometric authentication required but not available. "
-                    f"Provider: {provider.get_type()}"
-                )
-            
-            # Verify
-            status = self._verify_biometric()
-            
-            if status != BiometricStatus.SUCCESS:
-                raise BiometricFailedError(status)
-        
-        # Create device-bound seed (2FA: Knowledge + Possession)
-        auth_seed = self.create_device_bound_seed(user_seed)
-        
-        # Create node with device-bound keys
-        node = MeteorNode(
-            name=node_name or "AuthClient",
-            seed=auth_seed,
-            gpu=self.gpu,
-            device_id=self.device_id,
-        )
-        
-        return node
-    
+        return MeteorNode(name=node_name or "AuthClient",
+                          seed=self.create_device_bound_seed(user_seed))
+
     def export_qr_data(self, user_seed: bytes) -> str:
-        """
-        Export seed as QR-compatible string.
-        
-        Args:
-            user_seed: 32-byte user seed
-            
-        Returns:
-            str: Hex-encoded seed for QR code
-        """
+        """Hex of the user seed for a QR code. Whoever sees it has the
+        knowledge factor; the device secret is still needed to log in."""
         return user_seed.hex()
-    
+
     def import_qr_data(self, qr_data: str) -> bytes:
-        """
-        Import seed from QR code.
-        
-        Args:
-            qr_data: Hex-encoded seed from QR scan
-            
-        Returns:
-            bytes: 32-byte user seed
-        """
         seed = bytes.fromhex(qr_data)
         if len(seed) != 32:
             raise ValueError("Invalid QR data: seed must be 32 bytes")
         return seed
+
+
+def answer_challenge(node: MeteorNode, server_name: str, challenge: bytes) -> MeteorMessage:
+    """Client side of MeteorAuthServer.authenticate: send the challenge back,
+    encrypted to and signed for the server (envelope binds sender and recipient)."""
+    return node.send(server_name, challenge)
 
 
 # =============================================================================
@@ -565,7 +478,7 @@ class MeteorAuth:
 class UserRecord:
     """User record stored by server."""
     meteor_id: bytes
-    public_key: Any  # LWEPublicKey
+    public_key: Any                       # public bundle
     token: str
     metadata: Dict[str, Any] = field(default_factory=dict)
     registered_at: float = field(default_factory=time.time)
@@ -574,265 +487,133 @@ class UserRecord:
 
 class MeteorAuthServer:
     """
-    Meteor-Auth Server: Zero-Trust Authentication Server
-    
-    Features:
-    - Zero password storage (only MeteorIDs + public keys)
-    - Challenge-response authentication
-    - Full P2P integration
-    - Quantum-resistant verification
-    
-    Example:
-        >>> server = MeteorAuthServer("AuthServer")
-        >>> token = server.register(meteor_id, public_key, {"username": "alice"})
-        >>> challenge = server.create_challenge(token)
-        >>> is_valid = server.authenticate(token, encrypted_response)
+    Challenge-response server. Stores only MeteorIDs and public bundles.
+
+    ``authenticate`` accepts a response only if
+    - the challenge for that token exists, has not expired and is used once
+      (it is consumed by any attempt),
+    - the response comes from the MeteorID registered for that token (an
+      envelope signed by that user and addressed to this server),
+    - its content equals the challenge (constant-time comparison).
     """
-    
-    def __init__(
-        self,
-        node_name: str = "AuthServer",
-        gpu: bool = True,
-        device_id: int = 0,
-    ):
-        """
-        Initialize authentication server.
-        
-        Args:
-            node_name: Server node name
-            gpu: Use GPU acceleration
-            device_id: GPU device ID
-        """
-        self.node = MeteorNode(
-            name=node_name,
-            gpu=gpu,
-            device_id=device_id,
-        )
-        self.gpu = gpu
+
+    def __init__(self, node_name: str = "AuthServer", gpu: bool = False, device_id: int = 0,
+                 challenge_ttl_s: float = 60.0, seed: Optional[bytes] = None):
+        self.node = MeteorNode(name=node_name, seed=seed)
+        self.gpu = False
         self.device_id = device_id
-        
-        # User database (token -> UserRecord)
+        self.challenge_ttl_s = float(challenge_ttl_s)
         self.users: Dict[str, UserRecord] = {}
-        
-        # Active challenges (token -> challenge bytes)
-        self.challenges: Dict[str, bytes] = {}
-    
+        self.challenges: Dict[str, Tuple[bytes, float]] = {}
+        self._lock = threading.Lock()
+
     def get_server_id(self) -> bytes:
-        """Get server's MeteorID."""
         return self.node.get_meteor_id()
-    
-    def get_server_public_key(self):
-        """Get server's public key for client registration."""
+
+    def get_server_public_key(self) -> bytes:
         return self.node.get_public_key()
-    
-    def register(
-        self,
-        meteor_id: bytes,
-        public_key: Any,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        """
-        Register user with MeteorID and public key.
-        
-        Args:
-            meteor_id: 32-byte MeteorID (public identifier)
-            public_key: User's LWEPublicKey
-            metadata: Optional user metadata (username, email, etc.)
-            
-        Returns:
-            str: User token (hex string)
-        """
+
+    def register(self, meteor_id: bytes, public_key: bytes,
+                 metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Register a user (MeteorID + public bundle). Returns the user token.
+        Raises ValueError if the bundle does not match the MeteorID."""
         if len(meteor_id) != 32:
             raise ValueError("MeteorID must be 32 bytes")
-        
-        # Generate unique token
-        token = hashlib.sha256(
-            meteor_id + secrets.token_bytes(16)
-        ).hexdigest()
-        
-        # Create user record
-        record = UserRecord(
-            meteor_id=meteor_id,
-            public_key=public_key,
-            token=token,
-            metadata=metadata or {},
-        )
-        self.users[token] = record
-        
-        # Add as peer for P2P communication
-        self.node.add_peer(token, meteor_id, public_key)
-        
-        print(f"[{self.node.name}] Registered user: {token[:16]}...")
-        print(f"  MeteorID: {meteor_id.hex()[:16]}...")
-        
+        token = secrets.token_hex(32)
+        self.node.add_peer(token, meteor_id, public_key)       # verifies the bundle
+        with self._lock:
+            self.users[token] = UserRecord(meteor_id=meteor_id, public_key=public_key,
+                                           token=token, metadata=metadata or {})
+        logger.info("[%s] registered user %s...", self.node.name, token[:16])
         return token
-    
+
     def create_challenge(self, token: str) -> bytes:
-        """
-        Create authentication challenge.
-        
-        Args:
-            token: User token
-            
-        Returns:
-            bytes: 32-byte random challenge (plaintext)
-        """
-        if token not in self.users:
-            raise ValueError(f"Unknown token: {token[:16]}...")
-        
-        # Generate random challenge
-        challenge = secrets.token_bytes(32)
-        
-        # Store for verification
-        self.challenges[token] = challenge
-        
-        print(f"[{self.node.name}] Challenge created for {token[:16]}...")
-        
+        """New single-use 32-byte challenge for ``token`` (replaces any pending one)."""
+        with self._lock:
+            if token not in self.users:
+                raise ValueError("Unknown token")
+            challenge = secrets.token_bytes(32)
+            self.challenges[token] = (challenge, time.time() + self.challenge_ttl_s)
         return challenge
-    
+
     def authenticate(self, token: str, encrypted_response: MeteorMessage) -> bool:
-        """
-        Authenticate user via challenge-response.
-        
-        Flow:
-        1. Server creates challenge (plaintext)
-        2. Client encrypts challenge with their private key
-        3. Server decrypts with peer's public key and verifies
-        
-        Args:
-            token: User token
-            encrypted_response: Client's encrypted challenge (MeteorMessage)
-            
-        Returns:
-            bool: True if authentication successful
-        """
-        if token not in self.users:
-            print(f"[Auth Failed] Unknown token")
+        with self._lock:
+            record = self.users.get(token)
+            pending = self.challenges.pop(token, None)          # single use
+        if record is None or pending is None:
+            logger.info("[auth] rejected: unknown token or no pending challenge")
             return False
-        
-        if token not in self.challenges:
-            print(f"[Auth Failed] No challenge for token")
+        challenge, expires = pending
+        if time.time() > expires:
+            logger.info("[auth] rejected: challenge expired")
             return False
-        
+        if encrypted_response.sender_id != record.meteor_id:
+            logger.info("[auth] rejected: response not from the token's owner")
+            return False
         try:
-            # Decrypt response using P2P
-            decrypted = self.node.receive(encrypted_response)
-            
-            # Verify it matches the challenge
-            expected = self.challenges[token]
-            
-            if decrypted == expected:
-                print(f"[{self.node.name}] ✅ Authentication SUCCESS for {token[:16]}...")
-                
-                # Update last auth time
-                self.users[token].last_auth = time.time()
-                
-                # Clean up challenge
-                del self.challenges[token]
-                return True
-            else:
-                print(f"[Auth Failed] Challenge mismatch")
-                return False
-                
-        except Exception as e:
-            print(f"[Auth Failed] Decryption error: {e}")
+            answer = self.node.receive(encrypted_response)
+        except ValueError as e:
+            logger.info("[auth] rejected: %s", e)
             return False
-    
+        if not hmac.compare_digest(answer, challenge):
+            logger.info("[auth] rejected: challenge mismatch")
+            return False
+        with self._lock:
+            if token in self.users:
+                self.users[token].last_auth = time.time()
+        return True
+
     def get_user(self, token: str) -> Optional[UserRecord]:
-        """Get user record by token."""
         return self.users.get(token)
-    
+
     def get_user_by_meteor_id(self, meteor_id: bytes) -> Optional[UserRecord]:
-        """Get user record by MeteorID."""
         for record in self.users.values():
             if record.meteor_id == meteor_id:
                 return record
         return None
-    
+
     def revoke(self, token: str) -> bool:
-        """
-        Revoke user token.
-        
-        Args:
-            token: User token to revoke
-            
-        Returns:
-            bool: True if revoked successfully
-        """
-        if token not in self.users:
-            return False
-        
-        # Remove user
-        del self.users[token]
-        
-        # Remove from peers
-        if token in self.node.peers:
-            del self.node.peers[token]
-        
-        # Remove any pending challenges
-        self.challenges.pop(token, None)
-        
-        print(f"[{self.node.name}] Revoked: {token[:16]}...")
+        """Revoke a token: its record, pending challenge and peer entry go away."""
+        with self._lock:
+            if self.users.pop(token, None) is None:
+                return False
+            self.challenges.pop(token, None)
+        self.node.remove_peer(token)
         return True
-    
+
     def list_users(self) -> List[Dict[str, Any]]:
-        """List all registered users."""
-        return [
-            {
-                'token': record.token[:16] + '...',
-                'meteor_id': record.meteor_id.hex()[:16] + '...',
-                'metadata': record.metadata,
-                'registered_at': record.registered_at,
-                'last_auth': record.last_auth,
-            }
-            for record in self.users.values()
-        ]
+        return [{
+            'token': record.token[:16] + '...',
+            'meteor_id': record.meteor_id.hex()[:16] + '...',
+            'metadata': record.metadata,
+            'registered_at': record.registered_at,
+            'last_auth': record.last_auth,
+        } for record in self.users.values()]
 
 
 # =============================================================================
 # Utility Functions
 # =============================================================================
 
-def verify_device_binding(user_seed: bytes, expected_meteor_id: bytes) -> bool:
-    """
-    Verify that user_seed produces expected MeteorID on this device.
-    
-    Args:
-        user_seed: 32-byte user seed
-        expected_meteor_id: Expected 32-byte MeteorID
-        
-    Returns:
-        bool: True if this device + seed produces the expected ID
-    """
-    auth = MeteorAuth()
-    actual_id = auth.get_meteor_id(user_seed)
-    return actual_id == expected_meteor_id
+def verify_device_binding(user_seed: bytes, expected_meteor_id: bytes,
+                          device_store: Optional[DeviceKeyStore] = None) -> bool:
+    """True if ``user_seed`` on this device (its device secret) gives ``expected_meteor_id``."""
+    return hmac.compare_digest(
+        MeteorAuth(device_store=device_store).get_meteor_id(user_seed), expected_meteor_id)
 
 
 def generate_recovery_codes(user_seed: bytes, count: int = 8) -> List[str]:
     """
-    Generate recovery codes for backup authentication.
-    
-    Args:
-        user_seed: 32-byte user seed
-        count: Number of recovery codes to generate
-        
-    Returns:
-        list: Recovery code strings
+    Readable codes derived from the user seed (e.g. to check a printed backup).
+
+    Note: they are a function of the seed, so they carry no more and no less
+    than the seed itself, and nothing in Meteor-NC verifies them. They are not
+    a second factor and cannot replace a lost device secret.
     """
     codes = []
     for i in range(count):
-        # Derive code from seed + index
-        code_bytes = _sha256(
-            b"METEOR_RECOVERY_v2",
-            user_seed + i.to_bytes(4, 'big'),
-        )[:8]
-        
-        # Format as readable code (e.g., "ABCD-EFGH-IJKL-MNOP")
-        code_hex = code_bytes.hex().upper()
-        code = f"{code_hex[:4]}-{code_hex[4:8]}-{code_hex[8:12]}-{code_hex[12:16]}"
-        codes.append(code)
-    
+        code_hex = _sha256(b"METEOR_RECOVERY_v2", user_seed + i.to_bytes(4, 'big'))[:8].hex().upper()
+        codes.append(f"{code_hex[:4]}-{code_hex[4:8]}-{code_hex[8:12]}-{code_hex[12:16]}")
     return codes
 
 
@@ -841,199 +622,20 @@ def generate_recovery_codes(user_seed: bytes, count: int = 8) -> List[str]:
 # =============================================================================
 
 def run_tests() -> bool:
-    """Execute MeteorAuth tests."""
-    print("=" * 70)
-    print("Meteor-Auth Test Suite (with Biometric Hooks)")
-    print("=" * 70)
-    
-    results = {}
-    
-    # Test 1: Seed generation
-    print("\n[Test 1] Seed Generation")
-    print("-" * 40)
-    
-    auth = MeteorAuth(gpu=GPU_AVAILABLE)
-    seed1 = auth.generate_seed()
-    seed2 = auth.generate_seed()
-    
-    seed_ok = len(seed1) == 32 and len(seed2) == 32 and seed1 != seed2
-    results["seed_generation"] = seed_ok
-    print(f"  Seed 1: {seed1.hex()[:32]}...")
-    print(f"  Seed 2: {seed2.hex()[:32]}...")
-    print(f"  Result: {'PASS' if seed_ok else 'FAIL'}")
-    
-    # Test 2: Device fingerprint
-    print("\n[Test 2] Device Fingerprint")
-    print("-" * 40)
-    
-    fp1 = auth.get_device_fingerprint()
-    fp2 = auth.get_device_fingerprint()
-    
-    fp_ok = len(fp1) == 32 and fp1 == fp2  # Same device = same fingerprint
-    results["device_fingerprint"] = fp_ok
-    print(f"  Fingerprint: {fp1.hex()[:32]}...")
-    print(f"  Deterministic: {fp1 == fp2}")
-    print(f"  Result: {'PASS' if fp_ok else 'FAIL'}")
-    
-    # Test 3: Device-bound seed
-    print("\n[Test 3] Device-Bound Seed")
-    print("-" * 40)
-    
-    user_seed = auth.generate_seed()
-    bound1 = auth.create_device_bound_seed(user_seed)
-    bound2 = auth.create_device_bound_seed(user_seed)
-    
-    bound_ok = len(bound1) == 32 and bound1 == bound2  # Same seed + device = same bound
-    results["device_bound_seed"] = bound_ok
-    print(f"  User seed: {user_seed.hex()[:32]}...")
-    print(f"  Bound seed: {bound1.hex()[:32]}...")
-    print(f"  Result: {'PASS' if bound_ok else 'FAIL'}")
-    
-    # Test 4: MeteorID derivation
-    print("\n[Test 4] MeteorID Derivation")
-    print("-" * 40)
-    
-    meteor_id1 = auth.get_meteor_id(user_seed)
-    meteor_id2 = auth.get_meteor_id(user_seed)
-    
-    id_ok = len(meteor_id1) == 32 and meteor_id1 == meteor_id2
-    results["meteor_id"] = id_ok
-    print(f"  MeteorID: {meteor_id1.hex()[:32]}...")
-    print(f"  Deterministic: {meteor_id1 == meteor_id2}")
-    print(f"  Result: {'PASS' if id_ok else 'FAIL'}")
-    
-    # Test 5: Login (2FA)
-    print("\n[Test 5] Login (2FA)")
-    print("-" * 40)
-    
-    node = auth.login(user_seed, "TestClient")
-    
-    login_ok = node is not None and node.get_meteor_id() is not None
-    results["login_2fa"] = login_ok
-    print(f"  Node name: {node.name}")
-    print(f"  Node ID: {node.get_meteor_id().hex()[:32]}...")
-    print(f"  Result: {'PASS' if login_ok else 'FAIL'}")
-    
-    # Test 6: Biometric callback (3FA)
-    print("\n[Test 6] Login with Biometric Callback (3FA)")
-    print("-" * 40)
-    
-    auth_3fa = MeteorAuth(gpu=GPU_AVAILABLE, require_biometric=True)
-    
-    # Set callback that always succeeds
-    auth_3fa.set_biometric_callback(
-        verify_callback=lambda: True,
-        is_available_callback=lambda: True,
-        biometric_type="test_fingerprint",
-    )
-    
-    node_3fa = auth_3fa.login(user_seed, "TestClient3FA")
-    
-    biometric_ok = node_3fa is not None
-    results["login_3fa_callback"] = biometric_ok
-    print(f"  Biometric type: {auth_3fa.get_biometric_type()}")
-    print(f"  Node ID: {node_3fa.get_meteor_id().hex()[:32]}...")
-    print(f"  Result: {'PASS' if biometric_ok else 'FAIL'}")
-    
-    # Test 7: Biometric provider (3FA)
-    print("\n[Test 7] Login with Biometric Provider (3FA)")
-    print("-" * 40)
-    
-    auth_provider = MeteorAuth(gpu=GPU_AVAILABLE, require_biometric=True)
-    auth_provider.set_biometric_provider(
-        MockBiometricProvider(BiometricStatus.SUCCESS, available=True, biometric_type="mock_face_id")
-    )
-    
-    node_provider = auth_provider.login(user_seed, "TestClientProvider")
-    
-    provider_ok = node_provider is not None
-    results["login_3fa_provider"] = provider_ok
-    print(f"  Biometric type: {auth_provider.get_biometric_type()}")
-    print(f"  Result: {'PASS' if provider_ok else 'FAIL'}")
-    
-    # Test 8: Biometric failure
-    print("\n[Test 8] Biometric Failure Handling")
-    print("-" * 40)
-    
-    auth_fail = MeteorAuth(gpu=GPU_AVAILABLE, require_biometric=True)
-    auth_fail.set_biometric_provider(
-        MockBiometricProvider(BiometricStatus.FAILED, available=True)
-    )
-    
-    fail_ok = False
-    try:
-        auth_fail.login(user_seed)
-    except BiometricFailedError as e:
-        fail_ok = e.status == BiometricStatus.FAILED
-        print(f"  Exception: {e}")
-    
-    results["biometric_fail"] = fail_ok
-    print(f"  Result: {'PASS' if fail_ok else 'FAIL'}")
-    
-    # Test 9: Biometric not available
-    print("\n[Test 9] Biometric Not Available")
-    print("-" * 40)
-    
-    auth_unavail = MeteorAuth(gpu=GPU_AVAILABLE, require_biometric=True)
-    auth_unavail.set_biometric_provider(
-        MockBiometricProvider(BiometricStatus.NOT_AVAILABLE, available=False)
-    )
-    
-    unavail_ok = False
-    try:
-        auth_unavail.login(user_seed)
-    except BiometricRequiredError as e:
-        unavail_ok = True
-        print(f"  Exception: {e}")
-    
-    results["biometric_unavail"] = unavail_ok
-    print(f"  Result: {'PASS' if unavail_ok else 'FAIL'}")
-    
-    # Test 10: QR export/import
-    print("\n[Test 10] QR Export/Import")
-    print("-" * 40)
-    
-    qr_data = auth.export_qr_data(user_seed)
-    imported = auth.import_qr_data(qr_data)
-    
-    qr_ok = imported == user_seed
-    results["qr_roundtrip"] = qr_ok
-    print(f"  QR data: {qr_data[:32]}...")
-    print(f"  Roundtrip: {qr_ok}")
-    print(f"  Result: {'PASS' if qr_ok else 'FAIL'}")
-    
-    # Test 11: Recovery codes
-    print("\n[Test 11] Recovery Codes")
-    print("-" * 40)
-    
-    codes = generate_recovery_codes(user_seed)
-    
-    codes_ok = len(codes) == 8 and all(len(c) == 19 for c in codes)  # "XXXX-XXXX-XXXX-XXXX"
-    results["recovery_codes"] = codes_ok
-    print(f"  Codes generated: {len(codes)}")
-    for i, code in enumerate(codes[:3]):
-        print(f"    {i+1}. {code}")
-    print(f"    ...")
-    print(f"  Result: {'PASS' if codes_ok else 'FAIL'}")
-    
-    # Summary
-    print("\n" + "=" * 70)
-    all_pass = all(results.values())
-    print(f"Result: {'ALL TESTS PASSED ✅' if all_pass else 'SOME TESTS FAILED ❌'}")
-    
-    if all_pass:
-        print("\n✓ 3FA Security Model verified:")
-        print("  - Knowledge: user_seed (QR code)")
-        print("  - Possession: device_fingerprint")
-        print("  - Inherence: biometric (hook ready)")
-        print("\n✓ Biometric integration points:")
-        print("  - BiometricProvider (subclass for iOS/Android)")
-        print("  - CallbackBiometricProvider (simple function)")
-        print("  - set_biometric_callback() (one-liner setup)")
-    
-    print("=" * 70)
-    
-    return all_pass
+    """Quick self-check (the full suite is tests/test_auth.py)."""
+    store = MemoryDeviceKeyStore()
+    auth = MeteorAuth(device_store=store)
+    seed = auth.generate_seed()
+    node = auth.login(seed, "Client")
+    ok = node.get_meteor_id() == auth.get_meteor_id(seed)
+    ok &= MeteorAuth(device_store=MemoryDeviceKeyStore()).get_meteor_id(seed) != node.get_meteor_id()
+    server = MeteorAuthServer("Server")
+    node.add_peer("Server", server.get_server_id(), server.get_server_public_key())
+    token = server.register(node.get_meteor_id(), node.get_public_key())
+    ch = server.create_challenge(token)
+    ok &= server.authenticate(token, answer_challenge(node, "Server", ch))
+    print("Meteor-Auth self-check:", "PASS" if ok else "FAIL")
+    return bool(ok)
 
 
 if __name__ == "__main__":

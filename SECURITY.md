@@ -133,3 +133,34 @@ test in `tests/test_protocols.py`.
   can drop or delay, not read, alter or inject.
 * The GPU stream DEM is opt-in (`METEOR_NC_GPU_DEM=1`) and must be used on
   both ends.
+
+# Authentication layer (v2 → v3)
+
+`meteor_nc/auth/core.py` had these problems; tests are in `tests/test_auth.py`.
+
+* **The possession factor held no secret.** The "device fingerprint" was a
+  hash of the MAC address and OS/CPU strings. Someone holding the user seed
+  and the public MeteorID could search the few unknown bits offline. It was
+  also unstable: where no MAC is readable, `uuid.getnode()` returns a new
+  random value per process, and OS updates change the strings, so users
+  could get locked out of their own identity.
+  v3: a random 32-byte device secret in a `DeviceKeyStore` (default: an
+  owner-only 0600 file, created atomically; pluggable for Secure Enclave,
+  Android Keystore or a TPM). Device-bound seed =
+  SHA256(domain ‖ user seed ‖ device secret).
+* **Biometrics gated no key material.** The check was an `if` in `login()`
+  (with a `skip_biometric` flag); the keys did not depend on it. v3 checks
+  biometrics before the device secret is read and removes the flag, and the
+  documentation states plainly that in pure Python this is an application
+  gate. It is a real factor only with a hardware keystore that itself
+  requires user verification.
+* **Account takeover in `MeteorAuthServer.authenticate`.** It did not check
+  that the response came from the user the token belongs to, so any
+  registered user could answer another user's challenge. Challenges never
+  expired and survived failed attempts. `revoke()` left the user's MeteorID
+  mapped, so revoked users' messages were still accepted. v3 checks the
+  sender, makes challenges single-use with a TTL, compares in constant
+  time, and removes revoked peers (`MeteorNode.remove_peer`).
+* `get_meteor_id()` returned an ID that did not match the node's v3
+  MeteorID; it now derives it the same way. Recovery codes are documented
+  as a function of the seed (not a factor, not verified anywhere).

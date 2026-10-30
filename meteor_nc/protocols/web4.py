@@ -770,12 +770,13 @@ class MeteorWeb4Node:
         biometric_provider: Optional[Any] = None,
         local_delivery: bool = True,
         replay_window_s: float = 300.0,
+        device_store: Optional[Any] = None,
     ):
         self.name = name
         self._use_auth = use_auth
         if use_auth and AUTH_AVAILABLE:
-            auth = MeteorAuth(gpu=False, require_biometric=require_biometric,
-                              biometric_provider=biometric_provider)
+            auth = MeteorAuth(require_biometric=require_biometric,
+                              biometric_provider=biometric_provider, device_store=device_store)
             if seed is None:
                 seed = auth.generate_seed()
             seed = auth.create_device_bound_seed(seed)
@@ -1187,9 +1188,11 @@ def run_tests() -> bool:
             print("\n[Test 6] Auth Mode (Device-Bound)")
             print("-" * 40)
             
+            from ..auth.core import MemoryDeviceKeyStore
             seed = secrets.token_bytes(32)
-            auth_node1 = await MeteorWeb4Node.create("AuthNode1", seed=seed, use_auth=True)
-            auth_node2 = await MeteorWeb4Node.create("AuthNode2", seed=seed, use_auth=True)
+            store = MemoryDeviceKeyStore()
+            auth_node1 = await MeteorWeb4Node.create("AuthNode1", seed=seed, use_auth=True, device_store=store)
+            auth_node2 = await MeteorWeb4Node.create("AuthNode2", seed=seed, use_auth=True, device_store=store)
             
             # Same seed + same device = same MeteorID
             auth_ok = auth_node1.meteor_id == auth_node2.meteor_id
