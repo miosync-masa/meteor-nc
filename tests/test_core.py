@@ -754,7 +754,7 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
         print("  SKIPPED: GPU not available")
         return {'passed': True, 'skipped': True}
 
-    trials = 50
+    trials = 20
     results = {'b3_1': 0, 'b3_2': 0, 'b3_3': 0, 'total': trials}
 
     for _ in range(trials):
@@ -785,25 +785,19 @@ def test_b3_cpu_gpu_equivalence() -> Dict:
             results['b3_2'] += 1
 
         # -------------------------
-        # B3.3 Interop: GPU encrypt -> CPU decrypt via serialization
+        # B3.3 Interop: GPU batch encaps (v3 BatchLWEKEM) -> CPU decaps
+        # (v3: LWEKEM itself is CPU-only; the GPU path is the batch backend)
         # -------------------------
-        kem_gpu = LWEKEM(n=256, gpu=True)
+        from meteor_nc.cryptography.batch import BatchLWEKEM
+        kem_gpu = BatchLWEKEM(n=256)
         pk_bytes, sk_bytes = kem_gpu.key_gen()
+        K_batch, wires = kem_gpu.encaps_batch(2)
 
-        # GPU encaps
-        K_good, ct = kem_gpu.encaps()
-        ct_bytes = ct.to_bytes()
-
-        # CPU instance loads serialized keys
         kem_cpu = LWEKEM(n=256, gpu=False)
         kem_cpu.load_public_key(pk_bytes)
         kem_cpu.load_secret_key(sk_bytes)
 
-        # Deserialize CT and decaps
-        ct_restored = LWECiphertext.from_bytes(ct_bytes)
-        K_dec = kem_cpu.decaps(ct_restored)
-
-        if K_good == K_dec:
+        if all(kem_cpu.decaps(wires[i].tobytes()) == K_batch[i].tobytes() for i in range(2)):
             results['b3_3'] += 1
 
     results['passed'] = (

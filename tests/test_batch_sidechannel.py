@@ -89,7 +89,13 @@ def test_rejection_outputs(setup):
 
 def test_scaling_is_roughly_linear(setup):
     kem, wires, _, _ = setup
-    sizes = [max(1, SIZE // 4), max(2, SIZE // 2), SIZE]
+    if BACKEND == "cupy":
+        # at a few dozen rows a GPU batch costs the same fixed launch time
+        # regardless of size; linear growth only shows at thousands of rows
+        _, wires = kem.encaps_batch(16384)
+        sizes = [4096, 8192, 16384]
+    else:
+        sizes = [max(1, SIZE // 4), max(2, SIZE // 2), SIZE]
     times = [np.median([_time(kem.decaps_batch, wires[:s]) for _ in range(5)]) for s in sizes]
     r = stats.linregress(sizes, times)
     assert r.slope > 0 and r.rvalue ** 2 > 0.8, (sizes, times)
