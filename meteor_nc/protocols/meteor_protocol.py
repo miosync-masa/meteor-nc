@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -83,6 +84,7 @@ class MeteorNode:
         self.peers: Dict[str, MeteorPeer] = {}
         self._by_id: Dict[bytes, str] = {}
         self._guard = ReplayGuard(replay_window_s)
+        self._lock = threading.Lock()          # stats / inbox under concurrent receive
         self.inbox: List[MeteorMessage] = []
         self.outbox: List[MeteorMessage] = []
         self.stats = {
@@ -150,14 +152,16 @@ class MeteorNode:
             plaintext = open_envelope(self.identity, message,
                                       self.peers[sender_name].public_key, self._guard)
         except EnvelopeError as e:
-            self.stats['messages_rejected'] += 1
+            with self._lock:
+                self.stats['messages_rejected'] += 1
             raise ValueError(f"message rejected: {e}") from None
         dt = time.time() - start
-        self.stats['messages_received'] += 1
-        self.stats['bytes_received'] += len(plaintext)
-        self.stats['decryption_time'] += dt
-        self.inbox.append(message)
-        self.peers[sender_name].last_seen = message.timestamp
+        with self._lock:
+            self.stats['messages_received'] += 1
+            self.stats['bytes_received'] += len(plaintext)
+            self.stats['decryption_time'] += dt
+            self.inbox.append(message)
+            self.peers[sender_name].last_seen = message.timestamp
         logger.info("[%s] <- [%s]: %d bytes (%.1f ms)", self.name, sender_name, len(plaintext), dt * 1e3)
         return plaintext
 

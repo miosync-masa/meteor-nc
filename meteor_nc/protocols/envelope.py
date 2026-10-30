@@ -8,7 +8,7 @@ Identity
 A node has one *secret* seed. It is never published. From it we derive
 
 * a KEM key pair (v3 LWEKEM / FrodoKEM) for confidentiality, and
-* an Ed25519 key pair for sender authentication,
+* an Ed25519 key pair and an ML-DSA-65 key pair for sender authentication,
 
 and publish a *bundle* holding both public keys. The node's MeteorID is
 
@@ -24,17 +24,18 @@ Every message carries a header (version, type, sender, recipient, time,
 random message id, hash of the KEM ciphertext, metadata). For encrypted
 messages the payload is ChaCha20-Poly1305 under a key derived from a fresh
 KEM shared secret, with the whole header as associated data. Every envelope
-is signed (Ed25519) over the header and the ciphertext, and opening one
+carries a hybrid signature (Ed25519 and ML-DSA-65, both must verify) over
+the header and the ciphertext, and opening one
 
 1. checks the sender's MeteorID against the sender bundle the caller holds,
 2. verifies the signature,
 3. rejects stale timestamps and replays (ReplayGuard),
 4. decrypts.
 
-Ed25519 is not post-quantum. For authentication that is acceptable today
-(a signature only has to resist forgery when it is verified; recorded
-traffic does not become forgeable later), and the bundle format carries an
-algorithm id so ML-DSA can be added without changing the envelope.
+Signatures are hybrid: Ed25519 (classical, long-studied) and ML-DSA-65
+(FIPS 204, post-quantum). A forgery needs to break both. ML-DSA comes from
+the ``cryptography`` package (>= 49, whose wheels ship OpenSSL 4.0); without it, identities
+cannot be created and no signature verifies (fail closed).
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ import hashlib
 import json
 import secrets
 import struct
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
@@ -53,6 +55,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+try:
+    from cryptography.hazmat.primitives.asymmetric.mldsa import (
+        MLDSA65PrivateKey,
+        MLDSA65PublicKey,
+    )
+    MLDSA_AVAILABLE = True
+except ImportError:                         # older cryptography / OpenSSL
+    MLDSA65PrivateKey = MLDSA65PublicKey = None
+    MLDSA_AVAILABLE = False
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from ..cryptography.core import LWEKEM
@@ -61,7 +72,9 @@ ID_DOMAIN = b"meteor-nc-v3-id"
 BUNDLE_MAGIC = b"MNCB"
 ENVELOPE_MAGIC = b"MNCE"
 VERSION = 1
-SIG_ED25519 = 1
+SIG_HYBRID = 2          # Ed25519 + ML-DSA-65; both must verify
+ED25519_PK, ED25519_SIG = 32, 64
+MLDSA65_PK, MLDSA65_SIG = 1952, 3309
 BROADCAST_ID = b"\x00" * 32
 DEFAULT_WINDOW_S = 300.0
 
@@ -86,29 +99,37 @@ def _lp(b: bytes) -> bytes:
 # Bundles and identities
 # ---------------------------------------------------------------------------
 
-def make_bundle(kem_public: bytes, sign_public: bytes) -> bytes:
+def make_bundle(kem_public: bytes, ed25519_public: bytes, mldsa_public: bytes) -> bytes:
     return (BUNDLE_MAGIC + bytes([VERSION]) + _lp(kem_public)
-            + bytes([SIG_ED25519]) + _lp(sign_public))
+            + bytes([SIG_HYBRID]) + _lp(ed25519_public) + _lp(mldsa_public))
 
 
-def parse_bundle(bundle: bytes) -> Tuple[bytes, bytes]:
-    """Return (kem_public, sign_public); raise EnvelopeError if malformed."""
+def parse_bundle(bundle: bytes) -> Tuple[bytes, Tuple[bytes, bytes]]:
+    """Return (kem_public, (ed25519_public, mldsa_public)); raise EnvelopeError if malformed."""
     try:
         if bundle[:4] != BUNDLE_MAGIC or bundle[4] != VERSION:
             raise EnvelopeError("not a v3 public bundle")
         o = 5
-        (n,) = struct.unpack(">I", bundle[o:o + 4]); o += 4
-        kem_pk = bundle[o:o + n]; o += n
-        if bundle[o] != SIG_ED25519:
+
+        def lp():
+            nonlocal o
+            (n,) = struct.unpack(">I", bundle[o:o + 4])
+            v = bundle[o + 4:o + 4 + n]
+            if len(v) != n:
+                raise EnvelopeError("truncated public bundle")
+            o += 4 + n
+            return v
+
+        kem_pk = lp()
+        if bundle[o] != SIG_HYBRID:
             raise EnvelopeError("unsupported signature algorithm")
         o += 1
-        (m,) = struct.unpack(">I", bundle[o:o + 4]); o += 4
-        sign_pk = bundle[o:o + m]; o += m
+        ed_pk, ml_pk = lp(), lp()
     except (IndexError, struct.error):
         raise EnvelopeError("truncated public bundle") from None
-    if o != len(bundle) or len(kem_pk) != n or len(sign_pk) != 32:
+    if o != len(bundle) or len(ed_pk) != ED25519_PK or len(ml_pk) != MLDSA65_PK:
         raise EnvelopeError("malformed public bundle")
-    return kem_pk, sign_pk
+    return kem_pk, (ed_pk, ml_pk)
 
 
 def meteor_id_of(bundle: bytes) -> bytes:
@@ -133,24 +154,40 @@ class MeteorIdentity:
         seed = bytes(seed)
         self._kem = LWEKEM(n=kem_n, seed=_h(b"meteor-nc-v3/kem-seed", seed))
         self.kem_public, _ = self._kem.key_gen()
-        self._sign = Ed25519PrivateKey.from_private_bytes(_h(b"meteor-nc-v3/ed25519", seed))
-        self.sign_public = self._sign.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-        self.bundle = make_bundle(self.kem_public, self.sign_public)
+        if not MLDSA_AVAILABLE:
+            raise ImportError("ML-DSA needs cryptography>=49 (wheels ship OpenSSL 4.0) or a "
+                              "build against OpenSSL 3.5+: pip install -U 'cryptography>=49'")
+        self._ed = Ed25519PrivateKey.from_private_bytes(_h(b"meteor-nc-v3/ed25519", seed))
+        self._ml = MLDSA65PrivateKey.from_seed_bytes(_h(b"meteor-nc-v3/ml-dsa-65", seed))
+        self.sign_public = self._ed.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        self.mldsa_public = self._ml.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        self.bundle = make_bundle(self.kem_public, self.sign_public, self.mldsa_public)
         self.meteor_id = meteor_id_of(self.bundle)
 
     def sign(self, data: bytes) -> bytes:
-        return self._sign.sign(data)
+        """Hybrid signature: Ed25519 (64 bytes) || ML-DSA-65 (3309 bytes)."""
+        return self._ed.sign(data) + self._ml.sign(data)
 
     def decaps(self, kem_wire: bytes) -> bytes:
         return self._kem.decaps(kem_wire)
 
 
-def verify_signature(sign_public: bytes, signature: bytes, data: bytes) -> bool:
-    try:
-        Ed25519PublicKey.from_public_bytes(sign_public).verify(signature, data)
-        return True
-    except (InvalidSignature, ValueError):
+def verify_signature(sign_keys: Tuple[bytes, bytes], signature: bytes, data: bytes) -> bool:
+    """Verify a hybrid signature against (ed25519_public, mldsa_public).
+    True only if BOTH components verify. Fails closed."""
+    ed_pk, ml_pk = sign_keys
+    if len(signature) != ED25519_SIG + MLDSA65_SIG or not MLDSA_AVAILABLE:
         return False
+    ok = True
+    try:
+        Ed25519PublicKey.from_public_bytes(ed_pk).verify(signature[:ED25519_SIG], data)
+    except (InvalidSignature, ValueError):
+        ok = False
+    try:
+        MLDSA65PublicKey.from_public_bytes(ml_pk).verify(signature[ED25519_SIG:], data)
+    except (InvalidSignature, ValueError):
+        ok = False
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -158,25 +195,59 @@ def verify_signature(sign_public: bytes, signature: bytes, data: bytes) -> bool:
 # ---------------------------------------------------------------------------
 
 class ReplayGuard:
-    """Rejects envelopes outside a time window and (sender, id) repeats."""
+    """Rejects envelopes outside a time window and (sender, id) repeats.
+
+    Thread-safe: ``reserve`` atomically checks and claims an id, so two
+    concurrent deliveries of the same envelope cannot both be accepted.
+    The claim is made permanent with ``confirm`` or dropped with ``release``
+    (if the envelope then fails to decrypt).
+    """
 
     def __init__(self, window_s: float = DEFAULT_WINDOW_S):
         self.window_s = float(window_s)
         self._seen: Dict[Tuple[bytes, bytes], float] = {}
+        self._pending: set = set()
+        self._lock = threading.Lock()
+
+    def _check_time(self, timestamp_ms: int, now: float) -> None:
+        if abs(now - timestamp_ms / 1000.0) > self.window_s:
+            raise EnvelopeError("timestamp outside the accepted window")
 
     def check(self, sender_id: bytes, message_id: bytes, timestamp_ms: int,
               now: Optional[float] = None) -> None:
+        """Non-claiming check (kept for callers that only want to inspect)."""
         now = time.time() if now is None else now
-        if abs(now - timestamp_ms / 1000.0) > self.window_s:
-            raise EnvelopeError("timestamp outside the accepted window")
-        if (sender_id, message_id) in self._seen:
-            raise EnvelopeError("replayed message")
+        self._check_time(timestamp_ms, now)
+        with self._lock:
+            key = (sender_id, message_id)
+            if key in self._seen or key in self._pending:
+                raise EnvelopeError("replayed message")
+
+    def reserve(self, sender_id: bytes, message_id: bytes, timestamp_ms: int,
+                now: Optional[float] = None) -> Tuple[bytes, bytes]:
+        now = time.time() if now is None else now
+        self._check_time(timestamp_ms, now)
+        key = (sender_id, message_id)
+        with self._lock:
+            if key in self._seen or key in self._pending:
+                raise EnvelopeError("replayed message")
+            self._pending.add(key)
+        return key
+
+    def confirm(self, key: Tuple[bytes, bytes], now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        with self._lock:
+            self._pending.discard(key)
+            self._seen[key] = now + 2 * self.window_s
+            if len(self._seen) > 4096:
+                self._seen = {k: v for k, v in self._seen.items() if v > now}
+
+    def release(self, key: Tuple[bytes, bytes]) -> None:
+        with self._lock:
+            self._pending.discard(key)
 
     def record(self, sender_id: bytes, message_id: bytes, now: Optional[float] = None) -> None:
-        now = time.time() if now is None else now
-        self._seen[(sender_id, message_id)] = now + 2 * self.window_s
-        if len(self._seen) > 4096:
-            self._seen = {k: v for k, v in self._seen.items() if v > now}
+        self.confirm((sender_id, message_id), now)
 
 
 # ---------------------------------------------------------------------------
@@ -287,32 +358,36 @@ def open_envelope(identity: MeteorIdentity, env: Envelope, sender_bundle: bytes,
                   guard: Optional[ReplayGuard] = None, now: Optional[float] = None) -> bytes:
     """Authenticate (and decrypt) an envelope from the holder of ``sender_bundle``."""
     check_peer(env.sender_id, sender_bundle)
-    _, sign_pk = parse_bundle(sender_bundle)
-    if not verify_signature(sign_pk, env.signature, env.signed_data()):
+    _, sign_keys = parse_bundle(sender_bundle)
+    if not verify_signature(sign_keys, env.signature, env.signed_data()):
         raise EnvelopeError("bad signature")
     if env.encrypted:
         if env.recipient_id != identity.meteor_id:
             raise EnvelopeError("not addressed to this node")
     elif env.recipient_id not in (identity.meteor_id, BROADCAST_ID):
         raise EnvelopeError("not addressed to this node")
-    if guard is not None:
-        guard.check(env.sender_id, env.message_id, env.timestamp_ms, now)
-    if env.encrypted:
-        if len(env.tag) != 16:
-            raise EnvelopeError("bad tag length")
-        K = identity.decaps(env.kem_wire)
-        try:
-            payload = ChaCha20Poly1305(_message_key(K)).decrypt(
-                env.message_id[:12], env.payload + env.tag, env.header())
-        except InvalidTag:
-            raise EnvelopeError("decryption failed") from None
-    else:
-        payload = env.payload
-    if guard is not None:
-        guard.record(env.sender_id, env.message_id, now)
+    key = guard.reserve(env.sender_id, env.message_id, env.timestamp_ms, now) if guard else None
+    try:
+        if env.encrypted:
+            if len(env.tag) != 16:
+                raise EnvelopeError("bad tag length")
+            K = identity.decaps(env.kem_wire)
+            try:
+                payload = ChaCha20Poly1305(_message_key(K)).decrypt(
+                    env.message_id[:12], env.payload + env.tag, env.header())
+            except InvalidTag:
+                raise EnvelopeError("decryption failed") from None
+        else:
+            payload = env.payload
+    except BaseException:
+        if key is not None:
+            guard.release(key)
+        raise
+    if key is not None:
+        guard.confirm(key, now)
     return payload
 
 
 __all__ = ["MeteorIdentity", "Envelope", "EnvelopeError", "ReplayGuard", "seal",
            "open_envelope", "make_bundle", "parse_bundle", "meteor_id_of", "check_peer",
-           "verify_signature", "BROADCAST_ID"]
+           "verify_signature", "BROADCAST_ID", "MLDSA_AVAILABLE"]

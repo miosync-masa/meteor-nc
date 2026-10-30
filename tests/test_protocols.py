@@ -61,10 +61,28 @@ def test_web4_identity_cannot_be_rebuilt_from_meteor_id():
 def test_web4_verify_fails_closed():
     ident = Web4Identity()
     sig = ident.sign(b"m")
-    assert ident.verify(b"m", sig, ident.ed25519_public)
-    assert not ident.verify(b"x", sig, ident.ed25519_public)
-    assert not ident.verify(b"m", sig, Web4Identity().ed25519_public)
-    assert not ident.verify(b"m", b"\x00" * 64, ident.ed25519_public)
+    assert ident.verify(b"m", sig, ident.bundle)
+    assert not ident.verify(b"x", sig, ident.bundle)
+    assert not ident.verify(b"m", sig, Web4Identity().bundle)
+    assert not ident.verify(b"m", b"\x00" * len(sig), ident.bundle)
+    assert not ident.verify(b"m", sig, b"not a bundle")
+
+
+def test_hybrid_signature_needs_both_halves():
+    """Breaking either algorithm alone must not be enough to forge."""
+    from meteor_nc.protocols.envelope import ED25519_SIG, verify_signature
+    alice, mallory = MeteorIdentity(), MeteorIdentity()
+    _, keys = parse_bundle(alice.bundle)
+    data = b"transfer 100"
+    good = alice.sign(data)
+    assert verify_signature(keys, good, data)
+    m = mallory.sign(data)
+    # "classical break": valid Ed25519 half, forged ML-DSA half
+    assert not verify_signature(keys, good[:ED25519_SIG] + m[ED25519_SIG:], data)
+    # "quantum break": forged Ed25519 half, valid ML-DSA half
+    assert not verify_signature(keys, m[:ED25519_SIG] + good[ED25519_SIG:], data)
+    assert not verify_signature(keys, good[:ED25519_SIG], data)
+    assert not verify_signature(keys, good + b"\x00", data)
 
 
 def test_add_peer_rejects_mismatched_bundle():
@@ -316,3 +334,66 @@ def test_forged_chunk_does_not_block_genuine_chunk():
     assert dec.decrypt_chunk(good) == b"genuine"
     with pytest.raises(ValueError):
         dec.decrypt_chunk(good)                                  # real replay still caught
+
+
+# --------------------------------------------------------------------------
+# concurrency
+# --------------------------------------------------------------------------
+
+def _race(fn, n):
+    import threading
+    barrier = threading.Barrier(n)
+    results = [None] * n
+
+    def worker(i):
+        barrier.wait()
+        try:
+            results[i] = ("ok", fn())
+        except Exception as e:  # noqa: BLE001
+            results[i] = ("err", str(e))
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def test_concurrent_duplicate_delivery_is_accepted_once():
+    a, b = pair()
+    for _ in range(3):
+        env = a.send("Bob", b"exactly once")
+        res = _race(lambda: b.receive(env), 16)
+        assert sum(r[0] == "ok" for r in res) == 1
+        assert all("replay" in r[1] for r in res if r[0] == "err")
+
+
+def test_concurrent_distinct_messages_all_accepted():
+    a, b = pair()
+    envs = [a.send("Bob", f"m{i}".encode()) for i in range(16)]
+    it = iter(envs)
+    import threading
+    lock = threading.Lock()
+
+    def take():
+        with lock:
+            e = next(it)
+        return b.receive(e)
+    res = _race(take, 16)
+    assert sorted(r[1] for r in res) == sorted(f"m{i}".encode() for i in range(16))
+    assert b.stats['messages_received'] == 16
+
+
+def test_failed_decryption_releases_the_reservation():
+    """A tampered copy that fails after the signature check must not burn the
+    message id (the genuine copy is still accepted)."""
+    from meteor_nc.protocols.envelope import ReplayGuard
+    g = ReplayGuard()
+    k = g.reserve(b"s", b"i", int(time.time() * 1000))
+    with pytest.raises(EnvelopeError):
+        g.reserve(b"s", b"i", int(time.time() * 1000))
+    g.release(k)
+    k = g.reserve(b"s", b"i", int(time.time() * 1000))
+    g.confirm(k)
+    with pytest.raises(EnvelopeError):
+        g.reserve(b"s", b"i", int(time.time() * 1000))

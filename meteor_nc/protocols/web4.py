@@ -71,7 +71,7 @@ Security Model:
     │──────────────────│────────────────────────│────────────────│
     │  Key Exchange    │ FrodoKEM-640 (v3 KEM)  │ Post-Quantum   │
     │  Symmetric       │ ChaCha20-Poly1305      │ 256-bit key    │
-    │  Authentication  │ Ed25519 (every message)│ 128-bit        │
+    │  Authentication  │ Ed25519 + ML-DSA-65    │ hybrid, PQ     │
     │  Identity        │ SHA-256(public bundle) │ self-certifying│
     │  Device Binding  │ HMAC(seed, fingerprint)│ 256-bit        │
     └────────────────────────────────────────────────────────────┘
@@ -247,9 +247,11 @@ from .envelope import (
     ReplayGuard,
     check_peer,
     open_envelope,
+    parse_bundle,
     seal,
     verify_signature,
 )
+from .transport import TCPTransport, make_address_record, parse_address_record
 
 # StreamHybridKEM (optional)
 STREAM_AVAILABLE = False
@@ -344,13 +346,17 @@ class Web4Identity:
         return None
 
     def sign(self, message: bytes) -> bytes:
-        """Ed25519 signature (via the ``cryptography`` package; no fallback)."""
+        """Hybrid Ed25519 + ML-DSA-65 signature (``cryptography``; no fallback)."""
         return self._core.sign(message)
 
     @staticmethod
-    def verify(message: bytes, signature: bytes, public_key: bytes) -> bool:
-        """Verify an Ed25519 signature. Fails closed."""
-        return verify_signature(public_key, signature, message)
+    def verify(message: bytes, signature: bytes, public_bundle: bytes) -> bool:
+        """Verify a hybrid signature against a public bundle. Fails closed."""
+        try:
+            _, keys = parse_bundle(public_bundle)
+        except EnvelopeError:
+            return False
+        return verify_signature(keys, signature, message)
 
     def to_dict(self) -> Dict:
         """Export the public identity."""
@@ -747,9 +753,10 @@ class MeteorWeb4Node:
       hash to the MeteorID is rejected. Messages from unknown senders are
       dropped because their signatures cannot be checked.
 
-    In-process delivery: nodes created in the same Python process can reach
-    each other directly (``local_delivery=True``, the default), which is
-    what the tests use; real networking needs libp2p.
+    Transports: ``start_tcp()`` listens on plain TCP; peers added from a
+    signed address record (``add_peer_from_record``) are reached there.
+    Nodes in the same Python process can also reach each other directly
+    (``local_delivery=True``, the default). libp2p is optional.
     """
 
     _local_nodes: Dict[bytes, 'MeteorWeb4Node'] = {}
@@ -794,6 +801,7 @@ class MeteorWeb4Node:
             'pubsub_published': 0, 'pubsub_received': 0,
             'ipfs_uploads': 0, 'ipfs_downloads': 0,
         }
+        self.tcp: Optional[TCPTransport] = None
         self._local_delivery = local_delivery
         if local_delivery:
             MeteorWeb4Node._local_nodes[self.meteor_id] = self
@@ -828,8 +836,36 @@ class MeteorWeb4Node:
 
     async def stop(self):
         await self.p2p.stop()
+        if self.tcp is not None:
+            await self.tcp.stop()
+            self.tcp = None
         if MeteorWeb4Node._local_nodes.get(self.meteor_id) is self:
             del MeteorWeb4Node._local_nodes[self.meteor_id]
+
+    # -- TCP transport -----------------------------------------------------
+    async def start_tcp(self, host: str = "127.0.0.1", port: int = 0) -> str:
+        """Listen for envelopes over plain TCP. Returns the address
+        (``tcp://host:port``). Security comes from the envelopes."""
+        if self.tcp is None:
+            self.tcp = TCPTransport(self._handle_incoming)
+            await self.tcp.start(host, port)
+        return self.tcp.addrs[0]
+
+    def get_address_record(self, addrs: Optional[List[str]] = None) -> bytes:
+        """Signed record (MeteorID, bundle, addresses) to hand to peers or the DHT."""
+        if addrs is None:
+            addrs = list(self.tcp.addrs) if self.tcp else []
+        return make_address_record(self.identity._core, addrs)
+
+    def add_peer_from_record(self, name: str, record: bytes,
+                             max_age_s: Optional[float] = None) -> bytes:
+        """Verify a signed address record and add the peer. Returns its MeteorID."""
+        try:
+            meteor_id, bundle, addrs, _ = parse_address_record(record, max_age_s)
+        except EnvelopeError as e:
+            raise ValueError(f"bad address record for {name!r}: {e}") from None
+        self.add_peer(name, meteor_id, bundle, addrs=addrs)
+        return meteor_id
 
     # -- peers -------------------------------------------------------------
     def add_peer(self, name: str, meteor_id: bytes, public_key: bytes,
@@ -866,11 +902,15 @@ class MeteorWeb4Node:
             node = MeteorWeb4Node._local_nodes.get(peer['meteor_id'])
             if node is not None:
                 return await node._handle_incoming(data)
+        for addr in peer.get('addrs', []):
+            if addr.startswith("tcp://"):
+                if await TCPTransport.send(addr, data):
+                    return True
         peer_ref = peer.get('libp2p_id')
-        if peer_ref is None:
-            logger.warning(f"[{self.name}] no route to {peer['meteor_id'].hex()[:16]}...")
-            return False
-        return await self.p2p.send(peer_ref, data)
+        if peer_ref is not None:
+            return await self.p2p.send(peer_ref, data)
+        logger.warning(f"[{self.name}] no route to {peer['meteor_id'].hex()[:16]}...")
+        return False
 
     def _open(self, env: Envelope) -> Tuple[str, bytes]:
         name = self._by_id.get(env.sender_id)
@@ -1126,7 +1166,7 @@ def run_tests() -> bool:
         
         message = b"Test message for signing"
         sig = alice.identity.sign(message)
-        verify_ok = alice.identity.verify(message, sig, alice.identity.ed25519_public)
+        verify_ok = alice.identity.verify(message, sig, alice.identity.bundle)
         
         results["signature"] = verify_ok
         print(f"  Signature: {sig.hex()[:32]}...")

@@ -38,6 +38,8 @@ classifiers = [
 dependencies = [
     "numpy>=1.20.0",
     "scipy>=1.7.0",
+    # ML-DSA + Ed25519 + ChaCha20-Poly1305; 49.0 wheels ship OpenSSL 4.0 (ML-DSA via OpenSSL 3.5+)
+    "cryptography>=49.0",
 ]
 
 [project.optional-dependencies]
@@ -51,7 +53,7 @@ gpu-cuda11 = [
 ]
 # Stream encryption (XChaCha20-Poly1305)
 stream = [
-    "cryptography>=3.4.0",
+    "cryptography>=49.0",
 ]
 # Web 4.0 protocol (P2P, DHT, PubSub)
 web4 = [
@@ -63,7 +65,7 @@ web4 = [
 # Full installation
 full = [
     "cupy-cuda12x>=12.0.0",
-    "cryptography>=3.4.0",
+    "cryptography>=49.0",
     "pynacl>=1.5.0",
 ]
 # Development dependencies

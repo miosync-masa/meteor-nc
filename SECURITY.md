@@ -115,9 +115,21 @@ test in `tests/test_protocols.py`.
 * Receivers accept only known senders, verify the signature before
   decrypting, and reject timestamps outside a window and repeated
   (sender, id) pairs.
-* Ed25519 (via `cryptography`, no fallback) is not post-quantum. A signature
-  only has to resist forgery when it is verified, so this does not create a
-  harvest-now-decrypt-later risk; the bundle has an algorithm id so ML-DSA
-  can be added later.
+* Signatures are hybrid: Ed25519 and ML-DSA-65 (FIPS 204), both from
+  `cryptography` (>= 49, whose wheels ship OpenSSL 4.0), no fallback; a signature is accepted
+  only if both halves verify, so a forgery needs a break of both. Tests
+  check that a valid Ed25519 half with a forged ML-DSA half (and vice
+  versa) is rejected.
+* Replay protection is race-free: `ReplayGuard.reserve` atomically checks
+  and claims a (sender, id) under a lock and releases it if decryption then
+  fails. The earlier check-then-record order let 16 concurrent deliveries
+  of one envelope all be accepted (measured: 16/16, five runs out of five);
+  now exactly one is.
+* Transport (`protocols/transport.py`): one envelope per TCP connection
+  ("MNCT" | length | bytes, 64 MiB limit, timeouts, 1-byte ack). Peers are
+  reached through signed address records (MeteorID, bundle, addresses,
+  time, hybrid signature), so an address cannot be attached to someone
+  else's MeteorID. The transport itself adds no crypto: an on-path attacker
+  can drop or delay, not read, alter or inject.
 * The GPU stream DEM is opt-in (`METEOR_NC_GPU_DEM=1`) and must be used on
   both ends.
