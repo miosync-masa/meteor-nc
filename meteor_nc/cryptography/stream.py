@@ -49,8 +49,8 @@ if GPU_AVAILABLE:
     try:
         from .kernels.chacha_poly_kernel import GPUChaCha20Poly1305
         _GPU_CHACHA_OK = True
-    except ImportError:
-        pass
+    except Exception:  # missing or broken CuPy / CUDA: use the CPU DEM
+        GPUChaCha20Poly1305 = None
 
 # CPU DEM fallback
 ChaCha20Poly1305 = None

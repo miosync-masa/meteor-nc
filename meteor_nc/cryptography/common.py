@@ -459,7 +459,7 @@ class FullCiphertext:
 try:
     import cupy as cp
     GPU_AVAILABLE = True
-except ImportError:
+except Exception:  # ImportError, or a CuPy install without a usable device
     cp = None
     GPU_AVAILABLE = False
 

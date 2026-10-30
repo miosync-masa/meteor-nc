@@ -122,6 +122,48 @@ def bench(sizes, reps):
             print(f"{P.name:20s} {bs:6d}   {bs/te:12,.0f}   {bs/td:12,.0f}   {bs/tk:12,.0f}")
 
 
+def profile(bs):
+    """Per-stage time of one encaps_batch / decaps_batch (device-synchronised)."""
+    import collections
+    import functools
+    from meteor_nc.cryptography import batch as batch_mod
+    stages = ["_hash_rows", "_sample", "_mm", "_pack", "_unpack", "_encode",
+              "_decode", "_to_host", "_A"]
+    for n, P in zip((256, 512, 1024), LEVELS):
+        kem = BatchLWEKEM(n=n, backend="cupy")
+        kem.key_gen()
+        kem.encaps_batch(64)
+        bk = kem._batch
+        acc = collections.Counter()
+        orig = {}
+        for name in stages:
+            f = getattr(bk, name)
+            orig[name] = f
+
+            def wrapped(*a, _f=f, _n=name, **k):
+                sync(); t = time.perf_counter()
+                r = _f(*a, **k)
+                sync(); acc[_n] += time.perf_counter() - t
+                return r
+            setattr(bk, name, functools.wraps(f)(wrapped))
+        kdf = batch_mod.BatchLWEKEM._kdf_rows
+        for op in ("encaps", "decaps"):
+            acc.clear()
+            sync(); t = time.perf_counter()
+            if op == "encaps":
+                _, w = kem.encaps_batch(bs, raw=True)
+            else:
+                kem.decaps_batch(w, raw=True)
+            sync(); total = time.perf_counter() - t
+            t = time.perf_counter(); kdf(np.zeros((bs, P.ss_bytes), np.uint8)); hk = time.perf_counter() - t
+            other = total - sum(acc.values())
+            parts = ", ".join(f"{k[1:]} {v / total:5.1%}" for k, v in acc.most_common())
+            print(f"{P.name} {op} batch {bs}: {total * 1e3:7.1f} ms | {parts}, "
+                  f"other(host glue) {other / total:5.1%} | +HKDF would add {hk * 1e3:.1f} ms")
+        for name, f in orig.items():
+            setattr(bk, name, f)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--kat", help="FrodoKEM KAT directory (PQCrypto-LWEKE/FrodoKEM/KAT)")
@@ -129,6 +171,8 @@ if __name__ == "__main__":
     ap.add_argument("--sizes", default="1000,10000,50000")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--skip-checks", action="store_true")
+    ap.add_argument("--profile", type=int, metavar="BATCH",
+                    help="print a per-stage time breakdown at this batch size")
     a = ap.parse_args()
     if os.environ.get("CUPY_TF32") == "1":
         sys.exit("unset CUPY_TF32: TF32 breaks exact float32 products")
@@ -141,4 +185,7 @@ if __name__ == "__main__":
         else:
             print("[skip] KATs (pass --kat DIR)")
         check_random()
-    bench([int(x) for x in a.sizes.split(",")], a.reps)
+    if a.profile:
+        profile(a.profile)
+    else:
+        bench([int(x) for x in a.sizes.split(",")], a.reps)
