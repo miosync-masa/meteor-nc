@@ -23,7 +23,7 @@ try:
         pack_bits_gpu,
     )
     V1_KERNELS_AVAILABLE = True
-except ImportError:
+except Exception:  # missing or broken CuPy must not break the package import
     V1_KERNELS_AVAILABLE = False
 
 # =============================================================================
@@ -35,13 +35,13 @@ try:
         pack_bits_v2,
     )
     BATCH_V2_AVAILABLE = True
-except ImportError:
+except Exception:  # missing or broken CuPy must not break the package import
     BATCH_V2_AVAILABLE = False
 
 try:
     from .blake3_kernel_v2 import GPUBlake3V2
     BLAKE3_V2_AVAILABLE = True
-except ImportError:
+except Exception:  # missing or broken CuPy must not break the package import
     BLAKE3_V2_AVAILABLE = False
 
 # =============================================================================
@@ -50,7 +50,7 @@ except ImportError:
 try:
     from .chacha_poly_kernel import GPUChaCha20Poly1305
     CHACHA_GPU_AVAILABLE = True
-except ImportError:
+except Exception:  # missing or broken CuPy must not break the package import
     CHACHA_GPU_AVAILABLE = False
 
 
