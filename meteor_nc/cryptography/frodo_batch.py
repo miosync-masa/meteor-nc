@@ -2,9 +2,8 @@
 Batched FrodoKEM (SHAKE) for NumPy or CuPy.
 
 Same algorithm and byte output as ``frodo.FrodoKEM`` (and therefore the
-FrodoKEM reference / NIST KATs), but every step after hashing works on a
-whole batch of encapsulations or decapsulations at once, on CPU (NumPy) or
-GPU (CuPy). The array module is chosen at construction time.
+FrodoKEM reference / NIST KATs), but every step works on a whole batch of
+encapsulations or decapsulations at once, on CPU (NumPy) or GPU (CuPy).
 
 Exact integer matrix products on float GEMM
 -------------------------------------------
@@ -21,13 +20,25 @@ is multiplied in float32:
 Every partial sum is an integer below 2^24 in absolute value, so float32
 represents it exactly regardless of summation order, and
 small @ big = (small @ lo) + 256 * (small @ hi) exactly. With CuPy this runs
-on cuBLAS SGEMM. TF32 must stay disabled (CuPy's default; do not set
-CUPY_TF32=1), because TF32 rounds the inputs.
+on cuBLAS SGEMM. TF32 is refused, and a self-test at construction refuses to
+run if the GEMM is not exact on the device.
 
-What stays on the CPU
----------------------
-SHAKE (seed expansion, hashing of ct) runs per item with hashlib. It is the
-remaining bottleneck and the natural target for a GPU Keccak kernel later.
+Hashing
+-------
+With CuPy, every per-item SHAKE (seedSE||k derivation, noise expansion,
+shared-secret hash) runs in a CUDA kernel, one thread per item
+(kernels/shake_kernel.py; its C source is tested against hashlib on CPU).
+With NumPy, hashlib is used. Only key generation and Gen(A) (once per public
+key) run on the host.
+
+Throughput notes
+----------------
+* Rows are processed in chunks; on the GPU the chunk size is derived from free
+  device memory, because the SHAKE kernel needs many rows (threads) in flight.
+* Results can stay on the device (``to_host=False``); host copies go through
+  pinned memory.
+* Noise sampling is one fused elementwise kernel on the GPU; intermediates
+  are int32 / int16 rather than int64.
 
 Side channels: research implementation; no constant-time guarantees.
 """
@@ -35,7 +46,9 @@ Side channels: research implementation; no constant-time guarantees.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Optional, Tuple
+import os
+import secrets
+from typing import Any, Optional
 
 import numpy as np
 
@@ -45,7 +58,7 @@ try:  # pragma: no cover - depends on the machine
     import cupy as _cp
     _cp.cuda.runtime.getDeviceCount()
     CUPY_AVAILABLE = True
-except Exception:  # ImportError, CUDARuntimeError, ...
+except Exception:  # ImportError, CUDARuntimeError, broken install, ...
     _cp = None
     CUPY_AVAILABLE = False
 
@@ -61,66 +74,65 @@ def get_xp(backend: str = "auto"):
     return _cp if CUPY_AVAILABLE else np
 
 
+# rough device bytes per row in flight, per unit of n (measured from the
+# intermediates below with margin); used to size GPU chunks
+_BYTES_PER_ROW_PER_N = 600
+
+
 class BatchFrodoKEM:
     """Batched FrodoKEM-SHAKE; byte-identical to ``frodo.FrodoKEM``."""
 
     def __init__(self, params: FrodoParams = FRODO640, backend: str = "auto",
-                 matmul: str = "f32split", chunk: int = 2048):
+                 matmul: str = "f32split", chunk: Optional[int] = None):
         if matmul not in ("f32split", "int64"):
             raise ValueError("matmul must be 'f32split' or 'int64'")
         self.p = params
         self.xp = get_xp(backend)
         self.backend = "cupy" if self.xp is not np else "numpy"
         self.matmul = matmul
-        self.chunk = int(chunk)            # rows per device pass (bounds memory)
-        import os
-        try:
-            tf32 = int(os.environ.get("CUPY_TF32", "0") or 0) > 0
-        except ValueError:
-            tf32 = True
-        if self.xp is not np and matmul == "f32split" and tf32:
-            raise RuntimeError("CUPY_TF32 enables TF32, which breaks exact float32 products; unset it")
-        self.single = FrodoKEM(params)            # keygen, A generation, KATs
-        self._T = [int(t) for t in _cdf(params.chi)[:-1]]   # host ints
+        self.single = FrodoKEM(params)            # keygen, Gen(A), reference
+        self._T = [int(t) for t in _cdf(params.chi)[:-1]]
+        self._idt = self.xp.int64 if matmul == "int64" else self.xp.int32
         self._A_seed: Optional[bytes] = None
         self._A_dev: Any = None
         self._B_pk: Any = None
-        self._gpu_shake = None
+        self._shake = {}
+        self._sample_kernel = None
         if self.xp is not np:
-            from .kernels.shake_kernel import GPUShake
-            self._gpu_shake = GPUShake(params.shake)
+            try:
+                tf32 = int(os.environ.get("CUPY_TF32", "0") or 0) > 0
+            except ValueError:
+                tf32 = True
+            if matmul == "f32split" and tf32:
+                raise RuntimeError("CUPY_TF32 enables TF32, which breaks exact float32 products; unset it")
+            self._sample_kernel = self._build_sample_kernel()
+        self.chunk = int(chunk) if chunk else self._auto_chunk()
         if matmul == "f32split":
             self._check_f32_exact()
 
     # ------------------------------------------------------------------
-    # helpers
+    # setup helpers
     # ------------------------------------------------------------------
-    def _H(self, data: bytes, outlen: int) -> bytes:
-        return self.single._H(data, outlen)
+    def _auto_chunk(self) -> int:
+        if self.xp is np:
+            return 512
+        free, _total = self.xp.cuda.Device().mem_info
+        rows = int(0.5 * free / (_BYTES_PER_ROW_PER_N * self.p.n))
+        return max(1024, min(65536, rows))
 
-    def _to_host(self, a) -> np.ndarray:
-        return a.get() if self.xp is not np else a
-
-    def _hash_rows(self, data, outlen: int):
-        """SHAKE (params.shake) of each row: (batch, inlen) uint8 -> (batch, outlen)."""
-        if self._gpu_shake is not None:
-            return self._gpu_shake(data, outlen)
-        data = np.ascontiguousarray(data, dtype=np.uint8)
-        out = np.empty((data.shape[0], outlen), dtype=np.uint8)
-        for i in range(data.shape[0]):
-            out[i] = np.frombuffer(self._H(data[i].tobytes(), outlen), np.uint8)
-        return out
-
-    def _const_rows(self, b: bytes, batch: int):
-        """Broadcast a byte string to a (batch, len) device array."""
-        xp = self.xp
-        return xp.broadcast_to(xp.asarray(np.frombuffer(b, np.uint8)), (batch, len(b)))
+    def _build_sample_kernel(self):
+        """Fused Algorithm 5: uint16 sample -> int16 error, thresholds inlined."""
+        body = "int t = r >> 1; int c = 0;\n"
+        body += "".join(f"c += (t > {thr});\n" for thr in self._T)
+        body += "e = (r & 1) ? -c : c;"
+        return self.xp.ElementwiseKernel("uint16 r", "int16 e", body,
+                                         f"frodo_sample_{self.p.n}")
 
     def _check_f32_exact(self):
         """Refuse to run if the float32 GEMM is not exact on this device.
 
         Catches TF32 or reduced-precision GEMM modes switched on in code
-        (which no environment check can see). Uses the largest magnitudes
+        (which no environment check can see), using the largest magnitudes
         the products can reach for these parameters.
         """
         xp, p = self.xp, self.p
@@ -136,15 +148,50 @@ class BatchFrodoKEM:
             raise RuntimeError("float32 GEMM is not exact on this device "
                                "(TF32 or reduced precision enabled?); use matmul='int64'")
 
+    # ------------------------------------------------------------------
+    # primitives
+    # ------------------------------------------------------------------
+    def _H(self, data: bytes, outlen: int) -> bytes:
+        return self.single._H(data, outlen)
+
+    def to_host(self, a) -> np.ndarray:
+        """Device -> host copy (through pinned memory on the GPU)."""
+        if self.xp is np:
+            return a
+        import cupyx
+        out = cupyx.empty_pinned(a.shape, dtype=a.dtype)
+        a.get(out=out)
+        return out
+
+    def _hash_rows(self, data, outlen: int, variant: Optional[str] = None):
+        """SHAKE of each row: (batch, inlen) uint8 -> (batch, outlen) uint8."""
+        variant = variant or self.p.shake
+        if self.xp is not np:
+            g = self._shake.get(variant)
+            if g is None:
+                from .kernels.shake_kernel import GPUShake
+                g = self._shake[variant] = GPUShake(variant)
+            return g(data, outlen)
+        H = hashlib.shake_128 if variant == "shake128" else hashlib.shake_256
+        data = np.ascontiguousarray(data, dtype=np.uint8)
+        out = np.empty((data.shape[0], outlen), dtype=np.uint8)
+        for i in range(data.shape[0]):
+            out[i] = np.frombuffer(H(data[i].tobytes()).digest(outlen), np.uint8)
+        return out
+
+    def _const_rows(self, b: bytes, batch: int):
+        xp = self.xp
+        return xp.broadcast_to(xp.asarray(np.frombuffer(b, np.uint8)), (batch, len(b)))
+
     def _split(self, big):
         """Prepare a 'big' factor (entries in [0, 2^16)) for _mm."""
         if self.matmul == "int64":
-            return (big,)
+            return (big.astype(self.xp.int64),)
         xp = self.xp
         return ((big & 0xFF).astype(xp.float32), (big >> 8).astype(xp.float32))
 
     def _mm(self, small, big, small_left: bool = True):
-        """Exact (small @ big) or (big @ small) mod q.
+        """Exact (small @ big) or (big @ small) mod q, as self._idt.
 
         ``small``: int entries with |x| <= 12. ``big``: entries in [0, 2^16),
         either an int array or the tuple returned by ``_split``.
@@ -153,7 +200,8 @@ class BatchFrodoKEM:
         if not isinstance(big, tuple):
             big = self._split(big)
         if self.matmul == "int64":
-            r = small @ big[0] if small_left else big[0] @ small
+            s = small.astype(xp.int64)
+            r = s @ big[0] if small_left else big[0] @ s
             return r & (q - 1)
         s = small.astype(xp.float32)
         lo, hi = big
@@ -161,7 +209,8 @@ class BatchFrodoKEM:
             r_lo, r_hi = s @ lo, s @ hi
         else:
             r_lo, r_hi = lo @ s, hi @ s
-        r = r_lo.astype(xp.int64) + (r_hi.astype(xp.int64) << 8)
+        # |r_lo| < 2^24, |r_hi * 256| < 2^31: int32 is exact
+        r = r_lo.astype(xp.int32) + (r_hi.astype(xp.int32) << 8)
         return r & (q - 1)
 
     def _A(self, seedA: bytes):
@@ -171,112 +220,114 @@ class BatchFrodoKEM:
         return self._A_dev
 
     def _sample(self, r_u16):
-        """Algorithm 5 on an integer array of 16-bit samples (any shape)."""
-        xp = self.xp
-        t = (r_u16 >> 1).astype(xp.int32)
-        e = xp.zeros(t.shape, dtype=xp.int32)
-        for thr in self._T:                      # <= 12 thresholds
+        """Algorithm 5 on a uint16 array (any shape) -> int16 errors."""
+        if self._sample_kernel is not None:
+            return self._sample_kernel(r_u16)
+        t = r_u16 >> 1
+        e = np.zeros(t.shape, dtype=np.int16)
+        for thr in self._T:
             e += (t > thr)
-        sign = (r_u16 & 1).astype(bool)
-        return xp.where(sign, -e, e).astype(xp.int64)
+        return np.where(r_u16 & 1, -e, e).astype(np.int16)
 
-    def _pack(self, C):
-        """Algorithm 3 on (batch, rows, cols) -> device uint8 (batch, bytes)."""
+    def _pack_into(self, C, out):
+        """Algorithm 3: (batch, rows, cols) -> rows of ``out`` (device uint8)."""
         xp, D = self.xp, self.p.D
         bsz = C.shape[0]
         v = (C & (self.p.q - 1)).reshape(bsz, -1)
         if D == 16:
-            out = xp.empty((bsz, v.shape[1] * 2), dtype=xp.uint8)
             out[:, 0::2] = (v >> 8).astype(xp.uint8)
             out[:, 1::2] = (v & 0xFF).astype(xp.uint8)
-            return out
+            return
         # D = 15: every 8 entries -> 120 bits -> 15 bytes (MSB first).
-        g = v.reshape(bsz, -1, 8).astype(xp.uint64)
         u = xp.uint64
+        g = v.reshape(bsz, -1, 8).astype(u)
         hi = (g[..., 0] << u(45)) | (g[..., 1] << u(30)) | (g[..., 2] << u(15)) | g[..., 3]
         lo = (g[..., 4] << u(45)) | (g[..., 5] << u(30)) | (g[..., 6] << u(15)) | g[..., 7]
-        # 120 bits = hi(60) || lo(60); emit 15 big-endian bytes.
-        out = xp.empty(g.shape[:2] + (15,), dtype=xp.uint8)
+        o = xp.empty(g.shape[:2] + (15,), dtype=xp.uint8)   # contiguous scratch
         for k in range(15):
             bit = 112 - 8 * k                     # position of this byte's LSB
             if bit >= 60:
-                byte = hi >> xp.uint64(bit - 60)
+                byte = hi >> u(bit - 60)
             elif bit + 8 <= 60:
-                byte = lo >> xp.uint64(bit)
-            else:                                 # straddles hi/lo boundary
-                byte = (hi << xp.uint64(60 - bit)) | (lo >> xp.uint64(bit))
-            out[..., k] = (byte & xp.uint64(0xFF)).astype(xp.uint8)
-        return out.reshape(bsz, -1)
+                byte = lo >> u(bit)
+            else:                                 # straddles hi/lo (bit = 56)
+                byte = (hi << u(60 - bit)) | (lo >> u(bit))
+            o[..., k] = (byte & u(0xFF)).astype(xp.uint8)
+        out[...] = o.reshape(bsz, -1)
 
     def _unpack(self, b_dev, rows: int, cols: int):
-        """Algorithm 4: device uint8 (batch, bytes) -> int64 (batch, rows, cols)."""
+        """Algorithm 4: device uint8 (batch, bytes) -> int32 (batch, rows, cols)."""
         xp, D = self.xp, self.p.D
         bsz = b_dev.shape[0]
         if D == 16:
-            b = b_dev.reshape(bsz, -1, 2).astype(xp.int64)
+            b = b_dev.reshape(bsz, -1, 2).astype(xp.int32)
             return ((b[..., 0] << 8) | b[..., 1]).reshape(bsz, rows, cols)
-        g = b_dev.reshape(bsz, -1, 15).astype(xp.uint64)
-        hi = xp.zeros(g.shape[:2], dtype=xp.uint64)
-        lo = xp.zeros(g.shape[:2], dtype=xp.uint64)
+        u = xp.uint64
+        g = b_dev.reshape(bsz, -1, 15).astype(u)
+        hi = xp.zeros(g.shape[:2], dtype=u)
+        lo = xp.zeros(g.shape[:2], dtype=u)
         for k in range(15):
             bit = 112 - 8 * k
             byte = g[..., k]
             if bit >= 60:
-                hi |= byte << xp.uint64(bit - 60)
+                hi |= byte << u(bit - 60)
             elif bit + 8 <= 60:
-                lo |= byte << xp.uint64(bit)
+                lo |= byte << u(bit)
             else:
-                hi |= byte >> xp.uint64(60 - bit)
-                lo |= (byte << xp.uint64(bit)) & xp.uint64((1 << 60) - 1)
-        m = xp.uint64(0x7FFF)
-        vals = xp.stack([(hi >> xp.uint64(45)) & m, (hi >> xp.uint64(30)) & m,
-                         (hi >> xp.uint64(15)) & m, hi & m,
-                         (lo >> xp.uint64(45)) & m, (lo >> xp.uint64(30)) & m,
-                         (lo >> xp.uint64(15)) & m, lo & m], axis=-1)
-        return vals.astype(xp.int64).reshape(bsz, rows, cols)
+                hi |= byte >> u(60 - bit)
+                lo |= (byte << u(bit)) & u((1 << 60) - 1)
+        m = u(0x7FFF)
+        vals = xp.stack([(hi >> u(45)) & m, (hi >> u(30)) & m, (hi >> u(15)) & m, hi & m,
+                         (lo >> u(45)) & m, (lo >> u(30)) & m, (lo >> u(15)) & m, lo & m],
+                        axis=-1)
+        return vals.astype(xp.int32).reshape(bsz, rows, cols)
 
     def _encode(self, mu_dev):
-        """Algorithm 1: device uint8 (batch, len_mu) -> int64 (batch, mbar, nbar)."""
+        """Algorithm 1: device uint8 (batch, len_mu) -> int32 (batch, mbar, nbar)."""
         xp, p = self.xp, self.p
         bsz = mu_dev.shape[0]
         bits = (mu_dev[..., None] >> xp.arange(8, dtype=xp.uint8)) & 1  # LSB first
-        bits = bits.reshape(bsz, p.mbar * p.nbar, p.B).astype(xp.int64)
-        vals = (bits << xp.arange(p.B, dtype=xp.int64)).sum(axis=-1)
+        bits = bits.reshape(bsz, p.mbar * p.nbar, p.B).astype(xp.int32)
+        vals = (bits << xp.arange(p.B, dtype=xp.int32)).sum(axis=-1, dtype=xp.int32)
         return (vals * (p.q >> p.B)).reshape(bsz, p.mbar, p.nbar)
 
     def _decode(self, M):
-        """Algorithm 2: int64 (batch, mbar, nbar) -> device uint8 (batch, len_mu)."""
+        """Algorithm 2: int (batch, mbar, nbar) -> device uint8 (batch, len_mu)."""
         xp, p = self.xp, self.p
         bsz = M.shape[0]
-        M = M & (p.q - 1)
+        M = (M & (p.q - 1)).astype(xp.int32)
         vals = (((M << p.B) + (1 << (p.D - 1))) >> p.D) & ((1 << p.B) - 1)
-        bits = (vals.reshape(bsz, -1, 1) >> xp.arange(p.B, dtype=xp.int64)) & 1
+        bits = (vals.reshape(bsz, -1, 1) >> xp.arange(p.B, dtype=xp.int32)) & 1
         bits = bits.reshape(bsz, -1, 8)
-        return (bits << xp.arange(8, dtype=xp.int64)).sum(axis=-1).astype(xp.uint8)
+        return (bits << xp.arange(8, dtype=xp.int32)).sum(axis=-1).astype(xp.uint8)
 
     # ------------------------------------------------------------------
-    # batched core (all arrays on the device unless stated)
+    # batched core (all arrays on the device)
     # ------------------------------------------------------------------
-    def _encrypt_batch(self, pk: bytes, mu_dev, seedSE_dev):
-        """(c1 || c2) rows, device uint8 (batch, l1 + l2)."""
+    def _encrypt_into(self, pk: bytes, mu_dev, seedSE_dev, out):
+        """Write (c1 || c2) rows into ``out`` (device uint8, batch x (l1 + l2))."""
         xp, p = self.xp, self.p
         bsz = mu_dev.shape[0]
-        prefix = self._const_rows(b"\x96", bsz)
         nbytes = 2 * (2 * p.mbar * p.n + p.mbar * p.nbar)
-        rbytes = self._hash_rows(xp.concatenate([prefix, seedSE_dev], axis=1), nbytes)
-        r = rbytes.view(xp.uint16).astype(xp.int32)      # little-endian 16-bit
+        rbytes = self._hash_rows(xp.concatenate(
+            [self._const_rows(b"\x96", bsz), seedSE_dev], axis=1), nbytes)
+        r = rbytes.view(xp.uint16)                          # little-endian samples
         o1, o2 = p.mbar * p.n, 2 * p.mbar * p.n
         Sp = self._sample(r[:, :o1]).reshape(bsz * p.mbar, p.n)
         Ep = self._sample(r[:, o1:o2]).reshape(bsz, p.mbar, p.n)
         Epp = self._sample(r[:, o2:]).reshape(bsz, p.mbar, p.nbar)
+        del rbytes, r
         A = self._A(pk[:p.len_seedA])
         Bp = (self._mm(Sp, A).reshape(bsz, p.mbar, p.n) + Ep) & (p.q - 1)
+        del Ep
         if self._B_pk is None or self._B_pk[0] != pk:
             Bm = self.single.unpack(pk[p.len_seedA:], p.n, p.nbar)
             self._B_pk = (pk, self._split(xp.asarray(Bm)))
         V = self._mm(Sp, self._B_pk[1]).reshape(bsz, p.mbar, p.nbar)
         C = (V + Epp + self._encode(mu_dev)) & (p.q - 1)
-        return xp.concatenate([self._pack(Bp), self._pack(C)], axis=1)
+        l1 = p.D * p.mbar * p.n // 8
+        self._pack_into(Bp, out[:, :l1])
+        self._pack_into(C, out[:, l1:])
 
     def _derive_seedSE_k(self, pkh: bytes, mu_dev, salt_dev):
         p = self.p
@@ -285,11 +336,12 @@ class BatchFrodoKEM:
             [self._const_rows(pkh, bsz), mu_dev, salt_dev], axis=1), p.len_seedSE + p.len_sec)
         return h[:, :p.len_seedSE], h[:, p.len_seedSE:]
 
-    def _encaps_chunk(self, pk: bytes, mu_salt, to_host: bool = True):
+    def encaps_batch(self, pk: bytes, mu_salt, to_host: bool = True, prefix: bytes = b""):
         """Algorithm 13 for each row of ``mu_salt`` (uint8, batch x (len_mu+len_salt)).
 
-        ``mu_salt`` may be a host or device array. Returns (ct, ss), uint8 arrays
-        of shape (batch, ct_bytes) and (batch, ss_bytes); host arrays unless
+        ``mu_salt`` may be a host or device array. Returns (ct, ss): uint8
+        arrays (batch, len(prefix) + ct_bytes) and (batch, ss_bytes). Each ct
+        row starts with ``prefix`` (e.g. a wire header). Host arrays unless
         ``to_host`` is False.
         """
         xp, p = self.xp, self.p
@@ -298,74 +350,74 @@ class BatchFrodoKEM:
         ms = xp.ascontiguousarray(xp.asarray(mu_salt), dtype=xp.uint8)
         if ms.ndim != 2 or ms.shape[1] != p.len_sec + p.len_salt:
             raise ValueError("mu_salt must have shape (batch, len_mu + len_salt)")
-        mu, salt = ms[:, :p.len_sec], ms[:, p.len_sec:]
-        seedSE, k = self._derive_seedSE_k(self._H(pk, p.len_sec), mu, salt)
-        ct = xp.concatenate([self._encrypt_batch(pk, mu, seedSE), salt], axis=1)
-        ss = self._hash_rows(xp.concatenate([ct, k], axis=1), p.ss_bytes)
-        return (self._to_host(ct), self._to_host(ss)) if to_host else (ct, ss)
+        bsz, hp = ms.shape[0], len(prefix)
+        l12 = p.ct_bytes - p.len_salt
+        ct = xp.empty((bsz, hp + p.ct_bytes), dtype=xp.uint8)
+        ss = xp.empty((bsz, p.ss_bytes), dtype=xp.uint8)
+        if hp:
+            ct[:, :hp] = xp.asarray(np.frombuffer(prefix, np.uint8))
+        pkh = self._H(pk, p.len_sec)
+        for a in range(0, bsz, self.chunk):
+            b = min(bsz, a + self.chunk)
+            mu, salt = ms[a:b, :p.len_sec], ms[a:b, p.len_sec:]
+            seedSE, k = self._derive_seedSE_k(pkh, mu, salt)
+            body = ct[a:b, hp:]
+            self._encrypt_into(pk, mu, seedSE, body[:, :l12])
+            body[:, l12:] = salt
+            ss[a:b] = self._hash_rows(xp.concatenate([body, k], axis=1), p.ss_bytes)
+        return (self.to_host(ct), self.to_host(ss)) if to_host else (ct, ss)
 
-    def _chunked(self, fn, key: bytes, rows, to_host: bool, n_out: int):
-        xp = self.xp
-        bsz = rows.shape[0]
-        if bsz <= self.chunk:
-            return fn(key, rows, to_host)
-        parts = [fn(key, rows[i:i + self.chunk], to_host) for i in range(0, bsz, self.chunk)]
-        cat = np.concatenate if to_host else xp.concatenate
-        if n_out == 1:
-            return cat(parts, axis=0)
-        return tuple(cat([p[j] for p in parts], axis=0) for j in range(n_out))
-
-    def encaps_batch(self, pk: bytes, mu_salt, to_host: bool = True):
-        """Algorithm 13 for each row of ``mu_salt`` (uint8, batch x (len_mu+len_salt)).
-
-        ``mu_salt`` may be a host or device array. Returns (ct, ss), uint8 arrays
-        of shape (batch, ct_bytes) and (batch, ss_bytes); host arrays unless
-        ``to_host`` is False. Large batches are processed ``chunk`` rows at a time.
-        """
-        return self._chunked(self._encaps_chunk, pk, mu_salt, to_host, 2)
-
-    def decaps_batch(self, sk: bytes, ct, to_host: bool = True):
-        """Algorithm 14 for each row of ``ct`` (uint8, batch x ct_bytes)."""
-        return self._chunked(self._decaps_chunk, sk, ct, to_host, 1)
-
-    def encaps_batch_random(self, pk: bytes, batch: int, to_host: bool = True):
+    def encaps_batch_random(self, pk: bytes, batch: int, to_host: bool = True,
+                            prefix: bytes = b""):
         """encaps_batch with fresh randomness from the OS CSPRNG."""
-        import secrets
         p = self.p
         rnd = np.frombuffer(secrets.token_bytes(batch * (p.len_sec + p.len_salt)), np.uint8)
-        return self.encaps_batch(pk, rnd.reshape(batch, -1), to_host=to_host)
+        return self.encaps_batch(pk, rnd.reshape(batch, -1), to_host=to_host, prefix=prefix)
 
-    def _decaps_chunk(self, sk: bytes, ct, to_host: bool = True):
-        """Algorithm 14 for each row of ``ct`` (uint8, batch x ct_bytes)."""
+    def decaps_batch(self, sk: bytes, ct, to_host: bool = True, offset: int = 0):
+        """Algorithm 14 for each row of ``ct`` (uint8, batch x (offset + ct_bytes)).
+
+        The first ``offset`` bytes of each row (e.g. a wire header) are skipped.
+        ``ct`` may be a host or device array.
+        """
         xp, p = self.xp, self.p
         ct = xp.ascontiguousarray(xp.asarray(ct), dtype=xp.uint8)
-        if ct.ndim != 2 or ct.shape[1] != p.ct_bytes:
+        if ct.ndim != 2 or ct.shape[1] != offset + p.ct_bytes:
             raise ValueError("Incorrect ciphertext shape")
         if len(sk) != p.sk_bytes:
             raise ValueError("Incorrect secret key length")
         bsz = ct.shape[0]
         l1 = p.D * p.mbar * p.n // 8
-        l2 = p.D * p.mbar * p.nbar // 8
+        l12 = p.ct_bytes - p.len_salt
         o = 0
         s = sk[o:o + p.len_sec]; o += p.len_sec
         pk = sk[o:o + p.pk_bytes]; o += p.pk_bytes
-        ST = np.frombuffer(sk[o:o + 2 * p.n * p.nbar], "<i2").astype(np.int64).reshape(p.nbar, p.n)
+        ST = np.frombuffer(sk[o:o + 2 * p.n * p.nbar], "<i2").reshape(p.nbar, p.n)
         o += 2 * p.n * p.nbar
         pkh = sk[o:o + p.len_sec]
-
-        Bp = self._unpack(ct[:, :l1], p.mbar, p.n).reshape(bsz * p.mbar, p.n)
-        C = self._unpack(ct[:, l1:l1 + l2], p.mbar, p.nbar)
-        BpS = self._mm(xp.asarray(ST.T.copy()), Bp, small_left=False)
-        mu = self._decode((C - BpS.reshape(bsz, p.mbar, p.nbar)) & (p.q - 1))
-        salt = ct[:, l1 + l2:]
-        seedSE, k = self._derive_seedSE_k(pkh, mu, salt)
-        c12 = self._encrypt_batch(pk, mu, seedSE)
-        ok = xp.all(c12 == ct[:, :l1 + l2], axis=1)
-        # branch-free select: kbar = k if ok else s
-        mask = (ok.astype(xp.uint8) * xp.uint8(0xFF))[:, None]
-        kbar = (k & mask) | (self._const_rows(s, bsz) & ~mask)
-        ss = self._hash_rows(xp.concatenate([ct, kbar], axis=1), p.ss_bytes)
-        return self._to_host(ss) if to_host else ss
+        S = xp.asarray(np.ascontiguousarray(ST.T))
+        s_row = xp.asarray(np.frombuffer(s, np.uint8))
+        ss = xp.empty((bsz, p.ss_bytes), dtype=xp.uint8)
+        for a in range(0, bsz, self.chunk):
+            b = min(bsz, a + self.chunk)
+            body = ct[a:b, offset:]
+            m = b - a
+            Bp = self._unpack(body[:, :l1], p.mbar, p.n).reshape(m * p.mbar, p.n)
+            C = self._unpack(body[:, l1:l12], p.mbar, p.nbar)
+            BpS = self._mm(S, Bp, small_left=False)
+            del Bp
+            mu = self._decode((C - BpS.reshape(m, p.mbar, p.nbar)) & (p.q - 1))
+            salt = body[:, l12:]
+            seedSE, k = self._derive_seedSE_k(pkh, mu, salt)
+            c12 = xp.empty((m, l12), dtype=xp.uint8)
+            self._encrypt_into(pk, mu, seedSE, c12)
+            ok = xp.all(c12 == body[:, :l12], axis=1)
+            del c12
+            # branch-free select: kbar = k if ok else s
+            mask = (ok.astype(xp.uint8) * xp.uint8(0xFF))[:, None]
+            kbar = (k & mask) | (s_row[None, :] & ~mask)
+            ss[a:b] = self._hash_rows(xp.concatenate([body, kbar], axis=1), p.ss_bytes)
+        return self.to_host(ss) if to_host else ss
 
 
 __all__ = ["BatchFrodoKEM", "CUPY_AVAILABLE", "get_xp"]

@@ -148,7 +148,7 @@ def _derive_key(ikm: bytes, info: bytes, length: int = 32) -> bytes:
     HKDF-based key derivation with domain separation.
     
     Used for:
-      - Shared secret derivation: K = HKDF(m || ct_wire, "meteor-nc-shared-secret")
+      - Shared secret derivation (v3): K = SHAKE256("meteor-nc-v3-K" || FrodoKEM ss)
       - AEAD key derivation: aead_key = HKDF(K, "meteor-nc-aead-key")
       - Implicit rejection: K_fail = HKDF(z || ct_wire, "meteor-nc-implicit-reject")
     """

@@ -21,17 +21,15 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 
 from .core import (
+    KDF_DOMAIN,
     LWEKEM,
     _HDR,
     _WIRE_VERSION,
-    _derive_key_meteor,
     hybrid_open,
     hybrid_parse,
     hybrid_seal,
 )
 from .frodo_batch import BatchFrodoKEM, CUPY_AVAILABLE
-
-_KDF_INFO = b"meteor-nc-v3-shared-secret"   # must match LWEKEM._kdf
 
 
 class BatchLWEKEM:
@@ -94,53 +92,58 @@ class BatchLWEKEM:
         return self._kem.decaps(wire)
 
     # -- batch ------------------------------------------------------------
-    def _header(self) -> np.ndarray:
-        return np.frombuffer(_HDR.pack(_WIRE_VERSION, self.params.nist_level, self.params.n), np.uint8)
+    def _header(self) -> bytes:
+        return _HDR.pack(_WIRE_VERSION, self.params.nist_level, self.params.n)
 
-    @staticmethod
-    def _kdf_rows(ss: np.ndarray) -> np.ndarray:
-        out = np.empty((ss.shape[0], 32), dtype=np.uint8)
-        for i in range(ss.shape[0]):
-            out[i] = np.frombuffer(_derive_key_meteor(ss[i].tobytes(), _KDF_INFO), np.uint8)
-        return out
+    def _kdf_rows(self, ss):
+        """K = SHAKE256(KDF_DOMAIN || ss) per row, on the batch backend."""
+        bk = self._batch
+        dom = bk._const_rows(KDF_DOMAIN, ss.shape[0])
+        return bk._hash_rows(bk.xp.concatenate([dom, ss], axis=1), 32, "shake256")
 
-    def encaps_batch(self, batch: int, mu_salt: Optional[np.ndarray] = None,
-                     raw: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    def encaps_batch(self, batch: int, mu_salt=None, raw: bool = False,
+                     device: bool = False):
         """Encapsulate ``batch`` times to the loaded public key.
 
-        Returns (K, wires): K is (batch, 32) uint8 (HKDF of the FrodoKEM
-        shared secret, as in LWEKEM), wires is (batch, wire_len) uint8.
-        ``raw=True`` returns the FrodoKEM shared secrets instead of K
-        (skips the per-item HKDF on the host).
-        ``mu_salt`` fixes the randomness (tests only).
+        Returns (K, wires): K is (batch, 32) uint8 (as LWEKEM's K), wires is
+        (batch, wire_len) uint8. ``raw=True`` returns the FrodoKEM shared
+        secrets instead of K. ``device=True`` leaves both on the GPU (CuPy
+        arrays) instead of copying them to the host. ``mu_salt`` fixes the
+        randomness (tests only).
         """
         if self._kem.pk is None:
             raise ValueError("Public key not initialized")
-        pk = self._kem.pk.frodo_pk
+        pk, bk = self._kem.pk.frodo_pk, self._batch
         with self._device():
             if mu_salt is None:
-                ct, ss = self._batch.encaps_batch_random(pk, int(batch))
+                wires, ss = bk.encaps_batch_random(pk, int(batch), to_host=False,
+                                                   prefix=self._header())
             else:
-                ct, ss = self._batch.encaps_batch(pk, mu_salt)
-        hdr = np.broadcast_to(self._header(), (ct.shape[0], _HDR.size))
-        wires = np.concatenate([hdr, ct], axis=1)
-        return (ss if raw else self._kdf_rows(ss)), wires
+                wires, ss = bk.encaps_batch(pk, mu_salt, to_host=False, prefix=self._header())
+            K = ss if raw else self._kdf_rows(ss)
+            if device:
+                return K, wires
+            return bk.to_host(K), bk.to_host(wires)
 
-    def decaps_batch(self, wires, raw: bool = False) -> np.ndarray:
-        """Decapsulate rows of ``wires`` ((B, wire_len) uint8, or a list of bytes)."""
+    def decaps_batch(self, wires, raw: bool = False, device: bool = False):
+        """Decapsulate rows of ``wires``: (B, wire_len) uint8 host or device
+        array, or a list of bytes. Returns K (B, 32) uint8 (host unless
+        ``device=True``)."""
         if self._kem.sk is None:
             raise ValueError("Secret key not initialized")
-        if hasattr(wires, "get") and not isinstance(wires, np.ndarray):
-            wires = wires.get()                       # CuPy array -> host
-        if not isinstance(wires, np.ndarray):
+        bk = self._batch
+        if isinstance(wires, (list, tuple)):
             wires = np.stack([np.frombuffer(w, np.uint8) for w in wires])
         if wires.ndim != 2 or wires.shape[1] != _HDR.size + self.params.ct_bytes:
             raise ValueError("wires must have shape (batch, wire_len)")
-        if not (wires[:, :_HDR.size] == self._header()).all():
-            raise ValueError("wire header mismatch (version or level)")
         with self._device():
-            ss = self._batch.decaps_batch(self._kem.sk, wires[:, _HDR.size:])
-        return ss if raw else self._kdf_rows(ss)
+            w = bk.xp.asarray(wires)
+            hdr = bk.xp.asarray(np.frombuffer(self._header(), np.uint8))
+            if not bool((w[:, :_HDR.size] == hdr[None, :]).all()):
+                raise ValueError("wire header mismatch (version or level)")
+            ss = bk.decaps_batch(self._kem.sk, w, to_host=False, offset=_HDR.size)
+            K = ss if raw else self._kdf_rows(ss)
+            return K if device else bk.to_host(K)
 
 
 @dataclass

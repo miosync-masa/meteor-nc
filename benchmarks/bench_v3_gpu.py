@@ -15,8 +15,9 @@ second cupy-cuda1Xx package next to it (mixed CuPy builds fail to load cuBLAS).
    - official FrodoKEM KATs through the GPU batch path (byte-exact),
    - GPU batch == CPU single for random inputs, incl. tampered ciphertexts,
    - f32split == int64 on the GPU.
-2. Throughput of encaps_batch / decaps_batch per level and batch size,
-   FrodoKEM shared secret (raw) and with the Meteor HKDF (host).
+2. Throughput per level and batch size: GPU-resident (raw shared secret,
+   wires stay on the device) and end-to-end (K via SHAKE256, results copied
+   to the host).
 """
 import argparse
 import hashlib
@@ -99,36 +100,39 @@ def check_random():
 
 
 def bench(sizes, reps):
-    print("\nlevel                batch   encaps/s(raw)  decaps/s(raw)  encaps/s(+HKDF)")
+    """GPU-resident throughput (FrodoKEM ss, wires stay on the GPU) and
+    end-to-end throughput (K = SHAKE256 KDF, wires and K copied to the host)."""
+    print("\nlevel                 batch   encaps/s(gpu)  decaps/s(gpu)  encaps/s(e2e)  decaps/s(e2e)")
     for n, P in zip((256, 512, 1024), LEVELS):
         kem = BatchLWEKEM(n=n, backend="cupy")
         kem.key_gen()
         kem.encaps_batch(64)
         for bs in sizes:
-            _, w = kem.encaps_batch(bs, raw=True)
-            kem.decaps_batch(w, raw=True)
+            _, wd = kem.encaps_batch(bs, raw=True, device=True)
+            kem.decaps_batch(wd, raw=True, device=True)
             sync()
-            t = time.perf_counter()
-            for _ in range(reps):
-                _, w = kem.encaps_batch(bs, raw=True)
-            sync(); te = (time.perf_counter() - t) / reps
-            t = time.perf_counter()
-            for _ in range(reps):
-                kem.decaps_batch(w, raw=True)
-            sync(); td = (time.perf_counter() - t) / reps
-            t = time.perf_counter()
-            kem.encaps_batch(bs)
-            sync(); tk = time.perf_counter() - t
-            print(f"{P.name:20s} {bs:6d}   {bs/te:12,.0f}   {bs/td:12,.0f}   {bs/tk:12,.0f}")
+
+            def timed(fn):
+                sync(); t = time.perf_counter()
+                for _ in range(reps):
+                    r = fn()
+                sync()
+                return (time.perf_counter() - t) / reps, r
+            te, _ = timed(lambda: kem.encaps_batch(bs, raw=True, device=True))
+            td, _ = timed(lambda: kem.decaps_batch(wd, raw=True, device=True))
+            te2, (_, wh) = timed(lambda: kem.encaps_batch(bs))
+            td2, _ = timed(lambda: kem.decaps_batch(wh))
+            print(f"{P.name:20s} {bs:7d}   {bs/te:12,.0f}   {bs/td:12,.0f}   {bs/te2:12,.0f}   {bs/td2:12,.0f}")
+        del kem
+        cp.get_default_memory_pool().free_all_blocks()
 
 
 def profile(bs):
     """Per-stage time of one encaps_batch / decaps_batch (device-synchronised)."""
     import collections
     import functools
-    from meteor_nc.cryptography import batch as batch_mod
-    stages = ["_hash_rows", "_sample", "_mm", "_pack", "_unpack", "_encode",
-              "_decode", "_to_host", "_A"]
+    stages = ["_hash_rows", "_sample", "_mm", "_pack_into", "_unpack", "_encode",
+              "_decode", "to_host", "_A"]
     for n, P in zip((256, 512, 1024), LEVELS):
         kem = BatchLWEKEM(n=n, backend="cupy")
         kem.key_gen()
@@ -146,20 +150,18 @@ def profile(bs):
                 sync(); acc[_n] += time.perf_counter() - t
                 return r
             setattr(bk, name, functools.wraps(f)(wrapped))
-        kdf = batch_mod.BatchLWEKEM._kdf_rows
         for op in ("encaps", "decaps"):
             acc.clear()
             sync(); t = time.perf_counter()
             if op == "encaps":
-                _, w = kem.encaps_batch(bs, raw=True)
+                _, w = kem.encaps_batch(bs, raw=True, device=True)
             else:
-                kem.decaps_batch(w, raw=True)
+                kem.decaps_batch(w, raw=True, device=True)
             sync(); total = time.perf_counter() - t
-            t = time.perf_counter(); kdf(np.zeros((bs, P.ss_bytes), np.uint8)); hk = time.perf_counter() - t
             other = total - sum(acc.values())
-            parts = ", ".join(f"{k[1:]} {v / total:5.1%}" for k, v in acc.most_common())
+            parts = ", ".join(f"{k.lstrip('_')} {v / total:5.1%}" for k, v in acc.most_common())
             print(f"{P.name} {op} batch {bs}: {total * 1e3:7.1f} ms | {parts}, "
-                  f"other(host glue) {other / total:5.1%} | +HKDF would add {hk * 1e3:.1f} ms")
+                  f"other {other / total:5.1%}  (chunk={bk.chunk})")
         for name, f in orig.items():
             setattr(bk, name, f)
 
@@ -168,7 +170,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--kat", help="FrodoKEM KAT directory (PQCrypto-LWEKE/FrodoKEM/KAT)")
     ap.add_argument("--kat-count", type=int, default=20)
-    ap.add_argument("--sizes", default="1000,10000,50000")
+    ap.add_argument("--sizes", default="1000,10000,100000")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--skip-checks", action="store_true")
     ap.add_argument("--profile", type=int, metavar="BATCH",

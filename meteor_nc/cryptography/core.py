@@ -20,12 +20,13 @@ Levels (legacy selector n -> FrodoKEM):
   - n=512  -> FrodoKEM-976  (NIST L3): PK 15644 B, CT 15804 B
   - n=1024 -> FrodoKEM-1344 (NIST L5): PK 21532 B, CT 21708 B
 
-Shared secret: K = HKDF(FrodoKEM ss), 32 bytes.
+Shared secret: K = SHAKE256("meteor-nc-v3-K" || FrodoKEM ss), 32 bytes.
 """
 
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import struct
 from typing import Any, Callable, Optional, Tuple
@@ -213,6 +214,7 @@ class SymmetricMixer:
 _LEVEL_FOR_N = {256: 1, 640: 1, 512: 3, 976: 3, 1024: 5, 1344: 5}
 
 _WIRE_VERSION = 3
+KDF_DOMAIN = b"meteor-nc-v3-K"   # K = SHAKE256(KDF_DOMAIN || ss, 32)
 _HDR = struct.Struct(">III")          # version, nist_level, frodo_n
 
 
@@ -259,7 +261,7 @@ class LWEKEM:
       * ``key_gen() -> (pk_bytes, sk_bytes)``,
         ``encaps() -> (K, wire)``, ``decaps(wire) -> K`` with 32-byte K.
 
-    K = HKDF(FrodoKEM shared secret). The FrodoKEM layer itself is
+    K = SHAKE256(KDF_DOMAIN || FrodoKEM shared secret), 32 bytes. The FrodoKEM layer itself is
     byte-identical to the reference implementation (tests/test_frodo_kat.py).
     """
 
@@ -360,7 +362,8 @@ class LWEKEM:
     # -- KEM -----------------------------------------------------------------
     @staticmethod
     def _kdf(ss: bytes) -> bytes:
-        return _derive_key_meteor(ss, b"meteor-nc-v3-shared-secret")
+        # SHAKE256 so the batch backend can compute it on the GPU as well.
+        return hashlib.shake_256(KDF_DOMAIN + ss).digest(32)
 
     def encaps(self, rng: Optional[Callable[[int], bytes]] = None) -> Tuple[bytes, bytes]:
         if self.pk is None:
