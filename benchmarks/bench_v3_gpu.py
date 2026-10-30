@@ -125,7 +125,7 @@ def bench(sizes, reps):
             te2, (_, wh) = timed(lambda: kem.encaps_batch(bs))
             td2, _ = timed(lambda: kem.decaps_batch(wh))
             print(f"{P.name:20s} {bs:7d}   {bs/te:12,.0f}   {bs/td:12,.0f}   {bs/te2:12,.0f}   {bs/td2:12,.0f}")
-        del kem
+        kem = None                      # release GPU caches before the next level
         cp.get_default_memory_pool().free_all_blocks()
 
 
