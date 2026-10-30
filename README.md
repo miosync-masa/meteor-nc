@@ -27,12 +27,23 @@
 > Sizes include a 12-byte Meteor header. Timings: single-threaded NumPy, cloud VM.
 >
 > **Batch (v3).** `BatchLWEKEM(n=...)` batches encaps/decaps on the GPU when
-> CuPy and a CUDA device are present: SHAKE runs in a CUDA kernel (one thread
-> per item) and the LWE products run on cuBLAS SGEMM, split so that float32
-> results are exact. CPU (NumPy, batch 256): 1,791 / 1,603 (L1),
-> 1,256 / 1,128 (L3), 841 / 766 (L5) encaps / decaps per second. GPU figures:
-> run `benchmarks/bench_v3_gpu.py`, which first checks the GPU path against
-> the KATs and the CPU implementation.
+> CuPy and a CUDA device are present: SHAKE, noise sampling and 15-bit packing
+> run in CUDA kernels, and the LWE products run on tensor cores (float16
+> inputs, float32 accumulation), split so that every result is exact. The
+> GPU path passes the official KATs and matches the CPU implementation
+> (`benchmarks/bench_v3_gpu.py` checks this before benchmarking).
+>
+> Measured on an A100-SXM4-80GB (Colab), batch 100,000, operations per second:
+>
+> | Level | encaps (GPU-resident) | decaps (GPU-resident) | encaps (to host, with K) | decaps (to host, with K) |
+> |---|---|---|---|---|
+> | L1 FrodoKEM-640 | 759,086 | 639,882 | 197,094 | 424,214 |
+> | L3 FrodoKEM-976 | 456,295 | 374,421 | 107,029 | 252,866 |
+> | L5 FrodoKEM-1344 | 331,049 | 272,258 | 60,390 | 184,092 |
+>
+> "GPU-resident" leaves the FrodoKEM shared secrets and wires on the GPU;
+> "to host" also derives K and copies K and the ~10-22 KB wires back.
+> CPU (NumPy, batch 256): about 1,800 / 1,600 (L1) encaps / decaps per second.
 
 ## Overview
 
