@@ -1,10 +1,14 @@
 """
 Meteor-NC v3 GPU check and benchmark (e.g. Colab A100).
 
-    !git clone https://github.com/miosync-masa/meteor-nc && cd meteor-nc
+    !git clone https://github.com/miosync-masa/meteor-nc
+    %cd /content/meteor-nc
     !git clone --depth 1 https://github.com/microsoft/PQCrypto-LWEKE /content/LWEKE
-    !pip install -q cupy-cuda12x pytest scipy cryptography
+    !pip install -q pytest scipy cryptography
     !python benchmarks/bench_v3_gpu.py --kat /content/LWEKE/FrodoKEM/KAT
+
+Colab ships a CuPy matching its CUDA (e.g. cupy-cuda13x); do not install a
+second cupy-cuda1Xx package next to it (mixed CuPy builds fail to load cuBLAS).
 
 1. Correctness on the GPU (aborts on any failure):
    - SHAKE kernel vs hashlib,
