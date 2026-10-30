@@ -108,6 +108,7 @@ def bench(sizes, reps):
         kem = BatchLWEKEM(n=n, backend="cupy")
         kem.key_gen()
         kem.encaps_batch(64)
+        print(f"  [{P.name}: matmul={kem._batch.matmul}, chunk={kem._batch.chunk}]")
         for bs in sizes:
             _, wd = kem.encaps_batch(bs, raw=True, device=True)
             kem.decaps_batch(wd, raw=True, device=True)

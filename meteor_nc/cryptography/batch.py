@@ -36,7 +36,7 @@ class BatchLWEKEM:
     """Batched v3 LWEKEM (FrodoKEM core), wire-compatible with ``LWEKEM``."""
 
     def __init__(self, n: int = 256, device_id: int = 0, backend: str = "auto",
-                 matmul: str = "f32split", **_ignored):
+                 matmul: str = "auto", **_ignored):
         self._kem = LWEKEM(n=n)                     # keys, wire format, single ops
         self.n = self._kem.n
         self.params = self._kem.params
