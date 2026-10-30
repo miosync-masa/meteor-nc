@@ -37,10 +37,12 @@ def test_batch_roundtrip_and_interop(backend, n):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize("matmul", ["f32split", "int64"])
+@pytest.mark.parametrize("matmul", ["auto", "f16tc", "f32split", "int64"])
 @pytest.mark.parametrize("n", LEVELS)
 def test_byte_exact_with_single(backend, matmul, n):
     """Fixed randomness: batch ct/ss equal the single implementation's."""
+    if matmul == "f16tc" and backend != "cupy":
+        pytest.skip("f16tc needs CuPy")
     lw = LWEKEM(n=n); pk, sk = lw.key_gen()
     P = lw.params
     single = FrodoKEM(P)

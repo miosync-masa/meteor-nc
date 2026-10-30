@@ -93,12 +93,14 @@ def test_kat(params):
         assert kem.decaps(sk, ct) == ss
 
 
-@pytest.mark.parametrize("matmul", ["f32split", "int64"])
+@pytest.mark.parametrize("matmul", ["auto", "f16tc", "f32split", "int64"])
 @pytest.mark.parametrize("params", [FRODO640, FRODO976, FRODO1344], ids=lambda p: p.name)
 def test_kat_batch_path(params, matmul):
     """Same KATs through BatchFrodoKEM (CuPy if a GPU is present, else NumPy)."""
     import numpy as np
-    from meteor_nc.cryptography.frodo_batch import BatchFrodoKEM
+    from meteor_nc.cryptography.frodo_batch import BatchFrodoKEM, CUPY_AVAILABLE
+    if matmul == "f16tc" and not CUPY_AVAILABLE:
+        pytest.skip("f16tc needs CuPy")
     d = _kat_dir()
     if d is None or not (d / KAT_FILES[params]).exists():
         pytest.skip("FrodoKEM KAT files not available (set FRODO_KAT_DIR)")

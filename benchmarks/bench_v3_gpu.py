@@ -66,7 +66,7 @@ def check_kats(kat_dir, count):
     from test_frodo_kat import NistDrbg, _read_kats
     for P in LEVELS:
         entries = _read_kats(Path(kat_dir) / KAT_FILES[P])[:count]
-        for mm in ("f32split", "int64"):
+        for mm in ("f16tc", "f32split", "int64"):
             bk = BatchFrodoKEM(P, backend="cupy", matmul=mm)
             for e in entries:
                 drbg = NistDrbg(bytes.fromhex(e["seed"]))
@@ -78,7 +78,7 @@ def check_kats(kat_dir, count):
                 assert ct[0].tobytes().hex().upper() == e["ct"], (P.name, mm, e["count"])
                 assert ss[0].tobytes().hex().upper() == e["ss"], (P.name, mm, e["count"])
                 assert bk.decaps_batch(sk, ct)[0].tobytes().hex().upper() == e["ss"]
-        print(f"[ok] {P.name}: {len(entries)} KATs byte-exact on GPU (f32split, int64)")
+        print(f"[ok] {P.name}: {len(entries)} KATs byte-exact on GPU (f16tc, f32split, int64)")
 
 
 def check_random():
@@ -86,6 +86,7 @@ def check_random():
         single = FrodoKEM(P)
         pk, sk = single.keygen()
         bk = BatchFrodoKEM(P, backend="cupy", chunk=100)
+        assert bk.matmul == "f16tc", f"auto matmul fell back to {bk.matmul}"
         ms = np.frombuffer(secrets.token_bytes(257 * (P.len_sec + P.len_salt)), np.uint8).reshape(257, -1)
         ct, ss = bk.encaps_batch(pk, ms)
         bad = ct.copy()
@@ -96,7 +97,7 @@ def check_random():
             c, s = single.encaps_from_seed(pk, ms[i].tobytes())
             assert ct[i].tobytes() == c and ss[i].tobytes() == s
             assert ssd[i].tobytes() == single.decaps(sk, bad[i].tobytes())
-        print(f"[ok] {P.name}: 257 random encaps/decaps (incl. tampered) == CPU single")
+        print(f"[ok] {P.name}: 257 random encaps/decaps (incl. tampered) == CPU single [{bk.matmul}]")
 
 
 def bench(sizes, reps):
@@ -161,7 +162,7 @@ def profile(bs):
             other = total - sum(acc.values())
             parts = ", ".join(f"{k.lstrip('_')} {v / total:5.1%}" for k, v in acc.most_common())
             print(f"{P.name} {op} batch {bs}: {total * 1e3:7.1f} ms | {parts}, "
-                  f"other {other / total:5.1%}  (chunk={bk.chunk})")
+                  f"other {other / total:5.1%}  (chunk={bk.chunk}, matmul={bk.matmul})")
         for name, f in orig.items():
             setattr(bk, name, f)
 
