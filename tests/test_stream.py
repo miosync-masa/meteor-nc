@@ -548,16 +548,9 @@ def test_s3_2_kem_integration() -> Dict:
         chunks.append(enc.encrypt_chunk(f"message {i}".encode()))
     
     # Bad path: tampered KEM CT
-    if hasattr(ct.u, 'get'):
-        ct_u = ct.u.get().copy()
-        ct_v = ct.v.get().copy()
-    else:
-        ct_u = ct.u.copy()
-        ct_v = ct.v.copy()
-    
-    ct_u[0] ^= 1
-    ct_bad = LWECiphertext(u=ct_u, v=ct_v)
-    K_bad = kem.decaps(ct_bad)
+    ct_bad = bytearray(ct)
+    ct_bad[20] ^= 1
+    K_bad = kem.decaps(bytes(ct_bad))
     
     # Different key → different session
     session_key_bad = _sha256(b"stream-session", K_bad)

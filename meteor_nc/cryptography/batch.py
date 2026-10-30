@@ -99,6 +99,20 @@ SUPPORTED_N = [256, 512, 1024]
 # =============================================================================
 
 @dataclass
+def _refuse_v2_batch() -> None:
+    """The GPU batch path still implements the v2 construction, which is
+    broken (a single scalar mask b.r shared by every message bit lets a
+    passive attacker recover the shared secret from pk + ct). It stays
+    importable for benchmarking history only."""
+    import os
+    if os.environ.get("METEOR_NC_ALLOW_INSECURE_V2_BATCH") != "1":
+        raise RuntimeError(
+            "BatchLWEKEM/BatchHybridKEM implement the insecure Meteor-NC v2 "
+            "construction and are disabled. A GPU port of the v3 FrodoKEM "
+            "core is pending. Set METEOR_NC_ALLOW_INSECURE_V2_BATCH=1 only "
+            "to reproduce old benchmarks.")
+
+
 class BatchCiphertext:
     """
     Hybrid ciphertext for batch operations.
@@ -297,6 +311,7 @@ class BatchLWEKEM:
         device_id: int = 0,
         use_compression: bool = True,  # v2.0: Default to compressed
     ):
+        _refuse_v2_batch()
         if n not in SUPPORTED_N:
             raise ValueError(f"BatchKEM supports n={SUPPORTED_N}")
         
@@ -783,6 +798,7 @@ class BatchHybridKEM:
         device_id: int = 0,
         use_compression: bool = True,  # v2.0: Default to compressed
     ):
+        _refuse_v2_batch()
         self.n = n
         self.device_id = device_id
         self.use_compression = use_compression and COMPRESSION_AVAILABLE

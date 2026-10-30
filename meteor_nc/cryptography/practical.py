@@ -84,8 +84,7 @@ class EncryptedMessage:
     """
     sender_id: bytes
     recipient_id: bytes
-    kem_u: np.ndarray
-    kem_v: np.ndarray
+    kem_wire: bytes
     stream_ciphertext: bytes
     stream_tag: bytes
     stream_id: bytes
@@ -99,8 +98,7 @@ class EncryptedMessage:
         return {
             'sender_id': self.sender_id.hex(),
             'recipient_id': self.recipient_id.hex(),
-            'kem_u': self.kem_u.tolist(),
-            'kem_v': self.kem_v.tolist(),
+            'kem_wire_b64': base64.b64encode(self.kem_wire).decode('ascii'),
             'ciphertext_b64': base64.b64encode(self.stream_ciphertext).decode('ascii'),
             'tag_b64': base64.b64encode(self.stream_tag).decode('ascii'),
             'stream_id_b64': base64.b64encode(self.stream_id).decode('ascii'),
@@ -120,8 +118,7 @@ class EncryptedMessage:
         return cls(
             sender_id=bytes.fromhex(data['sender_id']),
             recipient_id=bytes.fromhex(data['recipient_id']),
-            kem_u=np.array(data['kem_u'], dtype=np.int64),
-            kem_v=np.array(data['kem_v'], dtype=np.int64),
+            kem_wire=base64.b64decode(data['kem_wire_b64']),
             stream_ciphertext=base64.b64decode(data['ciphertext_b64']),
             stream_tag=base64.b64decode(data['tag_b64']),
             stream_id=base64.b64decode(data['stream_id_b64']),
@@ -326,8 +323,7 @@ class MeteorPractical:
         return EncryptedMessage(
             sender_id=self.meteor_id,
             recipient_id=recipient.meteor_id,
-            kem_u=kem_ct.u,
-            kem_v=kem_ct.v,
+            kem_wire=kem_ct,
             stream_ciphertext=chunk.ciphertext,
             stream_tag=chunk.tag,
             stream_id=stream_id,
@@ -374,11 +370,7 @@ class MeteorPractical:
         
         # 1. KEM decapsulation with OWN secret key
         #    Recover the shared secret K
-        kem_ct = LWECiphertext(
-            u=message.kem_u,
-            v=message.kem_v,
-        )
-        K = self._kem.decaps(kem_ct)
+        K = self._kem.decaps(message.kem_wire)
         
         # 2. Derive session key from K
         session_key = _sha256(b"session", K)

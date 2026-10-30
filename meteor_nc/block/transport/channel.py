@@ -237,12 +237,11 @@ class SecureChannel:
         pk_bytes, sk_bytes = kem.key_gen()
         
         # Extract pk_seed and compute b_hash
-        # pk_bytes format: header(12) + pk_seed(32) + b(k*4) + pk_hash(32)
-        pk_seed = pk_bytes[12:44]
-        pk_hash = pk_bytes[-32:]
+        pk_seed = kem.pk.pk_seed
+        pk_hash = kem.pk.pk_hash
         
         # Compute b_hash from the b portion
-        b_bytes = pk_bytes[44:-32]
+        b_bytes = kem.pk.b_bytes
         b_hash = _sha256(b"b_hash", b_bytes)
         
         # key_id = H(pk_seed || b_hash)

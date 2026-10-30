@@ -58,14 +58,15 @@ from .core import (
 # Batch KEM (GPU required)
 try:
     from .batch import BatchLWEKEM, BatchHybridKEM, BatchCiphertext
-    BATCH_AVAILABLE = True
+    # v2 GPU batch path is insecure and disabled (see SECURITY.md)
+    BATCH_AVAILABLE = False
 except ImportError:
     BATCH_AVAILABLE = False
 
 # Batch Multi-Level (n=256/512/1024)
 try:
     from .kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
-    BATCH_MULTILEVEL_AVAILABLE = BATCH_V2_AVAILABLE and BLAKE3_V2_AVAILABLE
+    BATCH_MULTILEVEL_AVAILABLE = False  # v2 batch disabled (see SECURITY.md)
 except ImportError:
     BATCH_MULTILEVEL_AVAILABLE = False
 

@@ -40,13 +40,13 @@ Architecture:
     │      └── adapters/     # MetaMask, WalletConnect       │
     └─────────────────────────────────────────────────────────┘
 
-v2.0 Compression:
-    - Wire-based FO transform (canonical form for verification)
-    - Ciphertext sizes: 518B (n=256), 1094B (n=512), 2310B (n=1024)
-    - ~75% bandwidth reduction vs uncompressed
+v3.0 Core (see SECURITY.md):
+    - KEM core is FrodoKEM-640/976/1344-SHAKE (v2 construction was broken)
+    - Ciphertext sizes: 9764B (n=256), 15804B (n=512), 21708B (n=1024)
+    - GPU batch backend (v2) disabled pending a v3 port
 """
 
-__version__ = "2.2.0"
+__version__ = "3.0.0"
 
 # =============================================================================
 # Core Cryptography (CPU/GPU optional)
@@ -94,7 +94,8 @@ except ImportError:
 BATCH_AVAILABLE = False
 try:
     from .cryptography.batch import BatchLWEKEM, BatchHybridKEM, BatchCiphertext
-    BATCH_AVAILABLE = True
+    # v2 GPU batch path is insecure and disabled (see SECURITY.md)
+    BATCH_AVAILABLE = False
 except ImportError:
     pass
 
@@ -102,7 +103,7 @@ except ImportError:
 BATCH_MULTILEVEL_AVAILABLE = False
 try:
     from .cryptography.kernels import BATCH_V2_AVAILABLE, BLAKE3_V2_AVAILABLE
-    BATCH_MULTILEVEL_AVAILABLE = BATCH_V2_AVAILABLE and BLAKE3_V2_AVAILABLE
+    BATCH_MULTILEVEL_AVAILABLE = False  # v2 batch disabled (see SECURITY.md)
 except ImportError:
     pass
 

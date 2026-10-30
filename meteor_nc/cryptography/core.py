@@ -1,36 +1,26 @@
 # meteor_nc/cryptography/core.py
 """
-Meteor-NC Core Components
+Meteor-NC Core Components (v3)
 
-Single-message LWE-KEM with Fujisaki-Okamoto transform and hybrid encryption.
-CPU-friendly implementation (GPU optional for acceleration).
+LWEKEM: IND-CCA2 KEM whose core is FrodoKEM-640/976/1344-SHAKE
+(meteor_nc/cryptography/frodo.py, byte-exact with the official KATs),
+plus HybridKEM (KEM-DEM with a Feistel mixer and AES-GCM).
 
-v2.0 Changes:
-  - Wire-based FO transform: compress → compare wire, not raw (u,v)
-  - Compressed ciphertext as canonical form for transmission
-  - Backward compatible: uncompressed methods still available
+v3 replaces the v2 construction, which was broken: v2 hid all message bits
+under one shared scalar mask, allowing passive key recovery from (pk, ct).
+See SECURITY.md.
 
-Key Structure:
-  - Public Key: pk_seed (32B) + b (k×4B as uint32) + metadata
-  - Secret Key: s (n×8B as int64, internal only)
-  - Matrix A is reconstructed from pk_seed via SHA-256 counter-mode PRG
+Wire formats (all with a 12-byte big-endian header: version=3, level, frodo_n):
+  - Public key : header + FrodoKEM pk  (seedA || packed B)
+  - Secret key : header + FrodoKEM sk  (s || pk || S^T || pkh)
+  - Ciphertext : header + FrodoKEM ct  (c1 || c2 || salt)
 
-Wire Format Specification:
-  - Header fields: big-endian (">I", ">II", ">III")
-  - Coefficient arrays (b, u, v): little-endian uint32 ("<u4")
-  
-Compressed Ciphertext Sizes (v2.0):
-  - n=256:  518 bytes (vs 2056 uncompressed, -75%)
-  - n=512:  1094 bytes (vs 4104 uncompressed, -73%)
-  - n=1024: 2310 bytes (vs 8200 uncompressed, -72%)
+Levels (legacy selector n -> FrodoKEM):
+  - n=256  -> FrodoKEM-640  (NIST L1): PK 9628 B, CT 9764 B
+  - n=512  -> FrodoKEM-976  (NIST L3): PK 15644 B, CT 15804 B
+  - n=1024 -> FrodoKEM-1344 (NIST L5): PK 21532 B, CT 21708 B
 
-Supports multiple security levels:
-  - 128-bit (n=256): PK ~1.1KB, CT 518B
-  - 192-bit (n=512): PK ~2.1KB, CT 1094B
-  - 256-bit (n=1024): PK ~4.2KB, CT 2310B
-
-Updated: 2025-01-18
-Version: 2.0 - Wire-based FO transform with compression
+Shared secret: K = HKDF(FrodoKEM ss), 32 bytes.
 """
 
 
@@ -45,6 +35,8 @@ import numpy as np
 # =============================================================================
 # Import from common.py
 # =============================================================================
+
+from .frodo import FrodoKEM, FrodoParams, PARAMS_BY_LEVEL
 
 from .common import (
     # Constants
@@ -214,465 +206,182 @@ class SymmetricMixer:
 
 
 # =============================================================================
-# LWE-KEM with Fujisaki-Okamoto Transform (Wire-Based FO v2.0)
+# LWE-KEM (v3: FrodoKEM core)
 # =============================================================================
+
+# Legacy selector values (v2 "n") and FrodoKEM dimensions both map to a level.
+_LEVEL_FOR_N = {256: 1, 640: 1, 512: 3, 976: 3, 1024: 5, 1344: 5}
+
+_WIRE_VERSION = 3
+_HDR = struct.Struct(">III")          # version, nist_level, frodo_n
+
+
+def _params_for_n(n: int) -> FrodoParams:
+    try:
+        return PARAMS_BY_LEVEL[_LEVEL_FOR_N[int(n)]]
+    except KeyError:
+        raise ValueError(
+            f"Unsupported n={n}; use 256/512/1024 (legacy selectors) "
+            f"or 640/976/1344 (FrodoKEM dimensions)") from None
+
+
+class _PublicKeyView:
+    """Read-only view kept for callers that used kem.pk.* in v2."""
+
+    def __init__(self, params: FrodoParams, frodo_pk: bytes):
+        self.params = params
+        self.frodo_pk = frodo_pk
+        self.n = params.n
+        self.nbar = params.nbar
+        self.q = params.q
+        self.seedA = frodo_pk[:params.len_seedA]
+        # 32-byte field for the v2-era 64B blob (pk_seed || b_hash);
+        # zero padding keeps the blob an injective commitment to pk.
+        self.pk_seed = self.seedA.ljust(32, b"\x00")
+        self.b_bytes = frodo_pk[params.len_seedA:]
+        self.pk_hash = _sha256(b"pk_hash", frodo_pk)
+
 
 class LWEKEM:
     """
-    LWE-based Key Encapsulation Mechanism with FO transform.
-    
-    v2.0: Wire-Based FO Transform
-    =============================
-    FO verification now uses compressed wire format as canonical form:
-    
-      encaps():
-        1. Generate random message m
-        2. Encrypt: (u, v) = Enc(m)
-        3. Compress: wire = compress(u, v)  ← CANONICAL FORM
-        4. Derive: K = HKDF(m || H(wire))
-        5. Return: (K, wire)
-      
-      decaps(wire):
-        1. Decompress: (u, v) = decompress(wire)
-        2. Decrypt: m' = Dec(u, v)
-        3. Re-encrypt: (u', v') = Enc(m')
-        4. Re-compress: wire' = compress(u', v')
-        5. Compare: wire == wire' ?  ← WIRE COMPARISON
-        6. If match: K = HKDF(m' || H(wire))
-           Else: K = HKDF(z || H(wire))  (implicit rejection)
-    
-    This design ensures:
-      - Lossy compression doesn't break FO verification
-      - Wire format is self-describing and portable
-      - ~75% bandwidth reduction vs uncompressed
-    
-    CORRECT KEY STRUCTURE:
-      - pk_seed (32B): Public, used to reconstruct matrix A via SHA-256 PRG
-      - b (k×4B as uint32): Public, computed as A @ s + e mod q during key_gen
-      - s: SECRET, generated from TRUE RANDOMNESS (not from seed!)
-    
-    Supports multiple security levels:
-        - n=256:  128-bit security (NIST Level 1), CT 518B
-        - n=512:  192-bit security (NIST Level 3), CT 1094B
-        - n=1024: 256-bit security (NIST Level 5), CT 2310B
+    IND-CCA2 KEM from plain (unstructured) LWE: FrodoKEM-SHAKE.
+
+    v3 replaces the v2 construction, which was insecure (one scalar mask
+    shared by all message bits -> passive key recovery; see SECURITY.md).
+
+    API is kept compatible with v2:
+      * ``n`` selects the level: 256 -> FrodoKEM-640 (NIST L1),
+        512 -> FrodoKEM-976 (L3), 1024 -> FrodoKEM-1344 (L5).
+        640/976/1344 are accepted too.
+      * ``k``, ``q``, ``eta`` and ``use_compression`` are accepted and
+        ignored: FrodoKEM fixes them and its ciphertext is already packed.
+      * ``gpu`` is accepted; this core runs on CPU (NumPy).
+      * ``key_gen() -> (pk_bytes, sk_bytes)``,
+        ``encaps() -> (K, wire)``, ``decaps(wire) -> K`` with 32-byte K.
+
+    K = HKDF(FrodoKEM shared secret). The FrodoKEM layer itself is
+    byte-identical to the reference implementation (tests/test_frodo_kat.py).
     """
-    
+
     def __init__(
         self,
         n: int = 256,
         k: Optional[int] = None,
-        q: int = Q_DEFAULT,
-        eta: int = 2,
-        gpu: bool = True,
+        q: Optional[int] = None,
+        eta: Optional[int] = None,
+        gpu: bool = False,
         device_id: int = 0,
         seed: Optional[bytes] = None,
-        use_compression: bool = True,  # v2.0: Enable compression by default
+        use_compression: bool = True,
     ):
-        """
-        Initialize LWE-KEM.
-        
-        Args:
-            n: Dimension (256, 512, or 1024)
-            k: Number of samples (default: n)
-            q: Modulus (default: 2^32 - 5)
-            eta: Error distribution parameter
-            gpu: Use GPU acceleration
-            device_id: GPU device ID
-            seed: Optional master seed for deterministic key generation.
-            use_compression: Use compressed wire format (default: True)
-        """
-        self.n = int(n)
-        self.k = int(k if k is not None else n)
-        self.q = int(q)
-        self.eta = int(eta)
-        self.seed = seed
-        self.use_compression = bool(use_compression)
-        
-        # Dynamic message size based on n
-        self.msg_bits = self.n
-        self.msg_bytes = self.n // 8
-        
-        self.gpu = bool(gpu and GPU_AVAILABLE)
+        self.params = _params_for_n(n)
+        self.level = self.params.nist_level
+        self.n = int(n)                    # selector as given by caller
+        self.q = self.params.q
+        self.gpu = False
         self.device_id = int(device_id)
-        
-        if self.gpu:
-            cp.cuda.Device(self.device_id).use()
-            self.xp = cp
-        else:
-            self.xp = np
-        
-        self._cbd = CenteredBinomial(eta=self.eta, xp=self.xp)
-        
-        self.pk: Optional[LWEPublicKey] = None
-        self.sk: Optional[LWESecretKey] = None
-        
-        self.delta = self.q // 2
-        
-        # Cache for reconstructed A matrix
-        self._A_cache: Optional[Any] = None
-        self._A_cache_seed: Optional[bytes] = None
-    
-    def _mod_q(self, x: Any) -> Any:
-        return x % self.q
-    
-    def _to_xp(self, x: Any) -> Any:
-        if self.gpu:
-            return cp.asarray(x, dtype=cp.int64)
-        return np.asarray(x, dtype=np.int64)
-    
-    def _to_numpy(self, x: Any) -> np.ndarray:
-        if self.gpu:
-            return cp.asnumpy(x)
-        return np.asarray(x)
-    
-    def _reconstruct_A(self, pk_seed: bytes) -> Any:
-        """Reconstruct matrix A from pk_seed using deterministic expansion."""
-        if self._A_cache is not None and self._A_cache_seed == pk_seed:
-            return self._A_cache
-        
-        num_elements = self.k * self.n
-        num_bytes = num_elements * 4
-        
-        prg_output = prg_sha256(pk_seed, num_bytes, domain=b"matrix_A")
-        
-        raw = np.frombuffer(prg_output, dtype="<u4").copy()
-        A_flat = (raw.astype(np.int64) % self.q)
-        A = A_flat.reshape(self.k, self.n)
-        
-        if self.gpu:
-            A = cp.asarray(A)
-        
-        self._A_cache = A
-        self._A_cache_seed = pk_seed
-        
-        return A
-    
-    def key_gen(self) -> Tuple[bytes, bytes]:
-        """
-        Generate LWE key pair.
-        
-        Returns:
-            Tuple of (public_key_bytes, secret_key_bytes) for storage
-        """
-        if self.seed is not None:
-            hkdf = HKDF(salt=_sha256(b"meteor-nc-auth-v2"))
-            prk = hkdf.extract(self.seed)
-            
-            pk_seed = hkdf.expand(prk, b"pk_seed", 32)
-            
-            s_bytes = hkdf.expand(prk, b"secret_s", self.n * 4)
-            s_raw = np.frombuffer(s_bytes, dtype="<u4").copy()
-            s_np = ((s_raw % (2 * self.eta + 1)).astype(np.int64) - self.eta)
-            
-            e_bytes = hkdf.expand(prk, b"error_e", self.k * 4)
-            e_raw = np.frombuffer(e_bytes, dtype="<u4").copy()
-            e_np = ((e_raw % (2 * self.eta + 1)).astype(np.int64) - self.eta)
-            
-            z = hkdf.expand(prk, b"implicit_z", 32)
-            
-            if self.gpu:
-                s = cp.asarray(s_np)
-                e = cp.asarray(e_np)
-            else:
-                s = s_np
-                e = e_np
-        else:
-            pk_seed = secrets.token_bytes(32)
-            
-            if self.gpu:
-                s_np = np.array([
-                    secrets.randbelow(2 * self.eta + 1) - self.eta 
-                    for _ in range(self.n)
-                ], dtype=np.int64)
-                e_np = np.array([
-                    secrets.randbelow(2 * self.eta + 1) - self.eta 
-                    for _ in range(self.k)
-                ], dtype=np.int64)
-                s = cp.asarray(s_np)
-                e = cp.asarray(e_np)
-            else:
-                s_np = np.array([
-                    secrets.randbelow(2 * self.eta + 1) - self.eta 
-                    for _ in range(self.n)
-                ], dtype=np.int64)
-                e_np = np.array([
-                    secrets.randbelow(2 * self.eta + 1) - self.eta 
-                    for _ in range(self.k)
-                ], dtype=np.int64)
-                s = s_np
-                e = e_np
-            
-            z = secrets.token_bytes(32)
-        
-        A = self._reconstruct_A(pk_seed)
-        
-        b = self._mod_q(A @ s + e)
-        
-        b_np = self._to_numpy(b)
-        b_bytes_for_hash = b_np.astype("<u4").tobytes()
-        pk_bytes_for_hash = pk_seed + b_bytes_for_hash
-        pk_hash = _sha256(b"pk_hash", pk_bytes_for_hash)
-        
-        self.pk = LWEPublicKey(
-            pk_seed=pk_seed,
-            b=b_np,
-            pk_hash=pk_hash,
-            n=self.n,
-            k=self.k,
-            q=self.q,
-        )
-        self.sk = LWESecretKey(s=self._to_numpy(s), z=z)
-        
-        return self.pk.to_bytes(), self._export_secret_key()
-    
-    def _export_secret_key(self) -> bytes:
-        """Serialize secret key to bytes."""
-        if self.sk is None:
-            raise ValueError("Secret key not initialized")
-        return self.sk.s.astype(np.int64).tobytes() + self.sk.z
-    
-    def _import_secret_key(self, data: bytes) -> None:
-        """Deserialize secret key from bytes."""
-        s_bytes = data[:-32]
-        z = data[-32:]
-        s = np.frombuffer(s_bytes, dtype=np.int64).copy()
-        self.sk = LWESecretKey(s=s, z=z)
-    
-    def load_public_key(self, pk_bytes: bytes) -> None:
-        """Load public key from serialized bytes."""
-        self.pk = LWEPublicKey.from_bytes(pk_bytes)
-        self.sk = None
-        
-        self.n = self.pk.n
-        self.k = self.pk.k
-        self.q = self.pk.q
-        self.msg_bits = self.n
-        self.msg_bytes = self.n // 8
-    
-    def load_secret_key(self, sk_bytes: bytes) -> None:
-        """Load secret key from serialized bytes."""
-        self._import_secret_key(sk_bytes)
-    
-    def get_public_key_bytes(self) -> bytes:
-        """Get serialized public key for transmission."""
-        if self.pk is None:
-            raise ValueError("Public key not initialized")
-        return self.pk.to_bytes()
-    
-    def get_public_key_size(self) -> int:
-        """Get public key size in bytes."""
-        return 12 + 32 + self.k * 4 + 32
-    
-    @staticmethod
-    def _bytes_to_bits(data: bytes) -> np.ndarray:
-        bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
-        return bits.astype(np.int64)
-    
-    @staticmethod
-    def _bits_to_bytes(bits: np.ndarray) -> bytes:
-        return np.packbits(np.asarray(bits, dtype=np.uint8)).tobytes()
-    
-    def _encode_message(self, m: bytes) -> Any:
-        """Encode message bytes to LWE-compatible vector."""
-        if len(m) != self.msg_bytes:
-            raise ValueError(f"Message must be {self.msg_bytes} bytes")
-        bits = self._bytes_to_bits(m)
-        return self._to_xp(bits) * int(self.delta)
-    
-    def _decode_message(self, v_dec: Any) -> bytes:
-        """Decode LWE decryption result to message bytes."""
-        xp = self.xp
-        half_q = self.q // 2
-        v_centered = xp.where(v_dec > half_q, v_dec - self.q, v_dec)
-        threshold = self.q // 4
-        bits = (xp.abs(v_centered) > threshold).astype(xp.int64)
-        return self._bits_to_bytes(self._to_numpy(bits).astype(np.uint8))
-    
-    def _encrypt_internal(self, m_encoded: Any, rbytes: bytes) -> Tuple[Any, Any]:
-        """Internal encryption with deterministic randomness."""
-        xp = self.xp
-        
-        seed_r = _sha256(b"r", rbytes)
-        seed_e1 = _sha256(b"e1", rbytes)
-        seed_e2 = _sha256(b"e2", rbytes)
-        
-        r_np = small_error_from_seed(seed_r, self.k)
-        e1_np = small_error_from_seed(seed_e1, self.n)
-        e2_np = small_error_from_seed(seed_e2, self.msg_bits)
-        
-        A = self._reconstruct_A(self.pk.pk_seed)
-        b = self._to_xp(self.pk.b)
-        
-        if self.gpu:
-            r = xp.asarray(r_np)
-            e1 = xp.asarray(e1_np)
-            e2 = xp.asarray(e2_np)
-        else:
-            r, e1, e2 = r_np, e1_np, e2_np
-        
-        u = (A.T @ r + e1) % self.q
-        v = (b @ r + e2 + m_encoded) % self.q
-        
-        return u, v
-    
-    def _decrypt_internal(self, u: Any, v: Any) -> Any:
-        """Internal LWE decryption."""
-        if self.sk is None:
-            raise ValueError("Secret key not initialized")
-        
-        s = self._to_xp(self.sk.s)
-        s_dot_u = s @ u
-        return self._mod_q(v - s_dot_u)
-    
-    def encaps(
-        self,
-        rng: Optional[Callable[[int], bytes]] = None,
-    ) -> Tuple[bytes, bytes]:
-        """
-        KEM encapsulation (encryption).
-        
-        v2.0: Returns compressed wire format as canonical ciphertext.
-        
-        Returns:
-            K: Shared secret (32 bytes)
-            wire: Compressed ciphertext (canonical form for FO)
-        """
-        if self.pk is None:
-            raise ValueError("Public key not initialized")
-        
-        rng = rng or secrets.token_bytes
-        m = rng(self.msg_bytes)
-        r = _sha256(b"random", m, self.pk.pk_hash)
-        
-        m_encoded = self._encode_message(m)
-        u, v = self._encrypt_internal(m_encoded, r)
-        
-        u_np = self._to_numpy(u).astype(np.int64)
-        v_np = self._to_numpy(v).astype(np.int64)
-        
-        ct = LWECiphertext(u=u_np, v=v_np)
-        
-        # v2.0: Use compressed wire as canonical form
-        if self.use_compression:
-            wire = ct.to_bytes_compressed(self.q)
-        else:
-            wire = ct.to_bytes()
-        
-        # KDF input uses wire hash
-        wire_hash = _sha256(b"ct_hash", wire)
-        K = _derive_key_meteor(m + wire_hash, b"meteor-nc-shared-secret")
-        
-        return K, wire
-    
-    def decaps(self, wire: bytes) -> bytes:
-        """
-        KEM decapsulation (decryption).
-        
-        v2.0: Wire-based FO verification.
-        
-        Args:
-            wire: Compressed (or uncompressed) ciphertext
-        
-        Returns:
-            K: Shared secret (32 bytes)
-        """
-        if self.pk is None or self.sk is None:
-            raise ValueError("Keys not initialized (need both pk and sk for decaps)")
-        
-        # Decompress ciphertext
-        if self.use_compression:
-            ct = LWECiphertext.from_bytes_compressed(wire, self.q)
-        else:
-            ct = LWECiphertext.from_bytes(wire)
-        
-        u = self._to_xp(ct.u)
-        v = self._to_xp(ct.v)
-        
-        # Decrypt
-        v_dec = self._decrypt_internal(u, v)
-        m_prime = self._decode_message(v_dec)
-        
-        # Re-encrypt
-        r_prime = _sha256(b"random", m_prime, self.pk.pk_hash)
-        m_prime_encoded = self._encode_message(m_prime)
-        u2, v2 = self._encrypt_internal(m_prime_encoded, r_prime)
-        
-        u2_np = self._to_numpy(u2).astype(np.int64)
-        v2_np = self._to_numpy(v2).astype(np.int64)
-        ct2 = LWECiphertext(u=u2_np, v=v2_np)
-        
-        # v2.0: Re-compress and compare WIRE (not raw u,v)
-        if self.use_compression:
-            wire2 = ct2.to_bytes_compressed(self.q)
-        else:
-            wire2 = ct2.to_bytes()
-        
-        # FO verification: compare wire formats
-        ok = _ct_eq(wire, wire2)
-        
-        # Derive shared key
-        wire_hash = _sha256(b"ct_hash", wire)
-        K_good = _derive_key_meteor(m_prime + wire_hash, b"meteor-nc-shared-secret")
-        K_fail = _derive_key_meteor(self.sk.z + wire_hash, b"meteor-nc-implicit-reject")
-        
-        return K_good if ok == 1 else K_fail
-    
-    # --- Legacy methods for backward compatibility ---
-    
-    def encaps_uncompressed(
-        self,
-        rng: Optional[Callable[[int], bytes]] = None,
-    ) -> Tuple[bytes, LWECiphertext]:
-        """Legacy encaps returning LWECiphertext object."""
-        if self.pk is None:
-            raise ValueError("Public key not initialized")
-        
-        rng = rng or secrets.token_bytes
-        m = rng(self.msg_bytes)
-        r = _sha256(b"random", m, self.pk.pk_hash)
-        
-        m_encoded = self._encode_message(m)
-        u, v = self._encrypt_internal(m_encoded, r)
-        
-        u_np = self._to_numpy(u).astype(np.int64)
-        v_np = self._to_numpy(v).astype(np.int64)
-        
-        ct = LWECiphertext(u=u_np, v=v_np)
-        
-        ct_wire = ct.to_bytes()
-        K = _derive_key_meteor(m + ct_wire, b"meteor-nc-shared-secret")
-        
-        return K, ct
-    
-    def decaps_uncompressed(self, ct: LWECiphertext) -> bytes:
-        """Legacy decaps taking LWECiphertext object."""
-        if self.pk is None or self.sk is None:
-            raise ValueError("Keys not initialized")
-        
-        u = self._to_xp(ct.u)
-        v = self._to_xp(ct.v)
-        
-        v_dec = self._decrypt_internal(u, v)
-        m_prime = self._decode_message(v_dec)
-        
-        r_prime = _sha256(b"random", m_prime, self.pk.pk_hash)
-        m_prime_encoded = self._encode_message(m_prime)
-        u2, v2 = self._encrypt_internal(m_prime_encoded, r_prime)
-        
-        u2_np = self._to_numpy(u2).astype(np.int64)
-        v2_np = self._to_numpy(v2).astype(np.int64)
-        ct2 = LWECiphertext(u=u2_np, v=v2_np)
-        
-        ct_wire = ct.to_bytes()
-        ct2_wire = ct2.to_bytes()
-        
-        ok = _ct_eq(ct_wire, ct2_wire)
-        
-        K_good = _derive_key_meteor(m_prime + ct_wire, b"meteor-nc-shared-secret")
-        K_fail = _derive_key_meteor(self.sk.z + ct_wire, b"meteor-nc-implicit-reject")
-        
-        return K_good if ok == 1 else K_fail
+        self.use_compression = bool(use_compression)
+        self.seed = seed
+        self.msg_bytes = self.params.len_sec
+        self.msg_bits = 8 * self.msg_bytes
+        self._frodo = FrodoKEM(self.params)
+        self.pk: Optional[_PublicKeyView] = None
+        self._sk: Optional[bytes] = None
 
+    # -- serialization -------------------------------------------------------
+    def _wrap(self, body: bytes) -> bytes:
+        return _HDR.pack(_WIRE_VERSION, self.level, self.params.n) + body
+
+    def _unwrap(self, data: bytes, expected_len: int, what: str) -> bytes:
+        if len(data) < _HDR.size:
+            raise ValueError(f"{what} too short")
+        ver, level, fn = _HDR.unpack(data[:_HDR.size])
+        if ver != _WIRE_VERSION:
+            raise ValueError(
+                f"{what}: unsupported format (version field {ver}); "
+                f"Meteor-NC v2 keys are insecure and not accepted")
+        if level != self.level or fn != self.params.n:
+            raise ValueError(f"{what}: level mismatch ({fn} vs {self.params.n})")
+        body = data[_HDR.size:]
+        if len(body) != expected_len:
+            raise ValueError(f"{what}: wrong length")
+        return body
+
+    # -- keys ----------------------------------------------------------------
+    def key_gen(self) -> Tuple[bytes, bytes]:
+        p = self.params
+        nrand = p.len_sec + p.len_seedSE + p.len_z
+        if self.seed is not None:
+            hk = HKDF(salt=_sha256(b"meteor-nc-v3-keygen"))
+            rnd = hk.expand(hk.extract(self.seed), b"frodo-keygen", nrand)
+        else:
+            rnd = secrets.token_bytes(nrand)
+        pk, sk = self._frodo.keygen_from_seed(rnd)
+        self.pk = _PublicKeyView(p, pk)
+        self._sk = sk
+        return self._wrap(pk), self._wrap(sk)
+
+    def load_public_key(self, pk_bytes: bytes) -> None:
+        if len(pk_bytes) >= _HDR.size:
+            _, level, fn = _HDR.unpack(pk_bytes[:_HDR.size])
+            if fn in _LEVEL_FOR_N and _params_for_n(fn) is not self.params:
+                self.__init__(n=fn, device_id=self.device_id,
+                              use_compression=self.use_compression)
+        body = self._unwrap(pk_bytes, self.params.pk_bytes, "public key")
+        self.pk = _PublicKeyView(self.params, body)
+        self._sk = None
+
+    def load_secret_key(self, sk_bytes: bytes) -> None:
+        body = self._unwrap(sk_bytes, self.params.sk_bytes, "secret key")
+        embedded_pk = body[self.params.len_sec:self.params.len_sec + self.params.pk_bytes]
+        if self.pk is not None and self.pk.frodo_pk != embedded_pk:
+            raise ValueError("secret key does not match loaded public key")
+        self.pk = _PublicKeyView(self.params, embedded_pk)
+        self._sk = body
+
+    def _import_secret_key(self, data: bytes) -> None:
+        self.load_secret_key(data)
+
+    @property
+    def sk(self):
+        return self._sk
+
+    def get_public_key_bytes(self) -> bytes:
+        if self.pk is None:
+            raise ValueError("Public key not initialized")
+        return self._wrap(self.pk.frodo_pk)
+
+    def get_public_key_size(self) -> int:
+        return _HDR.size + self.params.pk_bytes
+
+    def get_ciphertext_size(self) -> int:
+        return _HDR.size + self.params.ct_bytes
+
+    # -- KEM -----------------------------------------------------------------
+    @staticmethod
+    def _kdf(ss: bytes) -> bytes:
+        return _derive_key_meteor(ss, b"meteor-nc-v3-shared-secret")
+
+    def encaps(self, rng: Optional[Callable[[int], bytes]] = None) -> Tuple[bytes, bytes]:
+        if self.pk is None:
+            raise ValueError("Public key not initialized")
+        p = self.params
+        rnd = (rng or secrets.token_bytes)(p.len_sec + p.len_salt)
+        ct, ss = self._frodo.encaps_from_seed(self.pk.frodo_pk, rnd)
+        return self._kdf(ss), self._wrap(ct)
+
+    def decaps(self, wire: bytes) -> bytes:
+        if self.pk is None or self._sk is None:
+            raise ValueError("Keys not initialized (need both pk and sk for decaps)")
+        ct = self._unwrap(bytes(wire), self.params.ct_bytes, "ciphertext")
+        return self._kdf(self._frodo.decaps(self._sk, ct))
+
+    # v2 names kept as aliases; the wire is the only ciphertext form in v3.
+    def encaps_uncompressed(self, rng=None):
+        return self.encaps(rng)
+
+    def decaps_uncompressed(self, wire: bytes) -> bytes:
+        return self.decaps(wire)
 
 # =============================================================================
 # Hybrid Cryptosystem

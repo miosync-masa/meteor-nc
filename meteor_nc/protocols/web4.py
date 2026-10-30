@@ -410,8 +410,7 @@ class Web4Message:
     timestamp: float
     
     # KEM ciphertext (for direct messages)
-    kem_u: Optional[np.ndarray] = None
-    kem_v: Optional[np.ndarray] = None
+    kem_wire: Optional[bytes] = None
     
     # Encrypted payload
     encrypted_payload: Optional[bytes] = None
@@ -440,8 +439,7 @@ class Web4Message:
             'sender_id': self.sender_id.hex(),
             'recipient_id': self.recipient_id.hex(),
             'timestamp': self.timestamp,
-            'kem_u': self.kem_u.tolist() if self.kem_u is not None else None,
-            'kem_v': self.kem_v.tolist() if self.kem_v is not None else None,
+            'kem_wire': base64.b64encode(self.kem_wire).decode() if self.kem_wire else None,
             'encrypted_payload': base64.b64encode(self.encrypted_payload).decode() if self.encrypted_payload else None,
             'tag': base64.b64encode(self.tag).decode() if self.tag else None,
             'nonce': self.nonce.hex() if self.nonce else None,
@@ -467,8 +465,7 @@ class Web4Message:
             sender_id=bytes.fromhex(obj['sender_id']),
             recipient_id=bytes.fromhex(obj['recipient_id']),
             timestamp=obj['timestamp'],
-            kem_u=np.array(obj['kem_u'], dtype=np.int64) if obj.get('kem_u') else None,
-            kem_v=np.array(obj['kem_v'], dtype=np.int64) if obj.get('kem_v') else None,
+            kem_wire=base64.b64decode(obj['kem_wire']) if obj.get('kem_wire') else None,
             encrypted_payload=base64.b64decode(obj['encrypted_payload']) if obj.get('encrypted_payload') else None,
             tag=base64.b64decode(obj['tag']) if obj.get('tag') else None,
             nonce=bytes.fromhex(obj['nonce']) if obj.get('nonce') else None,
@@ -1129,8 +1126,7 @@ class MeteorWeb4Node:
             sender_id=self.meteor_id,
             recipient_id=peer['meteor_id'],
             timestamp=time.time(),
-            kem_u=kem_ct.u,
-            kem_v=kem_ct.v,
+            kem_wire=kem_ct,
             encrypted_payload=chunk.ciphertext,
             tag=chunk.tag,
             nonce=nonce,
@@ -1175,8 +1171,7 @@ class MeteorWeb4Node:
                 return
             
             # KEM decapsulation
-            kem_ct = LWECiphertext(u=msg.kem_u, v=msg.kem_v)
-            K = self._kem.decaps(kem_ct)
+            K = self._kem.decaps(msg.kem_wire)
             
             # Decrypt payload
             from ..cryptography.stream import StreamDEM, StreamHeader, EncryptedChunk
@@ -1321,7 +1316,7 @@ class MeteorWeb4Node:
             stream = StreamDEM(session_key=session_key, gpu=False)
             chunk = stream.encrypt_chunk(data)
             
-            encrypted_bytes = kem_ct.to_bytes() + chunk.ciphertext + chunk.tag
+            encrypted_bytes = kem_ct + chunk.ciphertext + chunk.tag
         
         # Upload to IPFS
         cid = self.ipfs.add_bytes(encrypted_bytes)

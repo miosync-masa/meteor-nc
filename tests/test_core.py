@@ -35,6 +35,14 @@ from meteor_nc.cryptography.core import (
 # A1. Correctness Tests
 # =============================================================================
 
+
+def _flip(wire: bytes, pos: int, mask: int = 1) -> bytes:
+    """v3: KEM ciphertexts are wire bytes; flip bits at byte `pos`."""
+    b = bytearray(wire)
+    b[pos] ^= mask
+    return bytes(b)
+
+
 def test_a1_1_kem_encaps_decaps(iterations: int = 10000) -> Dict:
     """
     A1.1: KEM Encaps/Decaps consistency
@@ -118,12 +126,7 @@ def test_a1_2_implicit_rejection(iterations: int = 1000) -> Dict:
             K_good, ct = kem.encaps()
             
             # Modify u (flip one element)
-            ct_bad = LWECiphertext(
-                u=ct.u.copy(),
-                v=ct.v.copy()
-            )
-            modify_idx = np.random.randint(0, len(ct_bad.u))
-            ct_bad.u[modify_idx] ^= 1  # Flip bit
+            ct_bad = _flip(ct, np.random.randint(12, len(ct)))
             
             K_bad = kem.decaps(ct_bad)
             
@@ -298,9 +301,9 @@ def test_a2_2_type_shape_errors() -> Dict:
     
     # Test wrong shapes
     bad_cases = [
-        ("u wrong length", LWECiphertext(u=ct.u[:100], v=ct.v)),
-        ("v wrong length", LWECiphertext(u=ct.u, v=ct.v[:100])),
-        ("u wrong dtype", LWECiphertext(u=ct.u.astype(np.float32), v=ct.v)),
+        ("truncated wire", ct[:100]),
+        ("extended wire", ct + b"\x00"),
+        ("wrong type", "not-bytes"),
     ]
     
     for desc, bad_ct in bad_cases:
@@ -358,10 +361,7 @@ def test_a3_1_aead_integrity() -> Dict:
     
     # Test 2: Modified tag should fail
     try:
-        bad_ct = FullCiphertext(
-            u=ct.u, v=ct.v, nonce=ct.nonce, ct=ct.ct,
-            tag=bytes([ct.tag[0] ^ 1]) + ct.tag[1:]
-        )
+        bad_ct = _flip(ct, len(ct) - 1)  # last tag byte
         hybrid.decrypt(bad_ct, aad=aad)
         results['tests'].append(("Modified tag", "FAIL - no exception"))
         results['fail'] += 1
@@ -371,11 +371,7 @@ def test_a3_1_aead_integrity() -> Dict:
     
     # Test 3: Modified nonce should fail
     try:
-        bad_ct = FullCiphertext(
-            u=ct.u, v=ct.v,
-            nonce=bytes([ct.nonce[0] ^ 1]) + ct.nonce[1:],
-            ct=ct.ct, tag=ct.tag
-        )
+        bad_ct = _flip(ct, 4 + int.from_bytes(ct[:4], "big"))  # first nonce byte
         hybrid.decrypt(bad_ct, aad=aad)
         results['tests'].append(("Modified nonce", "FAIL - no exception"))
         results['fail'] += 1
@@ -527,7 +523,7 @@ def test_a4_2_encaps_randomness(iterations: int = 10000) -> Dict:
     
     for _ in range(iterations):
         _, ct = kem.encaps()
-        ct_hash = hashlib.sha256(ct.u.tobytes() + ct.v.tobytes()).hexdigest()
+        ct_hash = hashlib.sha256(ct).hexdigest()
         
         if ct_hash in seen_cts:
             results['duplicates'] += 1
@@ -670,8 +666,7 @@ def test_b1_implicit_rejection_determinism(iterations: int = 100) -> Dict:
         K_good, ct = kem.encaps()
         
         # Create bad CT
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad.u[0] ^= 1
+        ct_bad = _flip(ct, 12)
         
         # B1.1: Same bad CT → same K_fail
         K_fail_1 = kem.decaps(ct_bad)
@@ -680,8 +675,7 @@ def test_b1_implicit_rejection_determinism(iterations: int = 100) -> Dict:
             results['b1_1'] += 1
         
         # B1.2: Different bad CT → different K_fail
-        ct_bad2 = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad2.u[1] ^= 1
+        ct_bad2 = _flip(ct, 12 + 1)
         K_fail_3 = kem.decaps(ct_bad2)
         if K_fail_1 != K_fail_3:
             results['b1_2'] += 1
@@ -728,8 +722,7 @@ def test_b2_cca_reencrypt_check(iterations: int = 100) -> Dict:
             results['valid_pass'] += 1
         
         # B2.2: Modified CT should fail (K_dec != K_good)
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad.v[0] ^= 1
+        ct_bad = _flip(ct, len(ct) - kem.params.len_salt - 1)
         K_bad = kem.decaps(ct_bad)
         if K_bad != K_good:
             results['modified_fail'] += 1
@@ -949,8 +942,7 @@ def test_d3_kem_dem_integration(chunks: int = 100) -> Dict:
     K_good, ct = kem_sender.encaps()
     
     # Tamper CT
-    ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-    ct_bad.u[0] ^= 1
+    ct_bad = _flip(ct, 12)
     
     K_bad = kem_receiver.decaps(ct_bad)
     
@@ -1004,9 +996,7 @@ def test_e1_kfail_uniformity(iterations: int = 1000) -> Dict:
         K_good, ct = kem.encaps()
         
         # Tamper at random position
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        pos = np.random.randint(0, len(ct_bad.u))
-        ct_bad.u[pos] ^= 1
+        ct_bad = _flip(ct, np.random.randint(12, len(ct)))
         
         K_fail = kem.decaps(ct_bad)
         
@@ -1023,8 +1013,7 @@ def test_e1_kfail_uniformity(iterations: int = 1000) -> Dict:
     K_good, ct = kem.encaps()
     kfails_by_pos = []
     for pos in [0, 1, 10, 100, 200, 255]:
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad.u[pos] ^= 1
+        ct_bad = _flip(ct, 12 + pos)
         kfails_by_pos.append(kem.decaps(ct_bad))
     
     # All should be different
@@ -1071,53 +1060,21 @@ def test_e2_negative_comprehensive() -> Dict:
     
     K_good, ct = kem.encaps()
     
-    # Convert to numpy for manipulation (handle both CuPy and NumPy)
-    if hasattr(ct.u, 'get'):  # CuPy array
-        u_orig = ct.u.get().astype(np.int64)
-        v_orig = ct.v.get().astype(np.int64)
-    else:  # Already NumPy
-        u_orig = np.array(ct.u, dtype=np.int64)
-        v_orig = np.array(ct.v, dtype=np.int64)
+    body = len(ct) - 12
+    salt0 = len(ct) - kem.params.len_salt
+    test_cases = [
+        ("c1 first byte flip", _flip(ct, 12)),
+        ("c1 middle byte flip", _flip(ct, 12 + body // 3)),
+        ("c2 last byte flip", _flip(ct, salt0 - 1)),
+        ("salt first byte flip", _flip(ct, salt0)),
+        ("salt last byte flip", _flip(ct, len(ct) - 1)),
+        ("c1 byte = 0xFF", ct[:12] + b"\xff" + ct[13:]),
+        ("c1 random replace", ct[:12] + secrets.token_bytes(salt0 - 12 - 200) + ct[salt0 - 200:]),
+        ("everything random", ct[:12] + secrets.token_bytes(body)),
+    ]
     
-    # Test cases: (description, u_bad, v_bad)
-    test_cases = []
-    
-    # u modifications
-    for pos in [0, 128, -1]:
-        u_mod = u_orig.copy()
-        u_mod[pos] ^= 1
-        test_cases.append((f"u[{pos}] 1-bit flip", u_mod, v_orig.copy()))
-    
-    # v modifications
-    for pos in [0, -1]:
-        v_mod = v_orig.copy()
-        v_mod[pos] ^= 1
-        test_cases.append((f"v[{pos}] 1-bit flip", u_orig.copy(), v_mod))
-    
-    # u[0] = 0
-    u_zero = u_orig.copy()
-    u_zero[0] = 0
-    test_cases.append(("u[0] = 0", u_zero, v_orig.copy()))
-    
-    # u all +1
-    test_cases.append(("u all +1", (u_orig + 1) % Q_DEFAULT, v_orig.copy()))
-    
-    # v all +1
-    test_cases.append(("v all +1", u_orig.copy(), (v_orig + 1) % Q_DEFAULT))
-    
-    # Both flip
-    u_both = u_orig.copy()
-    v_both = v_orig.copy()
-    u_both[0] ^= 1
-    v_both[0] ^= 1
-    test_cases.append(("u,v both flip[0]", u_both, v_both))
-    
-    # u random
-    test_cases.append(("u random replace", np.random.randint(0, Q_DEFAULT, size=u_orig.shape, dtype=np.int64), v_orig.copy()))
-    
-    for desc, u_bad, v_bad in test_cases:
+    for desc, ct_bad in test_cases:
         try:
-            ct_bad = LWECiphertext(u=u_bad, v=v_bad)
             K_bad = kem.decaps(ct_bad)
             
             if K_bad != K_good:
@@ -1409,8 +1366,7 @@ def run_tests_for_level(n: int, level_name: str) -> Dict:
             kem.key_gen()
             K_good, ct = kem.encaps()
             
-            ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-            ct_bad.u[0] ^= 1
+            ct_bad = _flip(ct, 12 + 0)
             K_bad = kem.decaps(ct_bad)
             
             if K_bad != K_good:
@@ -1460,16 +1416,14 @@ def run_tests_for_level(n: int, level_name: str) -> Dict:
     for _ in range(50):
         K_good, ct = kem.encaps()
         
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad.u[0] ^= 1
+        ct_bad = _flip(ct, 12)
         
         K_fail_1 = kem.decaps(ct_bad)
         K_fail_2 = kem.decaps(ct_bad)
         if K_fail_1 == K_fail_2:
             det_results['b1_1'] += 1
         
-        ct_bad2 = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad2.u[1] ^= 1
+        ct_bad2 = _flip(ct, 12 + 1)
         K_fail_3 = kem.decaps(ct_bad2)
         if K_fail_1 != K_fail_3:
             det_results['b1_2'] += 1

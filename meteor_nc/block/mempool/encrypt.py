@@ -186,10 +186,8 @@ class TxEncryptor:
         self._kem.load_public_key(builder_pk_bytes)
         
         # Extract pk_seed and compute b_hash for key_id
-        # pk_bytes format: header(12) + pk_seed(32) + b(k*4) + pk_hash(32)
-        pk_seed = builder_pk_bytes[12:44]
-        k = self._kem.pk.k
-        b_bytes = builder_pk_bytes[44:44 + k * 4]
+        pk_seed = self._kem.pk.pk_seed
+        b_bytes = self._kem.pk.b_bytes
         b_hash = hashlib.sha256(b_bytes).digest()
         
         self._builder_pk_seed = pk_seed
@@ -362,9 +360,8 @@ class TxDecryptor:
         self._kem._import_secret_key(sk_bytes)
         
         # Extract pk_seed and compute key_id
-        pk_seed = pk_bytes[12:44]
-        k = self._kem.pk.k
-        b_bytes = pk_bytes[44:44 + k * 4]
+        pk_seed = self._kem.pk.pk_seed
+        b_bytes = self._kem.pk.b_bytes
         b_hash = hashlib.sha256(b_bytes).digest()
         self._key_id = hashlib.sha256(pk_seed + b_hash).digest()
     

@@ -349,8 +349,7 @@ def test_i4_tamper_detection() -> Dict:
         msg_tampered = EncryptedMessage(
             sender_id=encrypted.sender_id,
             recipient_id=encrypted.recipient_id,
-            kem_u=encrypted.kem_u.copy(),
-            kem_v=encrypted.kem_v.copy(),
+            kem_wire=encrypted.kem_wire,
             stream_ciphertext=bytes(ct_tampered),
             stream_tag=encrypted.stream_tag,
             stream_id=encrypted.stream_id,
@@ -376,8 +375,7 @@ def test_i4_tamper_detection() -> Dict:
         msg_tampered = EncryptedMessage(
             sender_id=encrypted.sender_id,
             recipient_id=encrypted.recipient_id,
-            kem_u=encrypted.kem_u.copy(),
-            kem_v=encrypted.kem_v.copy(),
+            kem_wire=encrypted.kem_wire,
             stream_ciphertext=encrypted.stream_ciphertext,
             stream_tag=bytes(tag_tampered),
             stream_id=encrypted.stream_id,
@@ -397,14 +395,13 @@ def test_i4_tamper_detection() -> Dict:
     # === Test 4: Tampered KEM CT rejected ===
     print("  Testing KEM CT tamper...")
     try:
-        kem_u_tampered = encrypted.kem_u.copy()
-        kem_u_tampered[50] ^= 1  # Tamper somewhere in the middle
+        kem_wire_tampered = bytearray(encrypted.kem_wire)
+        kem_wire_tampered[50] ^= 1  # Tamper somewhere in the middle
         
         msg_tampered = EncryptedMessage(
             sender_id=encrypted.sender_id,
             recipient_id=encrypted.recipient_id,
-            kem_u=kem_u_tampered,
-            kem_v=encrypted.kem_v.copy(),
+            kem_wire=bytes(kem_wire_tampered),
             stream_ciphertext=encrypted.stream_ciphertext,
             stream_tag=encrypted.stream_tag,
             stream_id=encrypted.stream_id,
@@ -955,8 +952,7 @@ def test_i10_mitm_prevention() -> Dict:
     tampered = EncryptedMessage(
         sender_id=original.sender_id,
         recipient_id=original.recipient_id,
-        kem_u=original.kem_u.copy(),
-        kem_v=original.kem_v.copy(),
+        kem_wire=original.kem_wire,
         stream_ciphertext=bytes(tampered_ct),
         stream_tag=original.stream_tag,
         stream_id=original.stream_id,

@@ -515,8 +515,7 @@ class StreamHybridKEM:
         decaps_kem.load_secret_key(self._sk_bytes)
         
         # Parse and decapsulate
-        kem_ct_obj = LWECiphertext.from_bytes(ct.kem_ciphertext)
-        shared_key = decaps_kem.decaps(kem_ct_obj)
+        shared_key = decaps_kem.decaps(ct.kem_ciphertext)
         
         # 2. DEM: Initialize stream
         if not ct.chunks:
@@ -620,8 +619,7 @@ class StreamHybridKEM:
         decaps_kem.load_public_key(self._pk_bytes)
         decaps_kem.load_secret_key(self._sk_bytes)
         
-        kem_ct_obj = LWECiphertext.from_bytes(kem_ct)
-        shared_key = decaps_kem.decaps(kem_ct_obj)
+        shared_key = decaps_kem.decaps(kem_ct)
         
         # Initialize DEM (stream_id will be set from first chunk)
         dem = None

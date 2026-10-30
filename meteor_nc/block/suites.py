@@ -20,7 +20,7 @@ Usage:
     from meteor_nc.block.suites import SUITES, AUTH_SCHEMES, get_suite, get_auth_scheme
     
     suite = get_suite(0x01)
-    print(suite["kem_ct_size"])  # 518
+    print(suite["kem_ct_size"])  # 9764 (v3)
     
     auth = get_auth_scheme(0x01)
     print(auth["size"])  # 64
@@ -61,7 +61,7 @@ SUITES: Dict[int, Suite] = {
         n=256,
         d_u=11,
         d_v=5,
-        kem_ct_size=518,        # 6 + ceil(256*11/8) + ceil(256*5/8) = 6 + 352 + 160 = 518
+        kem_ct_size=9764,       # v3: 12B header + FrodoKEM-640-SHAKE ciphertext
         pk_blob_size=64,        # pk_seed(32) + b_hash(32)
         aead="XChaCha20-Poly1305",
         hash_domain="meteor-nc-block-v3-L1",
@@ -73,7 +73,7 @@ SUITES: Dict[int, Suite] = {
         n=512,
         d_u=12,
         d_v=5,
-        kem_ct_size=1094,       # 6 + ceil(512*12/8) + ceil(512*5/8) = 6 + 768 + 320 = 1094
+        kem_ct_size=15804,       # v3: 12B header + FrodoKEM-976-SHAKE ciphertext
         pk_blob_size=64,        # pk_seed(32) + b_hash(32)
         aead="XChaCha20-Poly1305",
         hash_domain="meteor-nc-block-v3-L3",
@@ -85,7 +85,7 @@ SUITES: Dict[int, Suite] = {
         n=1024,
         d_u=13,
         d_v=5,
-        kem_ct_size=2310,       # 6 + ceil(1024*13/8) + ceil(1024*5/8) = 6 + 1664 + 640 = 2310
+        kem_ct_size=21708,       # v3: 12B header + FrodoKEM-1344-SHAKE ciphertext
         pk_blob_size=64,        # pk_seed(32) + b_hash(32)
         aead="XChaCha20-Poly1305",
         hash_domain="meteor-nc-block-v3-L5",

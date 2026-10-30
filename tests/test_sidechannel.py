@@ -32,7 +32,7 @@ from meteor_nc.cryptography.core import (
 # Configuration
 # =============================================================================
 
-SAMPLE_COUNT = 10000  # Number of timing samples
+SAMPLE_COUNT = int(__import__("os").environ.get("METEOR_SC_SAMPLES", "10000"))  # timing samples
 WARMUP_COUNT = 100    # Warmup iterations before measurement
 T_TEST_THRESHOLD = 4.5  # Welch's t-test threshold (|t| < 4.5 is considered safe)
 CV_THRESHOLD = 0.10   # Coefficient of Variation threshold (< 10% is good)
@@ -73,6 +73,14 @@ class TimingStats:
                 99: np.percentile(samples, 99),
             }
         )
+
+
+
+def _flip(wire: bytes, pos: int, mask: int = 1) -> bytes:
+    """v3: KEM ciphertexts are wire bytes; flip bits at byte `pos`."""
+    b = bytearray(wire)
+    b[pos] ^= mask
+    return bytes(b)
 
 
 def measure_timing_ns(func, *args, **kwargs) -> int:
@@ -132,8 +140,7 @@ def test_f1_1_decaps_timing_constancy(n_samples: int = SAMPLE_COUNT) -> Dict:
     for _ in range(WARMUP_COUNT):
         K, ct = kem.encaps()
         _ = kem.decaps(ct)
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad.u[0] ^= 1
+        ct_bad = _flip(ct, 12 + 0)
         _ = kem.decaps(ct_bad)
     
     # Collect SUCCESS timings (valid ciphertext)
@@ -151,8 +158,7 @@ def test_f1_1_decaps_timing_constancy(n_samples: int = SAMPLE_COUNT) -> Dict:
     failure_times = np.zeros(n_samples, dtype=np.int64)
     for i in range(n_samples):
         K, ct = kem.encaps()
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad.u[np.random.randint(0, len(ct_bad.u))] ^= 1  # Random bit flip
+        ct_bad = _flip(ct, np.random.randint(12, len(ct)))
         start = time.perf_counter_ns()
         _ = kem.decaps(ct_bad)
         end = time.perf_counter_ns()
@@ -433,8 +439,7 @@ def test_f2_1_ks_test_timing_distribution(n_samples: int = SAMPLE_COUNT) -> Dict
     invalid_times = np.zeros(n_samples // 2, dtype=np.int64)
     for i in range(n_samples // 2):
         K, ct = kem.encaps()
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad.u[0] ^= 1
+        ct_bad = _flip(ct, 12 + 0)
         start = time.perf_counter_ns()
         _ = kem.decaps(ct_bad)
         end = time.perf_counter_ns()
@@ -502,8 +507,7 @@ def test_f2_2_timing_histogram_analysis(n_samples: int = SAMPLE_COUNT) -> Dict:
     failure_times = np.zeros(n_samples, dtype=np.int64)
     for i in range(n_samples):
         K, ct = kem.encaps()
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad.u[0] ^= 1
+        ct_bad = _flip(ct, 12 + 0)
         start = time.perf_counter_ns()
         _ = kem.decaps(ct_bad)
         end = time.perf_counter_ns()
@@ -598,8 +602,7 @@ def test_f2_3_percentile_comparison(n_samples: int = SAMPLE_COUNT) -> Dict:
     failure_times = np.zeros(n_samples, dtype=np.int64)
     for i in range(n_samples):
         K, ct = kem.encaps()
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad.u[0] ^= 1
+        ct_bad = _flip(ct, 12 + 0)
         start = time.perf_counter_ns()
         _ = kem.decaps(ct_bad)
         end = time.perf_counter_ns()
@@ -674,12 +677,8 @@ def test_f3_1_ciphertext_content_timing(n_samples: int = SAMPLE_COUNT) -> Dict:
     for i in range(n_samples):
         K, ct = kem.encaps()
         
-        # Calculate Hamming weight of u
-        if hasattr(ct.u, 'get'):  # CuPy
-            u_np = ct.u.get()
-        else:
-            u_np = ct.u
-        hamming_weights[i] = np.sum(np.unpackbits(u_np.view(np.uint8)))
+        # Calculate Hamming weight of the ciphertext body
+        hamming_weights[i] = int(np.unpackbits(np.frombuffer(ct[12:], np.uint8)).sum())
         
         start = time.perf_counter_ns()
         _ = kem.decaps(ct)
@@ -796,8 +795,7 @@ def test_f3_3_modification_position_timing(n_samples: int = SAMPLE_COUNT) -> Dic
     # Warmup
     for _ in range(WARMUP_COUNT):
         K, ct = kem.encaps()
-        ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-        ct_bad.u[0] ^= 1
+        ct_bad = _flip(ct, 12 + 0)
         _ = kem.decaps(ct_bad)
     
     all_position_times = []
@@ -808,8 +806,7 @@ def test_f3_3_modification_position_timing(n_samples: int = SAMPLE_COUNT) -> Dic
         
         for i in range(samples_per_pos):
             K, ct = kem.encaps()
-            ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-            ct_bad.u[pos] ^= 1
+            ct_bad = _flip(ct, 12 + pos)
             
             start = time.perf_counter_ns()
             _ = kem.decaps(ct_bad)
@@ -913,8 +910,7 @@ def test_f4_timing_across_security_levels() -> Dict:
         failure_times = np.zeros(samples_per_level, dtype=np.int64)
         for i in range(samples_per_level):
             K, ct = kem.encaps()
-            ct_bad = LWECiphertext(u=ct.u.copy(), v=ct.v.copy())
-            ct_bad.u[0] ^= 1
+            ct_bad = _flip(ct, 12 + 0)
             start = time.perf_counter_ns()
             _ = kem.decaps(ct_bad)
             end = time.perf_counter_ns()

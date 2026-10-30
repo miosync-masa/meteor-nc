@@ -7,6 +7,24 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18309744.svg)](https://doi.org/10.5281/zenodo.18309744)
 
+> [!CAUTION]
+> **Meteor-NC v2.x is broken; do not use it.** Its encryption hid every
+> message bit under one shared scalar mask, so a passive attacker recovers
+> the shared secret from the public key and a single ciphertext. Its
+> parameters were also far below the claimed security levels.
+> **v3 replaces the KEM core with FrodoKEM-640/976/1344-SHAKE** (verified
+> byte-exact against the official KATs). The GPU batch backend still
+> implements v2 and is disabled. The performance and size tables below
+> describe **v2** and are kept for history only. See [SECURITY.md](SECURITY.md).
+>
+> | v3 level (`n=`) | Core | PK (B) | CT (B) | CPU keygen / encaps / decaps |
+> |---|---|---|---|---|
+> | L1 (`256`) | FrodoKEM-640-SHAKE | 9,628 | 9,764 | 8.5 / 7.6 / 7.2 ms |
+> | L3 (`512`) | FrodoKEM-976-SHAKE | 15,644 | 15,804 | 14.9 / 12.3 / 9.8 ms |
+> | L5 (`1024`) | FrodoKEM-1344-SHAKE | 21,532 | 21,708 | 28.3 / 19.7 / 25.8 ms |
+>
+> Sizes include a 12-byte Meteor header. Timings: single-threaded NumPy, cloud VM.
+
 ## Overview
 
 Meteor-NC is a practical implementation of a post-quantum lattice-based key encapsulation mechanism (KEM). The cryptographic security relies entirely on **well-established primitives**:
