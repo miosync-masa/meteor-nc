@@ -273,8 +273,12 @@ class StreamDEM:
         self.stream_id = stream_id or secrets.token_bytes(16)
         self.device_id = device_id
         
-        # Use GPU if available and requested
-        self.use_gpu = gpu and _GPU_CHACHA_OK
+        # The GPU path is XChaCha20 (24-byte nonce) and the CPU path ChaCha20
+        # (12-byte nonce): their ciphertexts differ, so a GPU-encrypted stream
+        # cannot be read on a CPU node. The GPU DEM is therefore opt-in
+        # (METEOR_NC_GPU_DEM=1), and both ends must use the same setting.
+        import os as _os
+        self.use_gpu = bool(gpu and _GPU_CHACHA_OK and _os.environ.get("METEOR_NC_GPU_DEM") == "1")
         
         if self.use_gpu:
             self._gpu_cipher = GPUChaCha20Poly1305(session_key, device_id=device_id)
@@ -348,12 +352,11 @@ class StreamDEM:
         if chunk.header.stream_id != self.stream_id:
             raise ValueError("Stream ID mismatch")
         
-        # Replay protection
+        # Replay protection (recorded only after the chunk authenticates, so a
+        # forged chunk cannot block the genuine one with the same seq)
         seq = chunk.header.seq
-        if check_replay:
-            if seq in self._seen_seqs:
-                raise ValueError(f"Replay attack detected: seq {seq} already seen")
-            self._seen_seqs.add(seq)
+        if check_replay and seq in self._seen_seqs:
+            raise ValueError(f"Replay attack detected: seq {seq} already seen")
         
         # Derive nonce
         nonce = self._derive_nonce(seq)
@@ -374,6 +377,8 @@ class StreamDEM:
             ct_with_tag = chunk.ciphertext + chunk.tag
             plaintext = self._cpu_cipher.decrypt(nonce_12, ct_with_tag, full_aad)
         
+        if check_replay:
+            self._seen_seqs.add(seq)
         return plaintext
     
     def reset_counters(self) -> None:

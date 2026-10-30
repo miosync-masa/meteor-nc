@@ -531,7 +531,6 @@ class SessionManager:
             dict: Reconnection test results
         """
         print(f"\n[SessionManager] Testing reconnection...")
-        print(f"  Seed: {original_seed.hex()[:32]}...")
         print(f"  Cycles: {num_cycles}")
         
         # Create first node to get reference ID
@@ -600,7 +599,6 @@ class SessionManager:
         
         results = {
             'num_cycles': num_cycles,
-            'original_seed': original_seed.hex(),
             'original_id': original_id.hex(),
             'id_consistency': id_consistency,
             'communication_success_rate': comm_success_rate,

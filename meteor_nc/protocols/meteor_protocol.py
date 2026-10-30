@@ -1,314 +1,171 @@
 # meteor_nc/protocols/meteor_protocol.py
 """
-Meteor-Protocol: Quantum-Resistant P2P Communication Protocol
+Meteor-Protocol: post-quantum P2P messaging (v3).
 
-Built on Meteor-NC v2 cryptography:
-- LWE-KEM for key encapsulation (Post-Quantum)
-- XChaCha20-Poly1305 for data encryption
-- 32-byte identity (DHT/IPFS/libp2p compatible)
+Built on the v3 envelope (protocols/envelope.py):
+- self-certifying identity: MeteorID = H(public bundle), seed stays secret
+- confidentiality: v3 LWEKEM (FrodoKEM) + ChaCha20-Poly1305, header as AAD
+- sender authentication: Ed25519 signature over header and ciphertext
+- replay protection: time window + (sender, message id) cache
+
+Messages from senders that are not in the peer directory are rejected,
+because their signature cannot be checked.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
+import logging
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import numpy as np
+from .envelope import (
+    Envelope,
+    EnvelopeError,
+    MeteorIdentity,
+    ReplayGuard,
+    check_peer,
+    open_envelope,
+    seal,
+)
 
-from ..cryptography.common import GPU_AVAILABLE, _sha256, LWECiphertext
-from ..cryptography.core import LWEKEM
-from ..cryptography.stream import StreamDEM, EncryptedChunk, StreamHeader
+logger = logging.getLogger("meteor-protocol")
+
+MeteorMessage = Envelope          # v3 wire message (to_bytes / from_bytes)
 
 
 @dataclass
 class MeteorPeer:
     """Peer in Meteor-Protocol network."""
     name: str
-    meteor_id: bytes          # 32-byte identity
-    public_key: Optional[bytes] = None  # Serialized public key
+    meteor_id: bytes          # 32-byte identity = H(public bundle)
+    public_key: bytes         # public bundle (KEM key + signing key)
     last_seen: Optional[float] = None
-    
+
     def __post_init__(self):
         if len(self.meteor_id) != 32:
             raise ValueError("MeteorID must be exactly 32 bytes")
-
-
-@dataclass
-class MeteorMessage:
-    """Encrypted message in Meteor-Protocol."""
-    sender_id: bytes          # 32 bytes
-    recipient_id: bytes       # 32 bytes
-    kem_ciphertext: dict      # LWE ciphertext (u, v)
-    encrypted_payload: bytes  # XChaCha20-Poly1305 ciphertext
-    tag: bytes                # 16-byte auth tag
-    nonce: bytes              # 24-byte nonce
-    timestamp: float
-    
-    def to_bytes(self) -> bytes:
-        """Serialize for transmission."""
-        return json.dumps({
-            'sender_id': self.sender_id.hex(),
-            'recipient_id': self.recipient_id.hex(),
-            'kem_u': self.kem_ciphertext['u'].tolist(),
-            'kem_v': self.kem_ciphertext['v'].tolist(),
-            'payload': self.encrypted_payload.hex(),
-            'tag': self.tag.hex(),
-            'nonce': self.nonce.hex(),
-            'timestamp': self.timestamp,
-        }).encode('utf-8')
-    
-    @classmethod
-    def from_bytes(cls, data: bytes) -> 'MeteorMessage':
-        """Deserialize from transmission."""
-        obj = json.loads(data.decode('utf-8'))
-        return cls(
-            sender_id=bytes.fromhex(obj['sender_id']),
-            recipient_id=bytes.fromhex(obj['recipient_id']),
-            kem_ciphertext={
-                'u': np.array(obj['kem_u'], dtype=np.int64),
-                'v': np.array(obj['kem_v'], dtype=np.int64),
-            },
-            encrypted_payload=bytes.fromhex(obj['payload']),
-            tag=bytes.fromhex(obj['tag']),
-            nonce=bytes.fromhex(obj['nonce']),
-            timestamp=obj['timestamp'],
-        )
+        check_peer(self.meteor_id, self.public_key)
 
 
 class MeteorNode:
     """
     A node in the Meteor-Protocol network.
-    
-    Features:
-    - 32-byte MeteorID (DHT/IPFS compatible)
-    - Post-Quantum key encapsulation (LWE-KEM)
-    - Authenticated encryption (XChaCha20-Poly1305)
-    - No session state required
-    
-    Key Generation Modes:
-    - seed=None: Random keys (standard use)
-    - seed=bytes: Deterministic keys (for auth/re-login)
-    
+
+    Key generation:
+    - seed=None: random identity
+    - seed=bytes (>= 16 bytes, kept secret): deterministic identity, e.g. to
+      log in again with the same MeteorID
+
     Example:
-        >>> alice = MeteorNode("Alice")
-        >>> bob = MeteorNode("Bob")
-        >>> 
-        >>> # Exchange IDs (32 bytes each)
+        >>> alice, bob = MeteorNode("Alice"), MeteorNode("Bob")
         >>> alice.add_peer("Bob", bob.get_meteor_id(), bob.get_public_key())
         >>> bob.add_peer("Alice", alice.get_meteor_id(), alice.get_public_key())
-        >>> 
-        >>> # Send encrypted message
         >>> msg = alice.send("Bob", b"Hello Bob!")
-        >>> plaintext = bob.receive(msg)
+        >>> bob.receive(msg)
+        b'Hello Bob!'
     """
-    
+
     def __init__(
         self,
         name: str = "Node",
         seed: Optional[bytes] = None,
-        gpu: bool = True,
+        gpu: bool = False,                 # accepted for compatibility; CPU only
         device_id: int = 0,
+        replay_window_s: float = 300.0,
     ):
         self.name = name
-        self.gpu = gpu and GPU_AVAILABLE
+        self.gpu = False
         self.device_id = device_id
-        
-        # Master seed (32 bytes) - for MeteorID derivation
-        self._master_seed = seed or secrets.token_bytes(32)
-        
-        # Derive MeteorID from seed
-        self.meteor_id = _sha256(b"meteor-id", self._master_seed)
-        
-        # Initialize KEM with seed (for reproducible keys in auth scenarios)
-        self._kem = LWEKEM(
-            n=256,
-            gpu=self.gpu,
-            device_id=device_id,
-            seed=self._master_seed,  # Pass seed for deterministic key gen
-        )
-        self._pk_bytes, self._sk_bytes = self._kem.key_gen()
-        
-        # Peer directory
+        self.identity = MeteorIdentity(seed if seed is not None else secrets.token_bytes(32))
+        self.meteor_id = self.identity.meteor_id
         self.peers: Dict[str, MeteorPeer] = {}
-        
-        # Message queues
+        self._by_id: Dict[bytes, str] = {}
+        self._guard = ReplayGuard(replay_window_s)
         self.inbox: List[MeteorMessage] = []
         self.outbox: List[MeteorMessage] = []
-        
-        # Statistics
         self.stats = {
             'messages_sent': 0,
             'messages_received': 0,
+            'messages_rejected': 0,
             'bytes_sent': 0,
             'bytes_received': 0,
             'encryption_time': 0.0,
             'decryption_time': 0.0,
         }
-    
+
     def get_meteor_id(self) -> bytes:
-        """Get 32-byte MeteorID (for DHT/sharing)."""
+        """32-byte MeteorID (public)."""
         return self.meteor_id
-    
+
     def get_public_key(self) -> bytes:
-        """Get serialized public key for peer registration."""
-        return self._pk_bytes
-    
-    def add_peer(
-        self,
-        name: str,
-        meteor_id: bytes,
-        public_key: bytes,
-    ):
-        """Add peer to directory."""
-        peer = MeteorPeer(
-            name=name,
-            meteor_id=meteor_id,
-            public_key=public_key,
-        )
+        """Public bundle to share with peers (KEM public key + signing key)."""
+        return self.identity.bundle
+
+    def add_peer(self, name: str, meteor_id: bytes, public_key: bytes):
+        """Add a peer. Raises ValueError if the bundle does not match the MeteorID."""
+        try:
+            peer = MeteorPeer(name=name, meteor_id=meteor_id, public_key=public_key)
+        except EnvelopeError as e:
+            raise ValueError(f"cannot add peer {name!r}: {e}") from None
+        old = self.peers.get(name)
+        if old is not None:
+            self._by_id.pop(old.meteor_id, None)
         self.peers[name] = peer
-        print(f"[{self.name}] Added peer: {name} ({meteor_id.hex()[:16]}...)")
-    
+        self._by_id[meteor_id] = name
+        logger.info("[%s] added peer %s (%s...)", self.name, name, meteor_id.hex()[:16])
+
     def get_peer(self, name: str) -> Optional[MeteorPeer]:
-        """Get peer by name."""
         return self.peers.get(name)
-    
+
     def send(self, peer_name: str, plaintext: bytes) -> MeteorMessage:
-        """
-        Send encrypted message to peer.
-        
-        Uses hybrid encryption:
-        1. KEM encapsulation → shared secret K
-        2. Derive session key from K
-        3. XChaCha20-Poly1305 encrypt payload
-        """
+        """Encrypt and sign ``plaintext`` for a known peer."""
         peer = self.get_peer(peer_name)
         if peer is None:
             raise ValueError(f"Unknown peer: {peer_name}")
-        if peer.public_key is None:
-            raise ValueError(f"No public key for peer: {peer_name}")
-        
         start = time.time()
-        
-        # 1. KEM encapsulation with peer's public key
-        peer_kem = LWEKEM(n=256, gpu=self.gpu, device_id=self.device_id)
-        peer_kem.load_public_key(peer.public_key)
-        
-        K, kem_ct = peer_kem.encaps()
-        
-        # 2. Create StreamDEM with derived key
-        session_key = _sha256(b"session", K)
-        nonce = secrets.token_bytes(24)
-        
-        # 3. Encrypt payload
-        stream = StreamDEM(
-            session_key=session_key,
-            stream_id=nonce[:16],
-            gpu=self.gpu,
-            device_id=self.device_id,
-        )
-        
-        chunk = stream.encrypt_chunk(plaintext)
-        
-        encrypt_time = time.time() - start
-        
-        # Create message
-        message = MeteorMessage(
-            sender_id=self.meteor_id,
-            recipient_id=peer.meteor_id,
-            kem_ciphertext={'u': kem_ct.u, 'v': kem_ct.v},
-            encrypted_payload=chunk.ciphertext,
-            tag=chunk.tag,
-            nonce=nonce,
-            timestamp=time.time(),
-        )
-        
-        # Update stats
+        message = seal(self.identity, "data", plaintext, recipient_id=peer.meteor_id,
+                       recipient_bundle=peer.public_key)
+        dt = time.time() - start
         self.stats['messages_sent'] += 1
         self.stats['bytes_sent'] += len(plaintext)
-        self.stats['encryption_time'] += encrypt_time
-        
+        self.stats['encryption_time'] += dt
         self.outbox.append(message)
         peer.last_seen = time.time()
-        
-        print(f"[{self.name}] → [{peer_name}]: {len(plaintext)} bytes ({encrypt_time*1000:.1f}ms)")
-        
+        logger.info("[%s] -> [%s]: %d bytes (%.1f ms)", self.name, peer_name, len(plaintext), dt * 1e3)
         return message
-    
+
     def receive(self, message: MeteorMessage) -> bytes:
-        """
-        Receive and decrypt message.
-        
-        Uses hybrid decryption:
-        1. KEM decapsulation → shared secret K
-        2. Derive session key from K
-        3. XChaCha20-Poly1305 decrypt payload
-        """
-        # Verify recipient
-        if message.recipient_id != self.meteor_id:
-            raise ValueError("Message not for this node")
-        
+        """Authenticate and decrypt a message. Raises ValueError if rejected."""
+        if isinstance(message, (bytes, bytearray)):
+            message = Envelope.from_bytes(bytes(message))
         start = time.time()
-        
-        # 1. KEM decapsulation
-        kem_ct = LWECiphertext(
-            u=message.kem_ciphertext['u'],
-            v=message.kem_ciphertext['v'],
-        )
-        K = self._kem.decaps(kem_ct)
-        
-        # 2. Derive session key
-        session_key = _sha256(b"session", K)
-        
-        # 3. Decrypt payload
-        stream = StreamDEM(
-            session_key=session_key,
-            stream_id=message.nonce[:16],
-            gpu=self.gpu,
-            device_id=self.device_id,
-        )
-        
-        # Reconstruct chunk
-        header = StreamHeader(
-            stream_id=message.nonce[:16],
-            seq=0,
-            chunk_len=len(message.encrypted_payload),
-            flags=0,
-        )
-        chunk = EncryptedChunk(
-            header=header,
-            ciphertext=message.encrypted_payload,
-            tag=message.tag,
-        )
-        
-        plaintext = stream.decrypt_chunk(chunk)
-        
-        decrypt_time = time.time() - start
-        
-        # Update stats
+        sender_name = self._by_id.get(message.sender_id)
+        try:
+            if sender_name is None:
+                raise EnvelopeError("unknown sender")
+            if not message.encrypted:
+                raise EnvelopeError("expected an encrypted message")
+            plaintext = open_envelope(self.identity, message,
+                                      self.peers[sender_name].public_key, self._guard)
+        except EnvelopeError as e:
+            self.stats['messages_rejected'] += 1
+            raise ValueError(f"message rejected: {e}") from None
+        dt = time.time() - start
         self.stats['messages_received'] += 1
         self.stats['bytes_received'] += len(plaintext)
-        self.stats['decryption_time'] += decrypt_time
-        
+        self.stats['decryption_time'] += dt
         self.inbox.append(message)
-        
-        # Find sender
-        sender_name = "Unknown"
-        for name, peer in self.peers.items():
-            if peer.meteor_id == message.sender_id:
-                sender_name = name
-                peer.last_seen = message.timestamp
-                break
-        
-        print(f"[{self.name}] ← [{sender_name}]: {len(plaintext)} bytes ({decrypt_time*1000:.1f}ms)")
-        
+        self.peers[sender_name].last_seen = message.timestamp
+        logger.info("[%s] <- [%s]: %d bytes (%.1f ms)", self.name, sender_name, len(plaintext), dt * 1e3)
         return plaintext
-    
+
+    def sender_name(self, message: MeteorMessage) -> Optional[str]:
+        """Directory name of the (authenticated) sender of a received message."""
+        return self._by_id.get(message.sender_id)
+
     def get_stats(self) -> Dict:
-        """Get node statistics."""
         return {
             'name': self.name,
             'meteor_id': self.meteor_id.hex(),
@@ -321,67 +178,50 @@ class MeteorNode:
 
 class MeteorProtocol:
     """
-    Meteor-Protocol network simulator.
-    
+    In-memory network simulator.
+
     Example:
         >>> protocol = MeteorProtocol()
-        >>> protocol.add_node("Alice")
-        >>> protocol.add_node("Bob")
+        >>> protocol.add_node("Alice"); protocol.add_node("Bob")
         >>> protocol.connect("Alice", "Bob")
         >>> protocol.send("Alice", "Bob", b"Hello!")
-        >>> msg = protocol.receive("Bob")
+        >>> protocol.receive("Bob")
+        b'Hello!'
     """
-    
+
     def __init__(self):
         self.nodes: Dict[str, MeteorNode] = {}
         self.message_pool: List[MeteorMessage] = []
-    
-    def add_node(self, name: str, gpu: bool = True) -> MeteorNode:
-        """Add node to network."""
+
+    def add_node(self, name: str, gpu: bool = False) -> MeteorNode:
         node = MeteorNode(name=name, gpu=gpu)
         self.nodes[name] = node
-        print(f"\n[Protocol] Node '{name}' joined")
-        print(f"  MeteorID: {node.get_meteor_id().hex()[:32]}...")
         return node
-    
+
     def connect(self, node1: str, node2: str):
-        """Connect two nodes (exchange keys)."""
-        n1 = self.nodes.get(node1)
-        n2 = self.nodes.get(node2)
-        
+        n1, n2 = self.nodes.get(node1), self.nodes.get(node2)
         if n1 is None or n2 is None:
             raise ValueError("Node not found")
-        
-        # Exchange IDs and public keys
         n1.add_peer(node2, n2.get_meteor_id(), n2.get_public_key())
         n2.add_peer(node1, n1.get_meteor_id(), n1.get_public_key())
-        
-        print(f"\n[Protocol] {node1} ↔ {node2} connected")
-    
+
     def send(self, sender: str, recipient: str, message: bytes):
-        """Send message between nodes."""
         sender_node = self.nodes.get(sender)
         if sender_node is None:
             raise ValueError(f"Sender '{sender}' not found")
-        
-        encrypted = sender_node.send(recipient, message)
-        self.message_pool.append(encrypted)
-    
+        self.message_pool.append(sender_node.send(recipient, message))
+
     def receive(self, recipient: str) -> Optional[bytes]:
-        """Receive message for node."""
         recipient_node = self.nodes.get(recipient)
         if recipient_node is None:
             raise ValueError(f"Recipient '{recipient}' not found")
-        
         for i, message in enumerate(self.message_pool):
             if message.recipient_id == recipient_node.meteor_id:
                 self.message_pool.pop(i)
                 return recipient_node.receive(message)
-        
         return None
-    
+
     def get_stats(self) -> Dict:
-        """Get network statistics."""
         return {
             'nodes': len(self.nodes),
             'messages_in_pool': len(self.message_pool),
@@ -389,140 +229,17 @@ class MeteorProtocol:
         }
 
 
-# =============================================================================
-# Test Suite
-# =============================================================================
-
 def run_tests() -> bool:
-    """Execute MeteorProtocol tests."""
-    print("=" * 70)
-    print("Meteor-Protocol Test Suite")
-    print("=" * 70)
-    
-    results = {}
-    
-    # Test 1: Node creation
-    print("\n[Test 1] Node Creation")
-    print("-" * 40)
-    
-    alice = MeteorNode("Alice", gpu=True)
-    bob = MeteorNode("Bob", gpu=True)
-    
-    alice_id = alice.get_meteor_id()
-    bob_id = bob.get_meteor_id()
-    
-    node_ok = len(alice_id) == 32 and len(bob_id) == 32 and alice_id != bob_id
-    results["node_creation"] = node_ok
-    print(f"  Alice ID: {alice_id.hex()[:32]}...")
-    print(f"  Bob ID:   {bob_id.hex()[:32]}...")
-    print(f"  Result: {'PASS' if node_ok else 'FAIL'}")
-    
-    # Test 2: Seed reproducibility (for auth)
-    print("\n[Test 2] Seed Reproducibility (Auth Use Case)")
-    print("-" * 40)
-    
-    auth_seed = b"user_auth_seed_1234567890123456"
-    node1 = MeteorNode("Auth1", seed=auth_seed)
-    node2 = MeteorNode("Auth2", seed=auth_seed)
-    
-    seed_ok = (
-        node1.get_meteor_id() == node2.get_meteor_id() and
-        node1.get_public_key() == node2.get_public_key()
-    )
-    results["seed_reproducibility"] = seed_ok
-    print(f"  Same MeteorID: {node1.get_meteor_id() == node2.get_meteor_id()}")
-    print(f"  Same PK: {node1.get_public_key() == node2.get_public_key()}")
-    print(f"  Result: {'PASS' if seed_ok else 'FAIL'}")
-    
-    # Test 3: Peer exchange
-    print("\n[Test 3] Peer Exchange")
-    print("-" * 40)
-    
+    """Quick self-check (the full suite is tests/test_protocols.py)."""
+    alice, bob = MeteorNode("Alice"), MeteorNode("Bob")
     alice.add_peer("Bob", bob.get_meteor_id(), bob.get_public_key())
     bob.add_peer("Alice", alice.get_meteor_id(), alice.get_public_key())
-    
-    peer_ok = alice.get_peer("Bob") is not None and bob.get_peer("Alice") is not None
-    results["peer_exchange"] = peer_ok
-    print(f"  Result: {'PASS' if peer_ok else 'FAIL'}")
-    
-    # Test 4: Single message
-    print("\n[Test 4] Single Message")
-    print("-" * 40)
-    
-    original = b"Hello Bob! This is a secret message."
-    msg = alice.send("Bob", original)
-    decrypted = bob.receive(msg)
-    
-    single_ok = original == decrypted
-    results["single_message"] = single_ok
-    print(f"  Original:  {original}")
-    print(f"  Decrypted: {decrypted}")
-    print(f"  Result: {'PASS' if single_ok else 'FAIL'}")
-    
-    # Test 5: Bidirectional
-    print("\n[Test 5] Bidirectional Communication")
-    print("-" * 40)
-    
-    msg1 = alice.send("Bob", b"Hello Bob!")
-    msg2 = bob.send("Alice", b"Hello Alice!")
-    
-    dec1 = bob.receive(msg1)
-    dec2 = alice.receive(msg2)
-    
-    bidir_ok = dec1 == b"Hello Bob!" and dec2 == b"Hello Alice!"
-    results["bidirectional"] = bidir_ok
-    print(f"  Result: {'PASS' if bidir_ok else 'FAIL'}")
-    
-    # Test 6: Protocol simulator
-    print("\n[Test 6] Protocol Simulator")
-    print("-" * 40)
-    
-    protocol = MeteorProtocol()
-    protocol.add_node("Charlie", gpu=True)
-    protocol.add_node("Diana", gpu=True)
-    protocol.connect("Charlie", "Diana")
-    
-    protocol.send("Charlie", "Diana", b"Hi Diana!")
-    received = protocol.receive("Diana")
-    
-    proto_ok = received == b"Hi Diana!"
-    results["protocol"] = proto_ok
-    print(f"  Result: {'PASS' if proto_ok else 'FAIL'}")
-    
-    # Test 7: Performance
-    print("\n[Test 7] Performance Benchmark")
-    print("-" * 40)
-    
-    import time as time_module
-    
-    test_sizes = [100, 1000, 10000]
-    perf_ok = True
-    
-    for size in test_sizes:
-        data = secrets.token_bytes(size)
-        
-        start = time_module.perf_counter()
-        msg = alice.send("Bob", data)
-        enc_time = time_module.perf_counter() - start
-        
-        start = time_module.perf_counter()
-        dec = bob.receive(msg)
-        dec_time = time_module.perf_counter() - start
-        
-        ok = data == dec
-        perf_ok = perf_ok and ok
-        
-        print(f"  {size:5d} bytes: enc={enc_time*1000:.1f}ms, dec={dec_time*1000:.1f}ms {'✓' if ok else '✗'}")
-    
-    results["performance"] = perf_ok
-    
-    # Summary
-    print("\n" + "=" * 70)
-    all_pass = all(results.values())
-    print(f"Result: {'ALL TESTS PASSED' if all_pass else 'SOME TESTS FAILED'}")
-    print("=" * 70)
-    
-    return all_pass
+    ok = bob.receive(alice.send("Bob", b"Hello Bob!")) == b"Hello Bob!"
+    ok &= alice.receive(bob.send("Alice", b"Hello Alice!")) == b"Hello Alice!"
+    s = secrets.token_bytes(32)
+    ok &= MeteorNode("A1", seed=s).get_meteor_id() == MeteorNode("A2", seed=s).get_meteor_id()
+    print("Meteor-Protocol self-check:", "PASS" if ok else "FAIL")
+    return bool(ok)
 
 
 if __name__ == "__main__":

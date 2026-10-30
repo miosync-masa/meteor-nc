@@ -69,10 +69,10 @@ Security Model:
     ┌────────────────────────────────────────────────────────────┐
     │  Layer           │ Algorithm              │ Security       │
     │──────────────────│────────────────────────│────────────────│
-    │  Key Exchange    │ LWE-KEM (n=256)        │ Post-Quantum   │
-    │  Symmetric       │ XChaCha20-Poly1305     │ 256-bit        │
-    │  Authentication  │ Ed25519                │ 128-bit        │
-    │  Identity        │ SHA-256(seed)          │ 256-bit        │
+    │  Key Exchange    │ FrodoKEM-640 (v3 KEM)  │ Post-Quantum   │
+    │  Symmetric       │ ChaCha20-Poly1305      │ 256-bit key    │
+    │  Authentication  │ Ed25519 (every message)│ 128-bit        │
+    │  Identity        │ SHA-256(public bundle) │ self-certifying│
     │  Device Binding  │ HMAC(seed, fingerprint)│ 256-bit        │
     └────────────────────────────────────────────────────────────┘
 
@@ -84,7 +84,6 @@ Requirements:
     # P2P Networking (recommended)
     pip install libp2p
     pip install multiaddr
-    pip install pynacl
     
     # Distributed Storage (optional)
     pip install ipfshttpclient
@@ -175,8 +174,7 @@ import numpy as np
 # Logging
 # =============================================================================
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("meteor-web4")
+logger = logging.getLogger("meteor-web4")   # library: no basicConfig here
 
 
 # =============================================================================
@@ -190,7 +188,7 @@ try:
     from nacl.encoding import RawEncoder
     NACL_AVAILABLE = True
 except ImportError:
-    logger.warning("PyNaCl not available: pip install pynacl")
+    logger.debug("PyNaCl not available: pip install pynacl")
 
 # --- libp2p ---
 LIBP2P_AVAILABLE = False
@@ -199,18 +197,18 @@ try:
     from libp2p.peer.peerinfo import info_from_p2p_addr
     from libp2p.crypto.ed25519 import Ed25519PrivateKey
     LIBP2P_AVAILABLE = True
-    logger.info("libp2p available ✅")
+    logger.debug("libp2p available ✅")
 except ImportError:
-    logger.warning("libp2p not available: pip install libp2p")
+    logger.debug("libp2p not available: pip install libp2p")
 
 # --- Kademlia DHT ---
 DHT_AVAILABLE = False
 try:
     from libp2p.kademlia.network import KademliaServer
     DHT_AVAILABLE = True
-    logger.info("Kademlia DHT available ✅")
+    logger.debug("Kademlia DHT available ✅")
 except ImportError:
-    logger.warning("Kademlia DHT not available")
+    logger.debug("Kademlia DHT not available")
 
 # --- PubSub (GossipSub) ---
 PUBSUB_AVAILABLE = False
@@ -218,18 +216,18 @@ try:
     from libp2p.pubsub.gossipsub import GossipSub
     from libp2p.pubsub.pubsub import Pubsub
     PUBSUB_AVAILABLE = True
-    logger.info("PubSub available ✅")
+    logger.debug("PubSub available ✅")
 except ImportError:
-    logger.warning("PubSub not available")
+    logger.debug("PubSub not available")
 
 # --- IPFS ---
 IPFS_AVAILABLE = False
 try:
     import ipfshttpclient
     IPFS_AVAILABLE = True
-    logger.info("IPFS available ✅")
+    logger.debug("IPFS available ✅")
 except ImportError:
-    logger.warning("IPFS not available: pip install ipfshttpclient")
+    logger.debug("IPFS not available: pip install ipfshttpclient")
 
 # --- Multiaddr ---
 MULTIADDR_AVAILABLE = False
@@ -237,11 +235,21 @@ try:
     from multiaddr import Multiaddr
     MULTIADDR_AVAILABLE = True
 except ImportError:
-    logger.warning("multiaddr not available: pip install multiaddr")
+    logger.debug("multiaddr not available: pip install multiaddr")
 
 # --- Meteor-NC (Internal) ---
-from ..cryptography.common import _sha256, LWECiphertext, CRYPTO_AVAILABLE
-from ..cryptography.core import LWEKEM
+from ..cryptography.common import _sha256, CRYPTO_AVAILABLE
+from .envelope import (
+    BROADCAST_ID,
+    Envelope,
+    EnvelopeError,
+    MeteorIdentity,
+    ReplayGuard,
+    check_peer,
+    open_envelope,
+    seal,
+    verify_signature,
+)
 
 # StreamHybridKEM (optional)
 STREAM_AVAILABLE = False
@@ -255,7 +263,7 @@ try:
     )
     STREAM_AVAILABLE = True
 except ImportError:
-    logger.warning("Stream module not available")
+    logger.debug("Stream module not available")
 
 # MeteorAuth (optional)
 AUTH_AVAILABLE = False
@@ -295,190 +303,75 @@ class MessageType(Enum):
 
 
 # =============================================================================
-# Web4 Identity (MeteorID → Ed25519 → PeerID)
+# Web4 Identity (secret seed -> keys -> public bundle -> MeteorID -> PeerID)
 # =============================================================================
 
 class Web4Identity:
     """
-    Unified identity for Web 4.0.
-    
-    MeteorID (32 bytes) is the single source of truth:
-    - Meteor-NC seed (quantum-resistant encryption)
-    - Ed25519 seed (libp2p authentication)
-    - Deterministic: MeteorID → Ed25519 → PeerID
+    Identity for Web 4.0, built on the v3 MeteorIdentity.
+
+    The seed is SECRET and never leaves the node. Published values:
+    - ``bundle``: KEM public key + Ed25519 public key
+    - ``meteor_id`` = H(bundle): self-certifying, reveals nothing secret
+    - ``peer_id``: derived from the Ed25519 public key
+
+    (v2 used the seed itself as the published MeteorID, which let anyone
+    rebuild the node's private keys; see SECURITY.md.)
     """
-    
+
     def __init__(self, seed: Optional[bytes] = None):
-        """
-        Initialize identity.
-        
-        Args:
-            seed: 32-byte seed (auto-generated if None)
-        """
         if seed is None:
             seed = secrets.token_bytes(32)
-        
         if len(seed) != 32:
             raise ValueError("Seed must be exactly 32 bytes")
-        
-        self.meteor_id = seed
-        self._init_ed25519()
-    
-    def _init_ed25519(self):
-        """Initialize Ed25519 keypair from seed."""
-        if NACL_AVAILABLE:
-            self._signing_key = SigningKey(self.meteor_id)
-            self._verify_key = self._signing_key.verify_key
-            self.ed25519_public = bytes(self._verify_key)
-        else:
-            # Fallback: derive via hash
-            self._signing_key = None
-            self._verify_key = None
-            self.ed25519_public = _sha256(b"ed25519-pub", self.meteor_id)
-    
+        self._core = MeteorIdentity(seed)
+        self.meteor_id = self._core.meteor_id
+        self.bundle = self._core.bundle
+        self.ed25519_public = self._core.sign_public
+
     @property
     def peer_id(self) -> str:
-        """Generate libp2p-compatible PeerID."""
+        """libp2p-style PeerID string (derived from the Ed25519 public key)."""
         hash_bytes = _sha256(b"peer-id", self.ed25519_public)
         return "12D3Koo" + base64.b32encode(hash_bytes[:25]).decode('ascii').rstrip('=')
-    
+
     @property
     def peer_id_bytes(self) -> bytes:
-        """Raw peer ID bytes."""
         return _sha256(b"peer-id", self.ed25519_public)
-    
+
     def get_libp2p_keypair(self) -> Optional[Any]:
-        """
-        Get libp2p-compatible keypair.
-        
-        Note: Currently returns None. libp2p generates its own keypair.
-        MeteorID <-> PeerID mapping is managed at application layer.
-        """
+        """libp2p generates its own keypair; MeteorID <-> PeerID is app-level."""
         return None
-    
+
     def sign(self, message: bytes) -> bytes:
-        """Sign message with Ed25519."""
-        if self._signing_key:
-            return bytes(self._signing_key.sign(message).signature)
-        else:
-            import hmac
-            return hmac.new(self.meteor_id, message, hashlib.sha256).digest()
-    
-    def verify(self, message: bytes, signature: bytes, public_key: bytes) -> bool:
-        """Verify Ed25519 signature."""
-        if NACL_AVAILABLE:
-            try:
-                verify_key = VerifyKey(public_key)
-                verify_key.verify(message, signature)
-                return True
-            except Exception:
-                return False
-        return True  # Trust mode without NaCl
-    
+        """Ed25519 signature (via the ``cryptography`` package; no fallback)."""
+        return self._core.sign(message)
+
+    @staticmethod
+    def verify(message: bytes, signature: bytes, public_key: bytes) -> bool:
+        """Verify an Ed25519 signature. Fails closed."""
+        return verify_signature(public_key, signature, message)
+
     def to_dict(self) -> Dict:
-        """Export public identity."""
+        """Export the public identity."""
         return {
             'meteor_id': self.meteor_id.hex(),
             'ed25519_public': self.ed25519_public.hex(),
             'peer_id': self.peer_id,
+            'bundle': base64.b64encode(self.bundle).decode(),
         }
-    
+
     @classmethod
     def from_meteor_id(cls, meteor_id: bytes) -> 'Web4Identity':
-        """Create identity from MeteorID."""
-        return cls(seed=meteor_id)
+        raise TypeError("an identity cannot be derived from a MeteorID (it is public); "
+                        "use Web4Identity(secret_seed)")
 
 
 # =============================================================================
-# Web4 Message
+# Web4 Message (v3 envelope)
 # =============================================================================
 
-@dataclass
-class Web4Message:
-    """
-    Universal message format for Web 4.0.
-    
-    Supports:
-    - Direct P2P (encrypted via Meteor-NC)
-    - IPFS-backed file transfer
-    - PubSub broadcast
-    - Streaming (chunked transfer)
-    """
-    msg_type: MessageType
-    sender_id: bytes
-    recipient_id: bytes
-    timestamp: float
-    
-    # KEM ciphertext (for direct messages)
-    kem_wire: Optional[bytes] = None
-    
-    # Encrypted payload
-    encrypted_payload: Optional[bytes] = None
-    tag: Optional[bytes] = None
-    nonce: Optional[bytes] = None
-    
-    # Stream/IPFS specific
-    stream_id: Optional[bytes] = None
-    chunk_seq: int = 0
-    ipfs_cid: Optional[str] = None
-    
-    # Metadata
-    original_len: int = 0
-    checksum: str = ""
-    filename: Optional[str] = None
-    pubsub_topic: Optional[str] = None
-    
-    # Security
-    message_id: str = field(default_factory=lambda: secrets.token_hex(8))
-    signature: Optional[bytes] = None
-    
-    def to_bytes(self) -> bytes:
-        """Serialize for network transmission."""
-        data = {
-            'msg_type': self.msg_type.value,
-            'sender_id': self.sender_id.hex(),
-            'recipient_id': self.recipient_id.hex(),
-            'timestamp': self.timestamp,
-            'kem_wire': base64.b64encode(self.kem_wire).decode() if self.kem_wire else None,
-            'encrypted_payload': base64.b64encode(self.encrypted_payload).decode() if self.encrypted_payload else None,
-            'tag': base64.b64encode(self.tag).decode() if self.tag else None,
-            'nonce': self.nonce.hex() if self.nonce else None,
-            'stream_id': self.stream_id.hex() if self.stream_id else None,
-            'chunk_seq': self.chunk_seq,
-            'ipfs_cid': self.ipfs_cid,
-            'original_len': self.original_len,
-            'checksum': self.checksum,
-            'filename': self.filename,
-            'pubsub_topic': self.pubsub_topic,
-            'message_id': self.message_id,
-            'signature': self.signature.hex() if self.signature else None,
-        }
-        return json.dumps(data).encode('utf-8')
-    
-    @classmethod
-    def from_bytes(cls, data: bytes) -> 'Web4Message':
-        """Deserialize from network transmission."""
-        obj = json.loads(data.decode('utf-8'))
-        
-        return cls(
-            msg_type=MessageType(obj['msg_type']),
-            sender_id=bytes.fromhex(obj['sender_id']),
-            recipient_id=bytes.fromhex(obj['recipient_id']),
-            timestamp=obj['timestamp'],
-            kem_wire=base64.b64decode(obj['kem_wire']) if obj.get('kem_wire') else None,
-            encrypted_payload=base64.b64decode(obj['encrypted_payload']) if obj.get('encrypted_payload') else None,
-            tag=base64.b64decode(obj['tag']) if obj.get('tag') else None,
-            nonce=bytes.fromhex(obj['nonce']) if obj.get('nonce') else None,
-            stream_id=bytes.fromhex(obj['stream_id']) if obj.get('stream_id') else None,
-            chunk_seq=obj.get('chunk_seq', 0),
-            ipfs_cid=obj.get('ipfs_cid'),
-            original_len=obj.get('original_len', 0),
-            checksum=obj.get('checksum', ''),
-            filename=obj.get('filename'),
-            pubsub_topic=obj.get('pubsub_topic'),
-            message_id=obj['message_id'],
-            signature=bytes.fromhex(obj['signature']) if obj.get('signature') else None,
-        )
+Web4Message = Envelope
 
 
 # =============================================================================
@@ -496,7 +389,7 @@ class Web4IPFS:
     def connect(self) -> bool:
         """Connect to IPFS daemon."""
         if not IPFS_AVAILABLE:
-            logger.warning("IPFS client not available")
+            logger.debug("IPFS client not available")
             return False
         
         try:
@@ -555,7 +448,7 @@ class Web4P2P:
     async def start(self, listen_addrs: Optional[List[str]] = None):
         """Start libp2p host."""
         if not LIBP2P_AVAILABLE:
-            logger.warning("libp2p not available - mock mode")
+            logger.debug("libp2p not available - mock mode")
             self._started = True
             return
         
@@ -612,35 +505,25 @@ class Web4P2P:
             return False
     
     async def send(self, peer_id: Any, data: bytes) -> bool:
-        """Send data to peer via stream."""
-        if not self._started:
-            logger.info(f"[Mock] Would send {len(data)} bytes")
-            return True
-        
-        if not self.host:
-            logger.info(f"[Mock] Would send {len(data)} bytes (no host)")
-            return True
-        
+        """Send data to a peer over a libp2p stream. Returns False if it was
+        not sent (no transport, unknown peer, or an error) - never pretends."""
+        if not self._started or not self.host:
+            logger.warning("no libp2p transport: message not sent")
+            return False
+        if isinstance(peer_id, str):
+            # Meteor PeerID strings are not libp2p peer IDs; resolving them
+            # needs the peer's libp2p address (see connect()).
+            logger.warning("cannot route to Meteor PeerID %s... over libp2p", peer_id[:16])
+            return False
         try:
-            # peer_id が文字列なら PeerID オブジェクトに変換
-            from libp2p.peer.id import ID as PeerID
-            
-            if isinstance(peer_id, str):
-                # MeteorのpeerIDはlibp2pのPeerIDと違う可能性
-                # 今はMock modeで成功扱い
-                logger.info(f"[Mock] Send to {peer_id[:16]}...: {len(data)} bytes")
-                return True
-            
             stream = await self.host.new_stream(peer_id, [METEOR_PROTOCOL_ID])
             await stream.write(data)
             await stream.close()
             return True
         except Exception as e:
             logger.error(f"Send failed: {e}")
-            # フォールバック: Mock成功
-            logger.info(f"[Mock] Send fallback: {len(data)} bytes")
-            return True
-    
+            return False
+
     async def _handle_stream(self, stream: Any):
         """Handle incoming stream."""
         try:
@@ -709,22 +592,37 @@ class Web4DHT:
             except Exception as e:
                 logger.error(f"DHT announce failed: {e}")
     
+    @staticmethod
+    def _verified(meteor_id: bytes, peer_info: Dict) -> bool:
+        """DHT records are untrusted: accept one only if its public bundle
+        hashes to the MeteorID we looked up."""
+        try:
+            bundle = peer_info['public_key']
+            if isinstance(bundle, str):
+                bundle = base64.b64decode(bundle)
+            check_peer(meteor_id, bundle)
+            return True
+        except Exception:
+            return False
+
     async def find_peer(self, meteor_id: bytes) -> Optional[Dict]:
-        """Find peer by MeteorID."""
+        """Find a peer by MeteorID; records that do not match it are ignored."""
         if meteor_id in self._peer_cache:
             return self._peer_cache[meteor_id]
-        
         if self.dht:
             try:
                 key = _sha256(b"dht-key", meteor_id)
                 value = await self.dht.get(key)
                 if value:
                     peer_info = json.loads(value.decode())
+                    if not self._verified(meteor_id, peer_info):
+                        logger.warning("ignoring DHT record that does not match MeteorID %s...",
+                                       meteor_id.hex()[:16])
+                        return None
                     self._peer_cache[meteor_id] = peer_info
                     return peer_info
             except Exception as e:
                 logger.error(f"DHT lookup failed: {e}")
-        
         return None
     
     def add_peer_local(self, meteor_id: bytes, peer_info: Dict):
@@ -749,7 +647,7 @@ class Web4PubSub:
     async def start(self):
         """Start PubSub service."""
         if not PUBSUB_AVAILABLE:
-            logger.warning("PubSub not available - mock mode")
+            logger.debug("PubSub not available - mock mode")
             self._started = True
             return
         
@@ -837,152 +735,84 @@ class Web4PubSub:
 # =============================================================================
 class MeteorWeb4Node:
     """
-    Meteor-Protocol Web 4.0 Complete Node.
-    
-    Features:
-    - Post-quantum encryption (Meteor-NC, CPU-friendly)
-    - P2P networking (libp2p)
-    - Peer discovery (Kademlia DHT)
-    - Broadcasting (GossipSub PubSub)
-    - Distributed storage (IPFS)
-    - Optional device-bound auth (MeteorAuth)
-    - Optional streaming (StreamHybridKEM)
-    
-    Example:
-        >>> node = await MeteorWeb4Node.create("Alice")
-        >>> await node.start()
-        >>> 
-        >>> # Add peer
-        >>> node.add_peer("Bob", bob_meteor_id)
-        >>> 
-        >>> # Send encrypted message
-        >>> await node.send_text("Bob", "Hello!")
-        >>> 
-        >>> # Subscribe to topic
-        >>> await node.pubsub_subscribe("chat", handler)
+    Meteor-Protocol Web 4.0 node (v3 envelope).
+
+    - Direct messages: encrypted to the peer's KEM key, signed with Ed25519,
+      header bound as AEAD associated data, replay-protected.
+    - PubSub: plaintext, signed; subscribers only accept messages from
+      known peers whose signature verifies.
+    - IPFS files: the encrypted envelope is uploaded; the peer gets a signed
+      notice with the CID and the blob hash (no plaintext hash is sent).
+    - Peers are added with (MeteorID, public bundle); a bundle that does not
+      hash to the MeteorID is rejected. Messages from unknown senders are
+      dropped because their signatures cannot be checked.
+
+    In-process delivery: nodes created in the same Python process can reach
+    each other directly (``local_delivery=True``, the default), which is
+    what the tests use; real networking needs libp2p.
     """
-    
-    # クラス変数：ローカルノード登録（テスト用）
+
     _local_nodes: Dict[bytes, 'MeteorWeb4Node'] = {}
-    
+
     def __init__(
         self,
         name: str = "Node",
         seed: Optional[bytes] = None,
-        # Auth options
         use_auth: bool = False,
         require_biometric: bool = False,
         biometric_provider: Optional[Any] = None,
+        local_delivery: bool = True,
+        replay_window_s: float = 300.0,
     ):
-        """
-        Initialize Web 4.0 node.
-        
-        Args:
-            name: Node display name
-            seed: 32-byte seed (auto-generated if None)
-            use_auth: Enable device-bound authentication
-            require_biometric: Require biometric for 3FA (needs use_auth=True)
-            biometric_provider: Custom biometric provider
-        """
         self.name = name
         self._use_auth = use_auth
-        
-        # Initialize identity
         if use_auth and AUTH_AVAILABLE:
-            auth = MeteorAuth(
-                gpu=False,
-                require_biometric=require_biometric,
-                biometric_provider=biometric_provider,
-            )
+            auth = MeteorAuth(gpu=False, require_biometric=require_biometric,
+                              biometric_provider=biometric_provider)
             if seed is None:
                 seed = auth.generate_seed()
-            self._auth_seed = seed
-            bound_seed = auth.create_device_bound_seed(seed)
-            self.identity = Web4Identity(bound_seed)
-        else:
-            if seed is None:
-                seed = secrets.token_bytes(32)
-            self._auth_seed = seed
-            self.identity = Web4Identity(seed)
-        
+            seed = auth.create_device_bound_seed(seed)
+        elif seed is None:
+            seed = secrets.token_bytes(32)
+        self.identity = Web4Identity(seed)          # seed stays inside the identity
         self.meteor_id = self.identity.meteor_id
         self.peer_id = self.identity.peer_id
-        
-        # Initialize KEM (CPU only!)
-        self._kem = LWEKEM(n=256, gpu=False, seed=self.meteor_id)
-        self._pk_bytes, self._sk_bytes = self._kem.key_gen()
-        
-        # Initialize layers
+        self._pk_bytes = self.identity.bundle
+
         self.p2p = Web4P2P(self.identity)
         self.dht = Web4DHT(self.identity)
         self.pubsub = Web4PubSub(self.identity, self.p2p)
         self.ipfs = Web4IPFS()
-        
-        # Peer directory
+
         self.peers: Dict[str, Dict] = {}
-        
-        # Message handlers
+        self._by_id: Dict[bytes, str] = {}
+        self._guard = ReplayGuard(replay_window_s)
         self._message_handlers: List[Callable] = []
-        
-        # Stats
         self.stats = {
-            'messages_sent': 0,
-            'messages_received': 0,
-            'bytes_sent': 0,
-            'bytes_received': 0,
-            'pubsub_published': 0,
-            'pubsub_received': 0,
-            'ipfs_uploads': 0,
-            'ipfs_downloads': 0,
+            'messages_sent': 0, 'messages_received': 0, 'messages_rejected': 0,
+            'bytes_sent': 0, 'bytes_received': 0,
+            'pubsub_published': 0, 'pubsub_received': 0,
+            'ipfs_uploads': 0, 'ipfs_downloads': 0,
         }
-        
-        # ★ ローカルネットワークに登録（meteor_id確定後！）
-        MeteorWeb4Node._local_nodes[self.meteor_id] = self
-        
-        logger.info(f"[{self.name}] Node created")
-        logger.info(f"  MeteorID: {self.meteor_id.hex()[:32]}...")
-        logger.info(f"  PeerID:   {self.peer_id}")
-        logger.info(f"  Auth:     {'Enabled' if use_auth else 'Disabled'}")
-    
+        self._local_delivery = local_delivery
+        if local_delivery:
+            MeteorWeb4Node._local_nodes[self.meteor_id] = self
+        logger.info(f"[{self.name}] Node created  MeteorID {self.meteor_id.hex()[:32]}...")
+
     @classmethod
-    async def create(
-        cls,
-        name: str = "Node",
-        seed: Optional[bytes] = None,
-        use_auth: bool = False,
-        require_biometric: bool = False,
-        biometric_provider: Optional[Any] = None,
-    ) -> 'MeteorWeb4Node':
+    async def create(cls, name: str = "Node", seed: Optional[bytes] = None,
+                     use_auth: bool = False, require_biometric: bool = False,
+                     biometric_provider: Optional[Any] = None, **kw) -> 'MeteorWeb4Node':
         """Async factory method."""
-        return cls(
-            name=name,
-            seed=seed,
-            use_auth=use_auth,
-            require_biometric=require_biometric,
-            biometric_provider=biometric_provider,
-        )
-    
-    # =========================================================================
-    # Lifecycle
-    # =========================================================================
-    
-    async def start(
-        self,
-        port: int = 0,
-        enable_dht: bool = True,
-        enable_pubsub: bool = True,
-        enable_ipfs: bool = True,
-        ipfs_addr: str = "/ip4/127.0.0.1/tcp/5001",
-    ):
+        return cls(name=name, seed=seed, use_auth=use_auth, require_biometric=require_biometric,
+                   biometric_provider=biometric_provider, **kw)
+
+    # -- lifecycle ---------------------------------------------------------
+    async def start(self, port: int = 0, enable_dht: bool = True, enable_pubsub: bool = True,
+                    enable_ipfs: bool = True, ipfs_addr: str = "/ip4/127.0.0.1/tcp/5001"):
         """Start all services."""
-        logger.info(f"[{self.name}] Starting services...")
-        
-        # libp2p
-        listen_addr = f"/ip4/0.0.0.0/tcp/{port}"
-        await self.p2p.start([listen_addr])
+        await self.p2p.start([f"/ip4/0.0.0.0/tcp/{port}"])
         self.p2p.add_handler("meteor", self._handle_incoming)
-        
-        # DHT
         if enable_dht:
             await self.dht.start()
             await self.dht.announce(self.meteor_id, {
@@ -990,433 +820,217 @@ class MeteorWeb4Node:
                 'addrs': self.p2p.listen_addrs,
                 'public_key': base64.b64encode(self._pk_bytes).decode(),
             })
-        
-        # PubSub
         if enable_pubsub:
             await self.pubsub.start()
-        
-        # IPFS
         if enable_ipfs:
             self.ipfs = Web4IPFS(ipfs_addr)
             self.ipfs.connect()
-        
-        logger.info(f"[{self.name}] All services started ✅")
-    
+
     async def stop(self):
-        """Stop all services."""
         await self.p2p.stop()
-        logger.info(f"[{self.name}] Stopped")
-    
-    # =========================================================================
-    # Peer Management
-    # =========================================================================
-    
-    def add_peer(
-        self,
-        name: str,
-        meteor_id: bytes,
-        public_key: Optional[bytes] = None,
-        addrs: Optional[List[str]] = None,
-    ):
-        """
-        Add peer to directory.
-        
-        Args:
-            name: Peer display name
-            meteor_id: 32-byte MeteorID
-            public_key: Serialized public key (for encryption)
-            addrs: libp2p multiaddrs
-        """
+        if MeteorWeb4Node._local_nodes.get(self.meteor_id) is self:
+            del MeteorWeb4Node._local_nodes[self.meteor_id]
+
+    # -- peers -------------------------------------------------------------
+    def add_peer(self, name: str, meteor_id: bytes, public_key: bytes,
+                 addrs: Optional[List[str]] = None):
+        """Add a peer. ``public_key`` is the peer's public bundle
+        (``get_public_key()``); it must hash to ``meteor_id``."""
         if len(meteor_id) != 32:
             raise ValueError("MeteorID must be 32 bytes")
-        
-        peer_identity = Web4Identity.from_meteor_id(meteor_id)
-        
+        if public_key is None:
+            raise ValueError("the peer's public bundle is required")
+        try:
+            check_peer(meteor_id, public_key)
+        except EnvelopeError as e:
+            raise ValueError(f"cannot add peer {name!r}: {e}") from None
+        old = self.peers.get(name)
+        if old is not None:
+            self._by_id.pop(old['meteor_id'], None)
         self.peers[name] = {
             'meteor_id': meteor_id,
-            'peer_id': peer_identity.peer_id,
             'public_key': public_key,
             'addrs': addrs or [],
             'last_seen': None,
         }
-        
+        self._by_id[meteor_id] = name
         self.dht.add_peer_local(meteor_id, self.peers[name])
-        
-        logger.info(f"[{self.name}] Added peer: {name} ({meteor_id.hex()[:16]}...)")
-    
+
     def get_public_key(self) -> bytes:
-        """Get serialized public key for sharing."""
+        """Public bundle (KEM public key + Ed25519 public key) for sharing."""
         return self._pk_bytes
-    
-    # =========================================================================
-    # Direct Messaging (Encrypted via Meteor-NC)
-    # =========================================================================
-    
+
+    # -- delivery ----------------------------------------------------------
+    async def _deliver(self, peer: Dict, data: bytes) -> bool:
+        if self._local_delivery:
+            node = MeteorWeb4Node._local_nodes.get(peer['meteor_id'])
+            if node is not None:
+                return await node._handle_incoming(data)
+        peer_ref = peer.get('libp2p_id')
+        if peer_ref is None:
+            logger.warning(f"[{self.name}] no route to {peer['meteor_id'].hex()[:16]}...")
+            return False
+        return await self.p2p.send(peer_ref, data)
+
+    def _open(self, env: Envelope) -> Tuple[str, bytes]:
+        name = self._by_id.get(env.sender_id)
+        if name is None:
+            raise EnvelopeError("unknown sender")
+        payload = open_envelope(self.identity._core, env, self.peers[name]['public_key'], self._guard)
+        self.peers[name]['last_seen'] = env.timestamp
+        return name, payload
+
+    # -- direct messages ---------------------------------------------------
     async def send_text(self, peer_name: str, text: str) -> bool:
-        """
-        Send encrypted text message.
-        
-        Uses Meteor-NC KEM for quantum-resistant encryption.
-        
-        Args:
-            peer_name: Recipient peer name
-            text: Message text
-            
-        Returns:
-            bool: True if sent successfully
-        """
-        return await self._send_data(
-            peer_name, 
-            text.encode('utf-8'), 
-            MessageType.TEXT
-        )
-    
+        return await self._send_data(peer_name, text.encode('utf-8'), MessageType.TEXT)
+
     async def send_binary(self, peer_name: str, data: bytes) -> bool:
-        """
-        Send encrypted binary data.
-        
-        Args:
-            peer_name: Recipient peer name
-            data: Binary data
-            
-        Returns:
-            bool: True if sent successfully
-        """
         return await self._send_data(peer_name, data, MessageType.BINARY)
-    
-    async def _send_data(
-        self,
-        peer_name: str,
-        data: bytes,
-        msg_type: MessageType,
-    ) -> bool:
-        """Internal send implementation."""
+
+    async def _send_data(self, peer_name: str, data: bytes, msg_type: MessageType,
+                         meta: Optional[Dict] = None) -> bool:
         peer = self.peers.get(peer_name)
         if not peer:
             logger.error(f"Unknown peer: {peer_name}")
             return False
-        
-        if not peer.get('public_key'):
-            logger.error(f"No public key for peer: {peer_name}")
-            return False
-        
-        # Create KEM instance for peer
-        peer_kem = LWEKEM(n=256, gpu=False)
-        peer_kem.load_public_key(peer['public_key'])
-        
-        # KEM encapsulation
-        K, kem_ct = peer_kem.encaps()
-        
-        # Derive session key and encrypt payload
-        session_key = _sha256(b"session", K)
-        nonce = secrets.token_bytes(16)
-        
-        stream = StreamDEM(
-            session_key=session_key,
-            stream_id=nonce,
-            gpu=False,
-        )
-        
-        chunk = stream.encrypt_chunk(data)
-        checksum = hashlib.sha256(data).hexdigest()[:16]
-        
-        # Create message
-        msg = Web4Message(
-            msg_type=msg_type,
-            sender_id=self.meteor_id,
-            recipient_id=peer['meteor_id'],
-            timestamp=time.time(),
-            kem_wire=kem_ct,
-            encrypted_payload=chunk.ciphertext,
-            tag=chunk.tag,
-            nonce=nonce,
-            original_len=len(data),
-            checksum=checksum,
-        )
-        msg.signature = self.identity.sign(checksum.encode())
-        
-        msg_bytes = msg.to_bytes()
-        
-        # ★ ローカル配送を試みる
-        recipient_node = MeteorWeb4Node._local_nodes.get(peer['meteor_id'])
-        if recipient_node:
-            # 直接配送
-            await recipient_node._handle_incoming(msg_bytes)
-            success = True
-            logger.info(f"[{self.name}] → [{peer_name}] (local): {len(data)} bytes")
-        else:
-            # P2P経由
-            success = await self.p2p.send(peer['peer_id'], msg_bytes)
-            if success:
-                logger.info(f"[{self.name}] → [{peer_name}]: {len(data)} bytes")
-        
-        if success:
+        env = seal(self.identity._core, msg_type.value, data, recipient_id=peer['meteor_id'],
+                   recipient_bundle=peer['public_key'], meta=meta)
+        ok = await self._deliver(peer, env.to_bytes())
+        if ok:
             self.stats['messages_sent'] += 1
             self.stats['bytes_sent'] += len(data)
             peer['last_seen'] = time.time()
-        
-        return success
-    
-    # =========================================================================
-    # Receiving Messages
-    # =========================================================================
-    
-    async def _handle_incoming(self, data: bytes):
-        """Handle incoming message."""
+        return ok
+
+    async def _handle_incoming(self, data: bytes) -> bool:
+        """Authenticate, decrypt and dispatch one incoming envelope.
+        Returns True if it was accepted."""
         try:
-            msg = Web4Message.from_bytes(data)
-            
-            # Verify recipient
-            if msg.recipient_id != self.meteor_id:
-                return
-            
-            # KEM decapsulation
-            K = self._kem.decaps(msg.kem_wire)
-            
-            # Decrypt payload
-            from ..cryptography.stream import StreamDEM, StreamHeader, EncryptedChunk
-            session_key = _sha256(b"session", K)
-            
-            stream = StreamDEM(
-                session_key=session_key,
-                stream_id=msg.nonce,
-                gpu=False,
-            )
-            
-            header = StreamHeader(
-                stream_id=msg.nonce,
-                seq=0,
-                chunk_len=len(msg.encrypted_payload),
-                flags=0,
-            )
-            chunk = EncryptedChunk(
-                header=header,
-                ciphertext=msg.encrypted_payload,
-                tag=msg.tag,
-            )
-            
-            plaintext = stream.decrypt_chunk(chunk)
-            
-            # Verify checksum
-            computed = hashlib.sha256(plaintext).hexdigest()[:16]
-            if computed != msg.checksum:
-                logger.warning("Checksum mismatch!")
-            
-            # Find sender
-            sender_name = "Unknown"
-            for name, peer in self.peers.items():
-                if peer['meteor_id'] == msg.sender_id:
-                    sender_name = name
-                    peer['last_seen'] = msg.timestamp
-                    break
-            
-            # Update stats
-            self.stats['messages_received'] += 1
-            self.stats['bytes_received'] += len(plaintext)
-            
-            # Log
-            if msg.msg_type == MessageType.TEXT:
-                text = plaintext.decode('utf-8')
-                logger.info(f"[{self.name}] ← [{sender_name}]: {text[:50]}...")
-            else:
-                logger.info(f"[{self.name}] ← [{sender_name}]: {len(plaintext)} bytes")
-            
-            # Call handlers
-            for handler in self._message_handlers:
-                try:
-                    await handler(sender_name, plaintext, msg)
-                except Exception as e:
-                    logger.error(f"Handler error: {e}")
-                    
-        except Exception as e:
-            logger.error(f"Receive error: {e}")
-    
+            env = Envelope.from_bytes(data)
+            if env.recipient_id != self.meteor_id:
+                return False
+            if env.msg_type in (MessageType.TEXT.value, MessageType.BINARY.value) and not env.encrypted:
+                raise EnvelopeError("direct messages must be encrypted")
+            sender_name, plaintext = self._open(env)
+        except EnvelopeError as e:
+            self.stats['messages_rejected'] += 1
+            logger.warning(f"[{self.name}] rejected message: {e}")
+            return False
+        self.stats['messages_received'] += 1
+        self.stats['bytes_received'] += len(plaintext)
+        for handler in self._message_handlers:
+            try:
+                await handler(sender_name, plaintext, env)
+            except Exception as e:
+                logger.error(f"Handler error: {e}")
+        return True
+
     def on_message(self, handler: Callable):
-        """Register message handler."""
+        """Register ``async handler(sender_name, plaintext, envelope)``."""
         self._message_handlers.append(handler)
-    
-    # =========================================================================
-    # PubSub
-    # =========================================================================
-    
+
+    # -- pubsub ------------------------------------------------------------
     async def pubsub_subscribe(self, topic: str, handler: Callable):
-        """Subscribe to PubSub topic."""
-        await self.pubsub.subscribe(topic, handler)
-    
-    async def pubsub_publish(self, topic: str, text: str):
-        """Publish to PubSub topic (plaintext broadcast)."""
-        data = text.encode('utf-8')
-        
-        msg = Web4Message(
-            msg_type=MessageType.PUBSUB,
-            sender_id=self.meteor_id,
-            recipient_id=b'\x00' * 32,  # Broadcast
-            timestamp=time.time(),
-            encrypted_payload=data,  # Not encrypted for broadcast
-            original_len=len(data),
-            checksum=hashlib.sha256(data).hexdigest()[:16],
-            pubsub_topic=topic,
-        )
-        msg.signature = self.identity.sign(msg.checksum.encode())
-        
-        await self.pubsub.publish(topic, msg.to_bytes())
-        self.stats['pubsub_published'] += 1
-        
-        logger.info(f"[{self.name}] Published to '{topic}'")
-    
-    # =========================================================================
-    # IPFS (Encrypted File Transfer)
-    # =========================================================================
-    
-    async def send_file_ipfs(
-        self,
-        peer_name: str,
-        filepath: str,
-    ) -> Optional[str]:
-        """
-        Send encrypted file via IPFS.
-        
-        File is encrypted with recipient's public key before upload.
-        
-        Args:
-            peer_name: Recipient peer name
-            filepath: Path to file
-            
-        Returns:
-            IPFS CID if successful
-        """
-        peer = self.peers.get(peer_name)
-        if not peer or not peer.get('public_key'):
-            logger.error(f"Unknown peer or no public key: {peer_name}")
+        """Subscribe; ``async handler(sender_name, text, envelope)`` is called
+        only for messages from known peers whose signature verifies."""
+        async def verified(raw: bytes):
+            text = self.open_pubsub(raw, topic)
+            if text is not None:
+                await handler(*text)
+        await self.pubsub.subscribe(topic, verified)
+
+    def open_pubsub(self, raw: bytes, topic: str):
+        """Verify a raw PubSub message; returns (sender_name, text, env) or None."""
+        try:
+            env = Envelope.from_bytes(raw)
+            if env.msg_type != MessageType.PUBSUB.value or env.encrypted:
+                raise EnvelopeError("not a pubsub message")
+            if env.recipient_id != BROADCAST_ID or env.meta.get('topic') != topic:
+                raise EnvelopeError("wrong topic")
+            name, payload = self._open(env)
+        except EnvelopeError as e:
+            self.stats['messages_rejected'] += 1
+            logger.warning(f"[{self.name}] rejected pubsub message: {e}")
             return None
-        
+        self.stats['pubsub_received'] += 1
+        return name, payload.decode('utf-8'), env
+
+    async def pubsub_publish(self, topic: str, text: str) -> bytes:
+        """Publish a signed plaintext broadcast. Returns the raw message."""
+        env = seal(self.identity._core, MessageType.PUBSUB.value, text.encode('utf-8'),
+                   recipient_id=BROADCAST_ID, meta={'topic': topic}, encrypt=False)
+        raw = env.to_bytes()
+        await self.pubsub.publish(topic, raw)
+        self.stats['pubsub_published'] += 1
+        return raw
+
+    # -- IPFS --------------------------------------------------------------
+    async def send_file_ipfs(self, peer_name: str, filepath: str) -> Optional[str]:
+        """Encrypt a file to a peer, upload the envelope to IPFS, and send the
+        peer a signed notice with the CID. Returns the CID."""
+        peer = self.peers.get(peer_name)
+        if not peer:
+            logger.error(f"Unknown peer: {peer_name}")
+            return None
         filepath = Path(filepath)
         if not filepath.exists():
             logger.error(f"File not found: {filepath}")
             return None
-        
-        # Read file
-        data = filepath.read_bytes()
-        checksum = hashlib.sha256(data).hexdigest()
-        
-        # Encrypt with StreamHybridKEM if available
-        if STREAM_AVAILABLE:
-            stream_kem = StreamHybridKEM(n=256, gpu=False)
-            stream_kem.load_public_key(peer['public_key'])
-            ct = stream_kem.encrypt(data)
-            encrypted_bytes = ct.to_bytes()
-        else:
-            # Fallback to simple KEM + symmetric
-            peer_kem = LWEKEM(n=256, gpu=False)
-            peer_kem.load_public_key(peer['public_key'])
-            K, kem_ct = peer_kem.encaps()
-            
-            from ..cryptography.stream import StreamDEM
-            session_key = _sha256(b"session", K)
-            stream = StreamDEM(session_key=session_key, gpu=False)
-            chunk = stream.encrypt_chunk(data)
-            
-            encrypted_bytes = kem_ct + chunk.ciphertext + chunk.tag
-        
-        # Upload to IPFS
-        cid = self.ipfs.add_bytes(encrypted_bytes)
+        blob = seal(self.identity._core, MessageType.FILE.value, filepath.read_bytes(),
+                    recipient_id=peer['meteor_id'], recipient_bundle=peer['public_key'],
+                    meta={'filename': filepath.name}).to_bytes()
+        cid = self.ipfs.add_bytes(blob)
         if not cid:
             logger.error("IPFS upload failed")
             return None
-        
-        # Notify peer
-        msg = Web4Message(
-            msg_type=MessageType.FILE_IPFS,
-            sender_id=self.meteor_id,
-            recipient_id=peer['meteor_id'],
-            timestamp=time.time(),
-            ipfs_cid=cid,
-            original_len=len(data),
-            checksum=checksum,
-            filename=filepath.name,
-        )
-        msg.signature = self.identity.sign(f"{cid}:{checksum}".encode())
-        
-        await self.p2p.send(peer['peer_id'], msg.to_bytes())
-        
+        notice = seal(self.identity._core, MessageType.FILE_IPFS.value, b"",
+                      recipient_id=peer['meteor_id'], encrypt=False,
+                      meta={'cid': cid, 'blob_sha256': hashlib.sha256(blob).hexdigest(),
+                            'filename': filepath.name})
+        if not await self._deliver(peer, notice.to_bytes()):
+            return None
         self.stats['ipfs_uploads'] += 1
-        logger.info(f"[{self.name}] → [{peer_name}] IPFS: {filepath.name} (CID: {cid[:16]}...)")
-        
         return cid
-    
-    # =========================================================================
-    # Streaming (Optional, for large files)
-    # =========================================================================
-    
-    async def send_stream(
-        self,
-        peer_name: str,
-        data_iterator: Iterator[bytes],
-        chunk_size: int = 64 * 1024,
-    ) -> bool:
-        """
-        Send large data via streaming.
-        
-        Uses StreamHybridKEM for chunked authenticated encryption.
-        
-        Args:
-            peer_name: Recipient peer name
-            data_iterator: Iterator yielding data chunks
-            chunk_size: Chunk size in bytes
-            
-        Returns:
-            bool: True if sent successfully
-        """
-        if not STREAM_AVAILABLE:
-            logger.error("StreamHybridKEM not available")
-            return False
-        
+
+    def fetch_file_ipfs(self, notice: Envelope) -> Tuple[str, bytes]:
+        """Download and decrypt a file announced by an (already accepted)
+        FILE_IPFS notice. Returns (filename, data)."""
+        cid, want = notice.meta.get('cid'), notice.meta.get('blob_sha256')
+        blob = self.ipfs.get_bytes(cid) if cid else None
+        if blob is None:
+            raise ValueError("IPFS download failed")
+        if hashlib.sha256(blob).hexdigest() != want:
+            raise ValueError("IPFS content does not match the signed notice")
+        env = Envelope.from_bytes(blob)
+        if env.msg_type != MessageType.FILE.value or env.sender_id != notice.sender_id:
+            raise ValueError("IPFS content is not the announced file")
+        _, data = self._open(env)
+        self.stats['ipfs_downloads'] += 1
+        return env.meta.get('filename', ''), data
+
+    # -- streaming ---------------------------------------------------------
+    async def send_stream(self, peer_name: str, data_iterator: Iterator[bytes],
+                          chunk_size: int = 64 * 1024) -> bool:
+        """Send data as a sequence of direct (encrypted, signed) messages,
+        one per chunk, tagged with a stream id and sequence number."""
         peer = self.peers.get(peer_name)
-        if not peer or not peer.get('public_key'):
-            logger.error(f"Unknown peer or no public key: {peer_name}")
+        if not peer:
+            logger.error(f"Unknown peer: {peer_name}")
             return False
-        
-        # Initialize streaming KEM
-        stream_kem = StreamHybridKEM(n=256, chunk_size=chunk_size, gpu=False)
-        stream_kem.load_public_key(peer['public_key'])
-        
-        stream_id = secrets.token_bytes(16)
-        
-        # Send encrypted chunks
-        for i, encrypted_chunk in enumerate(stream_kem.encrypt_stream(data_iterator)):
-            msg = Web4Message(
-                msg_type=MessageType.STREAM_CHUNK if i > 0 else MessageType.STREAM_START,
-                sender_id=self.meteor_id,
-                recipient_id=peer['meteor_id'],
-                timestamp=time.time(),
-                encrypted_payload=encrypted_chunk,
-                stream_id=stream_id,
-                chunk_seq=i,
-            )
-            
-            success = await self.p2p.send(peer['peer_id'], msg.to_bytes())
-            if not success:
-                return False
-        
-        # Send end marker
-        end_msg = Web4Message(
-            msg_type=MessageType.STREAM_END,
-            sender_id=self.meteor_id,
-            recipient_id=peer['meteor_id'],
-            timestamp=time.time(),
-            stream_id=stream_id,
-        )
-        await self.p2p.send(peer['peer_id'], end_msg.to_bytes())
-        
-        logger.info(f"[{self.name}] → [{peer_name}] Stream complete")
-        return True
-    
-    # =========================================================================
-    # Utilities
-    # =========================================================================
-    
+        stream_id = secrets.token_hex(16)
+        seq = 0
+        for piece in data_iterator:
+            for o in range(0, len(piece), chunk_size):
+                if not await self._send_data(peer_name, piece[o:o + chunk_size],
+                                             MessageType.STREAM_CHUNK,
+                                             meta={'stream_id': stream_id, 'seq': seq}):
+                    return False
+                seq += 1
+        return await self._send_data(peer_name, b"", MessageType.STREAM_END,
+                                     meta={'stream_id': stream_id, 'chunks': seq})
+
+    # -- utilities ---------------------------------------------------------
     def get_stats(self) -> Dict:
-        """Get comprehensive stats."""
         return {
             'name': self.name,
             'meteor_id': self.meteor_id.hex(),
@@ -1427,9 +1041,9 @@ class MeteorWeb4Node:
             'ipfs_connected': self.ipfs._connected,
             **self.stats,
         }
-    
+
     def get_connection_info(self) -> Dict:
-        """Get connection info for sharing."""
+        """Public connection info to share (no secrets)."""
         return {
             'name': self.name,
             'meteor_id': self.meteor_id.hex(),
@@ -1493,12 +1107,14 @@ def run_tests() -> bool:
         print("\n[Test 3] Identity (MeteorID → PeerID)")
         print("-" * 40)
         
-        id1 = Web4Identity(alice.meteor_id)
-        id2 = Web4Identity(alice.meteor_id)
+        seed = secrets.token_bytes(32)
+        id1 = Web4Identity(seed)
+        id2 = Web4Identity(seed)
         
         identity_ok = (
             id1.peer_id == id2.peer_id and
-            id1.ed25519_public == id2.ed25519_public
+            id1.ed25519_public == id2.ed25519_public and
+            id1.meteor_id != seed
         )
         results["identity"] = identity_ok
         print(f"  Deterministic: {id1.peer_id == id2.peer_id}")
