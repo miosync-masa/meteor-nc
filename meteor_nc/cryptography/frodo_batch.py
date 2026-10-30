@@ -39,7 +39,9 @@ Throughput notes
 * Rows are processed in chunks; on the GPU the chunk size is derived from free
   device memory, because the SHAKE kernel needs many rows (threads) in flight.
 * Results can stay on the device (``to_host=False``); host copies go through
-  pinned memory.
+  a reused pinned staging buffer.
+* Hash inputs are passed to the SHAKE kernel as segments, so prefixes and
+  (ct || k) are never concatenated in device memory.
 * Noise sampling is one fused elementwise kernel on the GPU; intermediates
   are int32 / int16 rather than int64.
 
@@ -105,6 +107,8 @@ class BatchFrodoKEM:
         self._A_dev: Any = None
         self._B_pk: Any = None
         self._shake = {}
+        self._consts = {}
+        self._stage = None
         self._sample_kernel = None
         self._pack15 = None
         if self.xp is not np:
@@ -184,30 +188,66 @@ class BatchFrodoKEM:
     def _H(self, data: bytes, outlen: int) -> bytes:
         return self.single._H(data, outlen)
 
+    _STAGE_BYTES = 64 << 20
+
     def to_host(self, a) -> np.ndarray:
-        """Device -> host copy (through pinned memory on the GPU)."""
+        """Device -> host copy into an ordinary NumPy array.
+
+        Goes through a reused 64 MiB pinned staging buffer: allocating fresh
+        pinned memory for every multi-GB result costs more than the copy.
+        """
         if self.xp is np:
             return a
-        import cupyx
-        out = cupyx.empty_pinned(a.shape, dtype=a.dtype)
-        a.get(out=out)
+        a = self.xp.ascontiguousarray(a)
+        out = np.empty(a.shape, dtype=a.dtype)
+        src = a.view(self.xp.uint8).reshape(-1)
+        dst = out.view(np.uint8).reshape(-1)
+        if self._stage is None:
+            import cupyx
+            self._stage = cupyx.empty_pinned((self._STAGE_BYTES,), dtype=np.uint8)
+        st = self._stage
+        for o in range(0, src.size, self._STAGE_BYTES):
+            n = min(self._STAGE_BYTES, src.size - o)
+            src[o:o + n].get(out=st[:n])
+            dst[o:o + n] = st[:n]
         return out
 
-    def _hash_rows(self, data, outlen: int, variant: Optional[str] = None):
-        """SHAKE of each row: (batch, inlen) uint8 -> (batch, outlen) uint8."""
+    def _hash_rows(self, segments, outlen: int, variant: Optional[str] = None, out=None):
+        """SHAKE of each row of seg0 || seg1 || ... -> (batch, outlen) uint8.
+
+        A segment is a (batch, len) uint8 array (rows may be strided) or
+        ``bytes`` / a 1-D array shared by every row. On the GPU the segments
+        are absorbed directly (no concatenation).
+        """
         variant = variant or self.p.shake
-        if self.xp is not np:
+        if not isinstance(segments, (list, tuple)):
+            segments = [segments]
+        xp = self.xp
+        batch = next(sg.shape[0] for sg in segments if not isinstance(sg, bytes) and sg.ndim == 2)
+        if xp is not np:
             g = self._shake.get(variant)
             if g is None:
                 from .kernels.shake_kernel import GPUShake
                 g = self._shake[variant] = GPUShake(variant)
-            return g(data, outlen)
+            segs = [self._const_dev(sg) if isinstance(sg, bytes) else sg for sg in segments]
+            return g(*segs, outlen=outlen, out=out)
         H = hashlib.shake_128 if variant == "shake128" else hashlib.shake_256
-        data = np.ascontiguousarray(data, dtype=np.uint8)
-        out = np.empty((data.shape[0], outlen), dtype=np.uint8)
-        for i in range(data.shape[0]):
-            out[i] = np.frombuffer(H(data[i].tobytes()).digest(outlen), np.uint8)
-        return out
+        rows = [np.broadcast_to(np.frombuffer(sg, np.uint8), (batch, len(sg)))
+                if isinstance(sg, bytes) else
+                (np.broadcast_to(sg, (batch, sg.shape[0])) if sg.ndim == 1 else sg)
+                for sg in segments]
+        data = np.ascontiguousarray(np.concatenate(rows, axis=1), dtype=np.uint8)
+        res = np.empty((batch, outlen), dtype=np.uint8) if out is None else out
+        for i in range(batch):
+            res[i] = np.frombuffer(H(data[i].tobytes()).digest(outlen), np.uint8)
+        return res
+
+    def _const_dev(self, b: bytes):
+        """Cached 1-D device copy of a constant byte string."""
+        c = self._consts.get(b)
+        if c is None:
+            c = self._consts[b] = self.xp.asarray(np.frombuffer(b, np.uint8))
+        return c
 
     def _const_rows(self, b: bytes, batch: int):
         xp = self.xp
@@ -384,8 +424,7 @@ class BatchFrodoKEM:
         xp, p = self.xp, self.p
         bsz = mu_dev.shape[0]
         nbytes = 2 * (2 * p.mbar * p.n + p.mbar * p.nbar)
-        rbytes = self._hash_rows(xp.concatenate(
-            [self._const_rows(b"\x96", bsz), seedSE_dev], axis=1), nbytes)
+        rbytes = self._hash_rows([b"\x96", seedSE_dev], nbytes)
         r = rbytes.view(xp.uint16)                          # little-endian samples
         o1, o2 = p.mbar * p.n, 2 * p.mbar * p.n
         Sp = self._sample(r[:, :o1]).reshape(bsz * p.mbar, p.n)
@@ -407,8 +446,7 @@ class BatchFrodoKEM:
     def _derive_seedSE_k(self, pkh: bytes, mu_dev, salt_dev):
         p = self.p
         bsz = mu_dev.shape[0]
-        h = self._hash_rows(self.xp.concatenate(
-            [self._const_rows(pkh, bsz), mu_dev, salt_dev], axis=1), p.len_seedSE + p.len_sec)
+        h = self._hash_rows([pkh, mu_dev, salt_dev], p.len_seedSE + p.len_sec)
         return h[:, :p.len_seedSE], h[:, p.len_seedSE:]
 
     def encaps_batch(self, pk: bytes, mu_salt, to_host: bool = True, prefix: bytes = b""):
@@ -439,7 +477,7 @@ class BatchFrodoKEM:
             body = ct[a:b, hp:]
             self._encrypt_into(pk, mu, seedSE, body[:, :l12])
             body[:, l12:] = salt
-            ss[a:b] = self._hash_rows(xp.concatenate([body, k], axis=1), p.ss_bytes)
+            self._hash_rows([body, k], p.ss_bytes, out=ss[a:b])
         return (self.to_host(ct), self.to_host(ss)) if to_host else (ct, ss)
 
     def encaps_batch_random(self, pk: bytes, batch: int, to_host: bool = True,
@@ -491,7 +529,7 @@ class BatchFrodoKEM:
             # branch-free select: kbar = k if ok else s
             mask = (ok.astype(xp.uint8) * xp.uint8(0xFF))[:, None]
             kbar = (k & mask) | (s_row[None, :] & ~mask)
-            ss[a:b] = self._hash_rows(xp.concatenate([body, kbar], axis=1), p.ss_bytes)
+            self._hash_rows([body, kbar], p.ss_bytes, out=ss[a:b])
         return self.to_host(ss) if to_host else ss
 
 

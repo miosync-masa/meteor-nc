@@ -97,9 +97,7 @@ class BatchLWEKEM:
 
     def _kdf_rows(self, ss):
         """K = SHAKE256(KDF_DOMAIN || ss) per row, on the batch backend."""
-        bk = self._batch
-        dom = bk._const_rows(KDF_DOMAIN, ss.shape[0])
-        return bk._hash_rows(bk.xp.concatenate([dom, ss], axis=1), 32, "shake256")
+        return self._batch._hash_rows([KDF_DOMAIN, ss], 32, "shake256")
 
     def encaps_batch(self, batch: int, mu_salt=None, raw: bool = False,
                      device: bool = False):
